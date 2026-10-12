@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>پنل واتروال</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🛡️</text></svg>">
+</head>
+<body>
+
+<!-- ------------------------------------------------------------- login -->
+<div id="login">
+  <form class="login-card" id="loginForm" autocomplete="off">
+    <h1>🛡️ پنل واتروال</h1>
+    <p>برای ورود، توکن API پنل را وارد کنید. این توکن هنگام اجرای سرور در ترمینال نمایش داده می‌شود.</p>
+    <label class="f">
+      <span class="lbl">API Token</span>
+      <input type="password" id="loginToken" placeholder="توکن" required>
+    </label>
+    <div id="loginError" class="err-box" style="display:none"></div>
+    <button class="primary" type="submit" style="width:100%;justify-content:center">ورود</button>
+    <p class="small muted" style="margin-top:16px;text-align:center">
+      توکن در <span class="mono">data/panel.json</span> ذخیره می‌شود
+    </p>
+  </form>
+</div>
+
+<!-- --------------------------------------------------------------- app -->
+<div id="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🛡️</span>
+      <span>پنل واتروال<small>ساخت، استقرار و تست تونل</small></span>
+    </div>
+    <div class="spacer"></div>
+    <span class="conn"><span class="dot" id="sseDot"></span><span id="sseText">اتصال…</span></span>
+    <button class="sm ghost" id="logoutBtn">خروج</button>
+  </header>
+
+  <div class="layout">
+    <nav class="sidebar">
+      <h4>منو</h4>
+      <div class="nav-item active" data-page="dashboard"><span class="ic">📊</span> داشبورد</div>
+      <div class="nav-item" data-page="servers"><span class="ic">🖥️</span> سرورها</div>
+      <div class="nav-item" data-page="tunnels"><span class="ic">🔗</span> تانل‌ها</div>
+      <div class="nav-item" data-page="new"><span class="ic">➕</span> تونل جدید</div>
+      <div class="nav-item" data-page="test"><span class="ic">🧪</span> تست اتصال</div>
+      <div class="nav-item" data-page="api"><span class="ic">📡</span> API و ایجنت</div>
+      <h4 style="margin-top:20px">مستندات</h4>
+      <a class="nav-item" href="https://radkesvat.github.io/WaterWall-Docs/" target="_blank"><span class="ic">📖</span> مستندات واتروال</a>
+    </nav>
+
+    <main class="content" id="content"></main>
+  </div>
+</div>
+
+<div id="toasts"></div>
+<div class="modal-back" id="modal">
+  <div class="modal">
+    <header><h3 id="modalTitle"></h3></header>
+    <div class="body" id="modalBody"></div>
+    <footer id="modalFoot"></footer>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

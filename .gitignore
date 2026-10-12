@@ -1,0 +1,23 @@
+# runtime data (tunnels, servers, panel token)
+data/
+
+# dependencies
+node_modules/
+
+# logs and editor noise
+*.log
+*.bak
+*.tmp
+.DS_Store
+Thumbs.db
+
+# archives
+*.zip
+
+# secrets — never commit these
+.env
+.env.*
+!.env.example
+*.secret
+*.pem
+*.key

@@ -1,0 +1,18 @@
+{
+  "name": "waterwall-panel",
+  "version": "1.0.0",
+  "description": "Web panel + API to build, deploy and test WaterWall tunnels between an Iran server and a foreign server",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "agent": "node agent/agent.js",
+    "test": "node test/run-tests.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "private": true
+}
