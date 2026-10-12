@@ -7,6 +7,7 @@ const state = {
   servers: [],
   tunnels: [],
   templates: [],
+  versions: null,
   page: 'dashboard',
   selectedTemplate: null,
   draft: null,        // working copy of the tunnel form
@@ -162,6 +163,7 @@ async function loadAll() {
   state.servers = data.servers;
   state.tunnels = data.tunnels;
   state.templates = data.templates;
+  state.versions = data.versions || null;
 }
 
 // ------------------------------------------------------------ live events
@@ -296,12 +298,62 @@ function pageDashboard() {
   </div>`;
 }
 
+/**
+ * What release the panel targets, what that release changed, and which
+ * settings WaterWall has removed. Shown on the servers page because a version
+ * mismatch is the first thing to check when a service refuses to start.
+ */
+function versionCardHtml() {
+  const v = state.versions;
+  if (!v) return '';
+  const rel = v.release;
+  return `
+  <div class="card">
+    <h3>ℹ️ نسخه واتروال <span class="badge ${v.current ? 'ok' : ''}">${esc(v.current)}</span></h3>
+    <p class="small muted" style="line-height:2">
+      پنل کانفیگ‌ها را برای این نسخه می‌سازد. کمترین نسخه پشتیبانی‌شده: <span class="mono">${esc(v.oldestSupported)}</span>.
+      هر تنظیمی که واتروال حذف کرده باشد <b>خطای اجرا</b> است، نه هشدار — پس پنل قبل از استقرار آن‌ها را می‌گیرد.
+    </p>
+    ${
+      rel
+        ? `<div style="margin:12px 0">
+            <div style="font-weight:600;margin-bottom:6px">${esc(rel.headline)}</div>
+            <ul class="small muted" style="line-height:2;padding-inline-start:20px">
+              ${(rel.highlights || []).map((h) => `<li>${esc(h)}</li>`).join('')}
+            </ul>
+          </div>
+          <details>
+            <summary class="small" style="cursor:pointer;color:var(--warn)">تغییرات شکننده (${(rel.breaking || []).length} مورد)</summary>
+            <ul class="small muted" style="line-height:2;padding-inline-start:20px">
+              ${(rel.breaking || []).map((h) => `<li>${esc(h)}</li>`).join('')}
+            </ul>
+          </details>`
+        : ''
+    }
+    ${
+      (v.breaking || []).length
+        ? `<details style="margin-top:10px">
+            <summary class="small" style="cursor:pointer">تنظیماتی که پنل رد می‌کند (${v.breaking.length} مورد)</summary>
+            <table style="margin-top:8px"><thead><tr><th>تنظیم</th><th>نود</th><th>از نسخه</th></tr></thead><tbody>
+              ${v.breaking.map((b) => `<tr><td class="ltr"><b>${esc(b.key)}</b></td><td class="ltr small">${esc((b.nodes || []).join(', '))}</td><td class="ltr small">${esc(b.since)}</td></tr>`).join('')}
+            </tbody></table>
+          </details>`
+        : ''
+    }
+  </div>`;
+}
+
 // ================================================================= servers
 function pageServers() {
   const rows = state.servers
     .map((s) => {
       const st = s.lastStatus || {};
       const online = s.lastSeen && Date.now() - new Date(s.lastSeen).getTime() < 90000;
+      const wv = st.waterwallVersion || null;
+      // The panel targets a specific release. A core older than the target can
+      // still work for older templates, so this is information, not a hard
+      // error — but a mismatch is worth seeing at a glance.
+      const vClass = !wv ? 'mute' : wv === state.versions?.current ? 'ok' : 'err';
       return `
       <tr>
         <td>
@@ -313,6 +365,9 @@ function pageServers() {
         <td>
           <span class="badge ${online ? 'ok' : 'mute'}">${online ? 'آنلاین' : 'آفلاین'}</span>
           <div class="small muted">${online ? esc(st.service || '') : 'گزارشی نشده'}</div>
+        </td>
+        <td class="ltr">
+          <span class="badge ${vClass}" title="نسخه واتروال نصب‌شده روی این سرور">${wv ? esc(wv) : 'نامشخص'}</span>
         </td>
         <td class="ltr small">${st.publicIp ? esc(st.publicIp) : '—'}</td>
         <td class="small">${fmtDate(s.lastSeen)}</td>
@@ -334,11 +389,13 @@ function pageServers() {
     <button class="primary" id="addServer">➕ افزودن سرور</button>
   </div>
 
+  ${versionCardHtml()}
+
   <div class="card">
     ${
       state.servers.length
         ? `<table><thead><tr>
-            <th>نام</th><th>SSH</th><th>مسیر واتروال</th><th>وضعیت</th><th>IP عمومی</th><th>آخرین گزارش</th><th></th>
+            <th>نام</th><th>SSH</th><th>مسیر واتروال</th><th>وضعیت</th><th>نسخه واتروال</th><th>IP عمومی</th><th>آخرین گزارش</th><th></th>
           </tr></thead><tbody>${rows}</tbody></table>`
         : '<div class="empty"><div class="ic">🖥️</div>هنوز سروری ثبت نشده است.<br>سرور ایران و سرور خارج را اضافه کنید.</div>'
     }
@@ -874,7 +931,10 @@ function pageNewTunnel() {
                 <h4>${esc(t.titleFa)}</h4>
                 <div class="en">${esc(t.title)}</div>
                 <p>${esc(t.summaryFa)}</p>
-                <div class="tags">${(t.tags || []).slice(0, 4).map((tag) => `<span class="badge mute">${esc(tag)}</span>`).join('')}</div>
+                <div class="tags">
+                  ${t.minVersion ? `<span class="badge" title="این سناریو به این نسخه واتروال نیاز دارد">نیازمند ${esc(t.minVersion)}</span>` : ''}
+                  ${(t.tags || []).slice(0, 4).map((tag) => `<span class="badge mute">${esc(tag)}</span>`).join('')}
+                </div>
               </div>`,
             )
             .join('')}</div>`;

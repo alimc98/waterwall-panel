@@ -100,13 +100,34 @@ async function serviceStatus(service) {
   return { active: res.stdout || 'unknown', enabled: enabled.stdout || 'unknown' };
 }
 
+/**
+ * Read the version of the WaterWall core actually installed on this box.
+ *
+ * The panel needs this to tell the user when a tunnel needs a newer core than
+ * the one on the server, instead of letting the service fail at startup.
+ * Tries the flag spellings the core has used, then falls back to the binary's
+ * embedded version string.
+ */
+async function waterwallVersion(basePath) {
+  const binary = `${basePath}/WaterWall`;
+  const attempts = [['--version'], ['-v'], ['version'], ['--help']];
+  for (const args of attempts) {
+    const res = await run(binary, args);
+    const text = `${res.stdout || ''} ${res.stderr || ''}`;
+    const m = text.match(/(\d+\.\d+\.\d+)/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
 async function localFacts() {
   const serviceName = process.env.WW_SERVICE || 'waterwall';
-  const [service, enabled, listeners, bootId] = await Promise.all([
+  const [service, enabled, listeners, bootId, waterwallVersionText] = await Promise.all([
     serviceStatus(serviceName),
     run('systemctl', ['is-enabled', serviceName]),
     run('ss', ['-lntup']),
     run('sh', ['-c', 'cat /proc/sys/kernel/random/boot_id 2>/dev/null']),
+    waterwallVersion(process.env.WW_WATERWALL_PATH || '/opt/waterwall'),
   ]);
   let publicIp = null;
   try {
@@ -137,7 +158,8 @@ async function localFacts() {
     bootId: bootId.stdout,
     listeners: parseListeners(listeners.stdout).slice(0, 200),
     loadAvg: os.loadavg().map((n) => Number(n.toFixed(2))),
-    agentVersion: '1.0.0',
+    waterwallVersion: waterwallVersionText,
+    agentVersion: '1.1.0',
   };
 }
 

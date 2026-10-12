@@ -10,6 +10,7 @@ const { validateBundle } = require('./lib/generator');
 const ssh = require('./lib/ssh');
 const tests = require('./lib/tests');
 const protoscan = require('./lib/protoscan');
+const versions = require('./lib/versions');
 const { Router, sendJson, sendError, sendText, parseJsonBody, serveStatic, parseUrl } = require('./lib/http');
 const { timingSafeEqual, readBody } = require('./lib/util');
 
@@ -92,6 +93,18 @@ router.get('/api/bootstrap', (req, res) => {
     servers: store.listServers().map((s) => ({ ...s, sshPassword: s.sshPassword ? '***' : '' })),
     tunnels: store.listTunnels(),
     templates: templates.catalog(),
+    // Shipped with the catalog so the UI can show the target release and the
+    // removed-settings list without a second request.
+    versions: {
+      current: versions.CURRENT,
+      oldestSupported: versions.OLDEST_SUPPORTED,
+      release: versions.RELEASE_NOTES[versions.CURRENT] || null,
+      breaking: versions.REMOVED_SETTINGS.map((r) => ({
+        key: r.key,
+        nodes: r.nodes,
+        since: r.since,
+      })),
+    },
   });
 });
 
@@ -105,6 +118,44 @@ router.get('/api/templates/:id', (req, res, ctx) => {
   const tpl = templates.get(ctx.params.id);
   if (!tpl) return sendError(res, 404, 'template not found');
   sendJson(res, 200, { ok: true, template: templates.catalogEntry(tpl) });
+});
+
+/**
+ * Which WaterWall release the panel targets, what it changed, and what each
+ * registered server is actually running.
+ */
+router.get('/api/versions', (req, res) => {
+  if (guard(req, res)) return;
+  const servers = store.listServers().map((s) => {
+    const reported = versions.normalise(s.lastStatus?.waterwallVersion);
+    const age = reported ? versions.cmp(reported, versions.CURRENT) : null;
+    return {
+      id: s.id,
+      name: s.name,
+      role: s.role,
+      reported,
+      current: reported === versions.CURRENT,
+      older: age !== null && age < 0 ? true : false,
+      belowSupported: reported ? versions.lt(reported, versions.OLDEST_SUPPORTED) : false,
+      agentVersion: s.lastStatus?.agentVersion || null,
+      lastSeen: s.lastSeen || null,
+    };
+  });
+
+  sendJson(res, 200, {
+    ok: true,
+    current: versions.CURRENT,
+    oldestSupported: versions.OLDEST_SUPPORTED,
+    release: versions.RELEASE_NOTES[versions.CURRENT] || null,
+    breaking: versions.REMOVED_SETTINGS.map((r) => ({
+      key: r.key,
+      nodes: r.nodes,
+      since: r.since,
+      reason: r.reason,
+    })),
+    features: versions.FEATURES,
+    servers,
+  });
 });
 
 // ---- servers -------------------------------------------------------------
