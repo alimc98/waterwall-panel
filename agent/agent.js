@@ -107,15 +107,21 @@ async function serviceStatus(service) {
  * the one on the server, instead of letting the service fail at startup.
  * Tries the flag spellings the core has used, then falls back to the binary's
  * embedded version string.
+ *
+ * The release archive names the binary "Waterwall" while many guides and
+ * hand-made installs use "WaterWall". Linux paths are case sensitive, so try
+ * both rather than assuming.
  */
 async function waterwallVersion(basePath) {
-  const binary = `${basePath}/WaterWall`;
+  const candidates = ['Waterwall', 'WaterWall'].map((n) => `${basePath}/${n}`);
   const attempts = [['--version'], ['-v'], ['version'], ['--help']];
-  for (const args of attempts) {
-    const res = await run(binary, args);
-    const text = `${res.stdout || ''} ${res.stderr || ''}`;
-    const m = text.match(/(\d+\.\d+\.\d+)/);
-    if (m) return m[1];
+  for (const binary of candidates) {
+    for (const args of attempts) {
+      const res = await run(binary, args);
+      const text = `${res.stdout || ''} ${res.stderr || ''}`;
+      const m = text.match(/(\d+\.\d+\.\d+)/);
+      if (m) return m[1];
+    }
   }
   return null;
 }

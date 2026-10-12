@@ -389,7 +389,48 @@ function pageServers() {
     <button class="primary" id="addServer">➕ افزودن سرور</button>
   </div>
 
-  ${versionCardHtml()}
+  <div class="card">
+    <h3>📥 نصب روی سرور</h3>
+    <p class="small muted" style="line-height:2">
+      اسکریپت نصب، هم واتروال و هم ایجنت را می‌نویسد. اگر سرور به گیت‌هاب دسترسی ندارد،
+      فایل‌ها را روی کامپیوتر خودتان بگیرید و با <span class="mono">--waterwall-zip</span> نصب کنید.
+    </p>
+
+    <h4 style="margin:14px 0 8px;font-size:12px;color:var(--accent)">نصب خودکار</h4>
+    <pre class="code" style="direction:ltr;text-align:left">curl -fsSL ${esc(location.origin)}/install.sh | sudo bash -s -- \\
+  --panel-url ${esc(location.origin)} \\
+  --agent-token AGENT_TOKEN</pre>
+    <div class="small muted">توکن هر سرور جداست: در جدول بالا دکمه «ویرایش» را بزنید.</div>
+
+    <h4 style="margin:18px 0 8px;font-size:12px;color:var(--accent)">نصب آفلاین</h4>
+    <pre class="code" style="direction:ltr;text-align:left"># 1) روی کامپیوتر خودتان:
+#    Waterwall-linux-gcc-x64-old-cpu.zip  و  agent.js  را دانلود کنید
+scp Waterwall-linux-gcc-x64-old-cpu.zip agent.js root@SERVER_IP:/root/
+
+# 2) روی سرور:
+sudo ./install.sh --offline \\
+  --waterwall-zip /root/Waterwall-linux-gcc-x64-old-cpu.zip \\
+  --agent-file /root/agent.js \\
+  --panel-url ${esc(location.origin)} \\
+  --agent-token AGENT_TOKEN</pre>
+
+    <div class="row" style="gap:8px;margin-top:12px">
+      <a class="btn" href="/install.sh" download>⬇️ دانلود install.sh</a>
+      <a class="btn" href="/install-agent.sh" download>⬇️ نصب‌کننده ایجنت</a>
+      <a class="btn" href="/agent.js" download>⬇️ agent.js</a>
+    </div>
+
+    <details style="margin-top:14px">
+      <summary class="small" style="cursor:pointer">نصب کاملاً دستی (بدون اسکریپت)</summary>
+      <p class="small muted">
+        راهنمای گام‌به‌گام برای وقتی که هیچ اسکریپتی قابل اجرا نیست: ساخت باینری،
+        یونیت systemd، sysctl و عیب‌یابی. در فایل
+        <span class="mono">docs/INSTALL-MANUAL.md</span> داخل ریپوزیتوری هست.
+      </p>
+    </details>
+  </div>
+
+${versionCardHtml()}
 
   <div class="card">
     ${

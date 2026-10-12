@@ -638,10 +638,21 @@ const server = require('node:http').createServer(async (req, res) => {
       return await match.handler(req, res, { params: match.params, url });
     }
     if (serveStatic(res, PUBLIC_DIR, url.pathname)) return;
-    // The agent installer is fetched by servers, not browsers.
-    if (url.pathname === '/agent.js' || url.pathname === '/install-agent.sh') {
-      const source = url.pathname === '/agent.js' ? path.join(ROOT, 'agent', 'agent.js') : path.join(PUBLIC_DIR, 'install-agent.sh');
-      const body = fs.readFileSync(source);
+    // Fetched by servers, not browsers: the agent itself, the one-file
+    // installer, and the offline installer kept at the repo root.
+    const DOWNLOADS = {
+      '/agent.js': () => path.join(ROOT, 'agent', 'agent.js'),
+      '/install-agent.sh': () => path.join(PUBLIC_DIR, 'install-agent.sh'),
+      '/install.sh': () => path.join(ROOT, 'install.sh'),
+    };
+    if (DOWNLOADS[url.pathname]) {
+      const source = DOWNLOADS[url.pathname]();
+      let body;
+      try {
+        body = fs.readFileSync(source);
+      } catch {
+        return sendError(res, 404, `${url.pathname} is not present in this checkout`);
+      }
       res.writeHead(200, {
         'content-type': 'text/plain; charset=utf-8',
         'content-length': body.length,

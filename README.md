@@ -34,6 +34,67 @@ node server.js
 
 مرورگر را باز کنید، توکن را وارد کنید.
 
+## نصب روی سرور
+
+### خودکار (دسترسی به گیت‌هاب)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alimc98/waterwall-panel/main/install.sh | sudo bash -s -- \
+  --panel-url https://panel.example.com \
+  --agent-token AGENT_TOKEN
+```
+
+اسکریپت معماری CPU را تشخیص می‌دهد، باینری مناسب را از گیت‌هاب می‌گیرد، یونیت systemd و ایجنت را می‌نویسد و sysctl را تنظیم می‌کند.
+
+### آفلاین (بدون دسترسی به گیت‌هاب)
+
+اگر ارتباط سرور ایران با خارج قطع شده و سرور به گیت‌هاب دسترسی ندارد:
+
+```bash
+# 1) روی کامپیوتر خودتان فایل‌ها را بگیرید:
+#      Waterwall-linux-gcc-x64-old-cpu.zip
+#      agent.js
+scp Waterwall-linux-gcc-x64-old-cpu.zip agent.js root@SERVER_IP:/root/
+
+# 2) روی سرور:
+sudo ./install.sh --offline \
+  --waterwall-zip /root/Waterwall-linux-gcc-x64-old-cpu.zip \
+  --agent-file /root/agent.js \
+  --panel-url https://panel.example.com \
+  --agent-token AGENT_TOKEN
+```
+
+هیچ درخواستی به شبکه زده نمی‌شود. همان فایل zip و همان ایجنت نصب می‌شوند.
+
+### کاملاً دستی
+
+راهنمای گام‌به‌گام بدون هیچ اسکریپتی — ساخت باینری، یونیت systemd، sysctl و عیب‌یابی:
+
+**[docs/INSTALL-MANUAL.md](docs/INSTALL-MANUAL.md)**
+
+### ⚠️ نام باینری
+
+آرشیو انتشار رسمی باینری را **`Waterwall`** می‌نامد (حرف w کوچک)، در حالی که خود مخزن `WaterWall` است. روی لینوکس مسیر به حروف حساس است — یک اشتباه کوچک باعث `ExecStart` شکسته می‌شود.
+
+پنل هر دو نام را می‌پذیرد، ولی اسکریپت و سند نصب از `Waterwall` استفاده می‌کنند.
+
+### گزینه‌های `install.sh`
+
+| گزینه | توضیح |
+| --- | --- |
+| `--panel-url URL` | آدرس پنل که ایجنت آن را poll می‌کند |
+| `--agent-token TOKEN` | توکن ایجنت این سرور |
+| `--version VER` | نسخه واتروال (پیش‌فرض `1.46.96`) |
+| `--base DIR` | مسیر نصب (پیش‌فرض `/opt/waterwall`) |
+| `--arch ARCH` | `x64` \| `x64-old` \| `arm64` \| `arm64-old` \| `clang` \| `avx512` |
+| `--waterwall-zip FILE` | نصب از فایل محلی |
+| `--agent-file FILE` | نصب ایجنت از فایل محلی |
+| `--offline` | هیچ درخواست شبکه‌ای |
+| `--skip-waterwall` | فقط ایجنت |
+| `--skip-agent` | فقط واتروال |
+| `--skip-tuning` | دست‌نزدن به sysctl |
+| `--force` | بازنویسی نصب موجود |
+
 ### متغیرهای محیطی
 
 | متغیر | پیش‌فرض | توضیح |
@@ -577,6 +638,8 @@ cmake --preset linux-gcc-x64 && cmake --build --preset linux-gcc-x64
 
 سپس مسیر نصب را در پنل روی `/opt/waterwall` تنظیم کنید و یک سرویس systemd بسازید:
 
+> ⚠️ نام باینری در آرشیو انتشار رسمی **`Waterwall`** است (حرف w کوچک). روی لینوکس مسیر به حروف حساس است. پنل هر دو نام را می‌پذیرد، ولی اگر دستی نصب می‌کنید بهتر است همان `Waterwall` را نگه دارید.
+
 ```ini
 [Unit]
 Description=WaterWall
@@ -585,7 +648,7 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/waterwall
-ExecStart=/opt/waterwall/WaterWall
+ExecStart=/opt/waterwall/Waterwall
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -636,8 +699,11 @@ lib/
     ops.js             عملیات
 agent/agent.js         ایجنت سمت سرور
 public/                رابط کاربری
+docs/INSTALL-MANUAL.md راهنمای نصب دستی و آفلاین
+install.sh             نصب‌کننده (خودکار و آفلاین)
 test/run-tests.js      تست‌ها
 test/fake-socks.js     SOCKS5 قلابی برای تست ابزارها
+test/install-checks.sh تست‌های اسکریپت نصب
 ```
 
 ## بلوک variables
