@@ -306,6 +306,78 @@ for (const tpl of templates.ALL) {
   );
 }
 
+// ---- reachability checks --------------------------------------------------
+// A tunnel can upload cleanly and still be dead because a firewall never let the
+// link port through. If the check stops working, the user is back to hunting a
+// config that was never the problem.
+//
+// These are asynchronous, so the block returns a promise that is awaited before
+// the summary is printed.
+function netcheckTests() {
+  const netcheck = require('../lib/netcheck');
+
+  assert.strictEqual(netcheck.validPort(443), true);
+  assert.strictEqual(netcheck.validPort('8443'), true);
+  for (const bad of [0, -1, 65536, 'abc', '', null, undefined, '22; rm -rf /']) {
+    assert.strictEqual(netcheck.validPort(bad), false, JSON.stringify(bad) + ' must be rejected');
+  }
+
+  // The probe classifies by `timeout`'s exit code: 0 open, 124 filtered,
+  // anything else means the host answered with RST so nothing is listening.
+  const stub = (rc) => async () => ({ stdout: String(rc) + '\n', stderr: '', failed: false, code: 0 });
+  const srv = { host: '10.0.0.1', sshUser: 'root' };
+  const peerHost = '203.0.113.9';
+
+  return (async () => {
+    const open = await netcheck.tcpProbe(stub(0), srv, { host: peerHost, port: 443 });
+    assert.strictEqual(open.verdict, 'open', 'an accepted connection is open');
+
+    const filtered = await netcheck.tcpProbe(stub(124), srv, { host: peerHost, port: 443 });
+    assert.strictEqual(filtered.verdict, 'filtered', 'a timed-out connection is filtered');
+
+    const refused = await netcheck.tcpProbe(stub(1), srv, { host: peerHost, port: 443 });
+    assert.strictEqual(refused.verdict, 'refused', 'an RST means nothing is listening');
+
+    // A probe that yields nothing usable falls through to the control test. If
+    // that also fails the box has no path at all, and blaming the far side's
+    // firewall would send the user in exactly the wrong direction.
+    const deadBox = async () => ({ stdout: '', stderr: '', failed: true, code: null });
+    const noEgress = await netcheck.tcpProbe(deadBox, srv, { host: peerHost, port: 443 });
+    assert.strictEqual(noEgress.verdict, 'no-egress', 'a box with no path must not be reported as filtered');
+
+    const sides = { iran: { host: '85.198.55.61', role: 'iran' }, foreign: { host: peerHost, role: 'foreign' } };
+
+    // Only scoped ufw allow rules may be applied by the panel: this endpoint
+    // runs commands on a live host.
+    const fake = async () => ({ ok: true, output: 'ok' });
+    assert.strictEqual((await netcheck.applyFirewallFix(fake, sides.foreign, 'ufw allow 443/tcp')).ok, true);
+    assert.strictEqual(
+      (await netcheck.applyFirewallFix(fake, sides.foreign, 'ufw allow from 1.2.3.4 to any port 2053 proto tcp')).ok,
+      true,
+    );
+    for (const dangerous of ['ufw disable', 'ufw --force delete all', 'rm -rf /', 'iptables -F', 'ufw allow all', '']) {
+      const r = await netcheck.applyFirewallFix(fake, sides.foreign, dangerous);
+      assert.strictEqual(r.ok, false, 'must refuse: ' + dangerous);
+    }
+
+    // A refused link is a different problem from a filtered one, so it must not
+    // be answered with a firewall rule: nothing is listening, not nothing is
+    // allowed.
+    assert.strictEqual(
+      netcheck.fixCommandFor({ kind: 'link-filtered', port: 2053 }, sides),
+      'ufw allow from 85.198.55.61 to any port 2053 proto tcp',
+    );
+    assert.strictEqual(netcheck.fixCommandFor({ kind: 'entry-filtered', port: 443 }, sides), 'ufw allow 443/tcp');
+    assert.strictEqual(
+      netcheck.fixCommandFor({ kind: 'link-refused', port: 2053 }, sides),
+      null,
+      'a refused port is a service problem, not a firewall one',
+    );
+  })();
+}
+
+const netcheckPending = netcheckTests();
+
 // ---- store round trip -----------------------------------------------------
 assert.strictEqual(store.listServers().length, 2, 'server store');
 assert.ok(store.addTunnel({ name: 'x', template: 'tcp-forward' }).id, 'tunnel store');
@@ -313,8 +385,10 @@ assert.strictEqual(store.getTunnel(store.listTunnels()[0].id).name, store.listTu
 
 fs.rmSync(tmp, { recursive: true, force: true });
 
-console.log('');
-console.log(`  ${pass} passed, ${fail} failed (${usedVariables} config variables resolved)`);
+netcheckPending.then(() => {
+  console.log('');
+  console.log(`  ${pass} passed, ${fail} failed (${usedVariables} config variables resolved)`);
+});
 if (fail) {
   console.log('');
   failures.forEach((f) => console.log(`  - ${f}`));

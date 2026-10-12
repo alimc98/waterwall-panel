@@ -892,6 +892,67 @@ async function doPreview() {
   }
 }
 
+/**
+ * Post-deploy reachability report.
+ *
+ * A tunnel that uploaded cleanly can still be dead because a firewall never let
+ * the link port through. Showing the verdict, and the exact rule that fixes it,
+ * is the difference between "it says deployed but nothing works" and a one-line
+ * fix the user can paste.
+ */
+function reachabilityHtml(r) {
+  if (!r) return '';
+  if (r.error) return `<div class="err-box">بررسی دسترسی انجام نشد: ${esc(r.error)}</div>`;
+
+  const VERDICT = {
+    open: ['باز', 'ok'],
+    refused: ['بسته (چیزی گوش نمی‌دهد)', 'err'],
+    filtered: ['فیلترشده', 'err'],
+    'no-egress': ['بدون دسترسی به بیرون', 'err'],
+    unknown: ['نامشخص', ''],
+    invalid: ['پورت نامعتبر', 'err'],
+  };
+  const row = (label, leg) => {
+    if (!leg) return '';
+    const [text, cls] = VERDICT[leg.verdict] || ['?', ''];
+    return `<tr>
+      <td>${esc(label)}</td>
+      <td class="ltr">${esc(leg.from)} → ${esc(leg.to)}</td>
+      <td class="ltr">${leg.port}</td>
+      <td><span class="badge ${cls}">${esc(text)}</span></td>
+    </tr>`;
+  };
+
+  const problems = (r.problems || [])
+    .map(
+      (p) => `<div class="err-box">
+        ${esc(p.message)}
+        ${p.fix ? `<br><span class="small">رفع: <code class="mono" style="direction:ltr;display:inline-block">${esc(p.fix)}</code></span>` : ''}
+      </div>`,
+    )
+    .join('');
+
+  const good = r.ok
+    ? '<div class="ok-box">✓ هر دو سرور به پورت‌های مورد نیاز یکدیگر دسترسی دارند.</div>'
+    : '';
+
+  return `<div style="margin-top:14px">
+    <h4 style="margin:0 0 8px;font-size:12px;color:var(--accent)">🔗 بررسی دسترسی بین دو سرور</h4>
+    <table>
+      <thead><tr><th>مسیر</th><th>جهت</th><th>پورت</th><th>وضعیت</th></tr></thead>
+      <tbody>
+        ${row('لینک بین دو سرور', r.link)}
+        ${row('پورت کاربران', r.entry)}
+      </tbody>
+    </table>
+    <p class="small muted" style="margin:8px 0">
+      فایروال ایران: <span class="mono">${esc(r.firewalls?.iran || '—')}</span><br>
+      فایروال خارج: <span class="mono">${esc(r.firewalls?.foreign || '—')}</span>
+    </p>
+    ${good}${problems}
+  </div>`;
+}
+
 async function doApply(dryRun = false) {
   const t = state.draft;
   if (!t) return;
@@ -912,10 +973,13 @@ async function doApply(dryRun = false) {
           : `<div class="err-box">${label}: ${esc(res.error)}</div>`;
       })
       .join('');
-    openModal(dryRun ? 'اعمال آزمایشی' : 'نتیجه اعمال', lines || '<p class="muted">چیزی برای نمایش نیست.</p>', [
-      { text: 'بستن', class: 'primary', onClick: closeModal },
-    ]);
-    if (r.ok) toast('روی سرورها اعمال شد', 'ok');
+    openModal(
+      dryRun ? 'اعمال آزمایشی' : 'نتیجه اعمال',
+      (lines || '<p class="muted">چیزی برای نمایش نیست.</p>') + reachabilityHtml(r.reachability),
+      [{ text: 'بستن', class: 'primary', onClick: closeModal }],
+    );
+    if (r.ok && !r.reachability?.problems?.length) toast('روی سرورها اعمال شد', 'ok');
+    else if (r.ok) toast('اعمال شد، ولی ارتباط دو سرور برقرار نیست', 'err');
   } catch (err) {
     toast(err.message, 'err');
   }

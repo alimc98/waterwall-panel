@@ -6,11 +6,12 @@ const fs = require('node:fs');
 const { Store } = require('./lib/store');
 const templates = require('./lib/templates');
 const { buildBundle, renderClientConfig, resolveOptions, regenerateOptions } = require('./lib/build');
-const { validateBundle } = require('./lib/generator');
+const { validateBundle, preprocessConfig } = require('./lib/generator');
 const ssh = require('./lib/ssh');
 const tests = require('./lib/tests');
 const protoscan = require('./lib/protoscan');
 const versions = require('./lib/versions');
+const netcheck = require('./lib/netcheck');
 const { Router, sendJson, sendError, sendText, parseJsonBody, serveStatic, parseUrl } = require('./lib/http');
 const { timingSafeEqual, readBody } = require('./lib/util');
 
@@ -337,7 +338,73 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   }
   store.log({ type: 'tunnel.apply', tunnelId: tunnel.id, sides, results });
   broadcast('tunnels', store.listTunnels());
-  sendJson(res, 200, { ok: Object.values(results).every((r) => r.ok), results });
+
+  // A tunnel can upload cleanly and still be dead because the far side's
+  // firewall never let the link port through. Measuring it here turns a silent
+  // failure into an explicit, actionable message instead of a config hunt.
+  let reachability = null;
+  if (body.check !== false && servers.iran && servers.foreign) {
+    try {
+      reachability = await netcheck.checkTunnel((s, c, o) => ssh.sshExec(s, c, o), servers, {
+        link: listenerPort(bundle, 'foreign'),
+        user: listenerPort(bundle, 'iran'),
+      });
+    } catch (err) {
+      reachability = { error: err.message, problems: [] };
+    }
+  }
+
+  sendJson(res, 200, { ok: Object.values(results).every((r) => r.ok), results, reachability });
+});
+
+/**
+ * The first port a side listens on for connections.
+ *
+ * Read straight out of the emitted JSON so the reported port can never drift
+ * from what the template actually produced.
+ */
+function listenerPort(bundle, side) {
+  for (const [file, text] of Object.entries(bundle.bundles?.[side] || {})) {
+    if (!file.startsWith('configs/')) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(preprocessConfig(text).text);
+    } catch {
+      continue;
+    }
+    for (const node of parsed.nodes || []) {
+      if (!/Listener$/.test(String(node.type || ''))) continue;
+      const port = node.settings?.port;
+      if (port !== undefined && /^\d+$/.test(String(port))) return Number(port);
+    }
+  }
+  return null;
+}
+
+/**
+ * Apply the firewall rule the reachability check suggested.
+ *
+ * Narrow on purpose: only scoped `ufw allow` rules the panel itself derived are
+ * accepted, so this endpoint cannot be used to run arbitrary commands on a live
+ * host or to open a port to the world.
+ */
+router.post('/api/tunnels/:id/fix-firewall', async (req, res, ctx) => {
+  if (guard(req, res)) return;
+  const tunnel = store.getTunnel(ctx.params.id);
+  if (!tunnel) return sendError(res, 404, 'tunnel not found');
+  const body = await parseJsonBody(req);
+  const servers = findServers(tunnel);
+  const command = String(body.command || '');
+  if (!command) return sendError(res, 400, 'command is required');
+
+  // Work out which server the rule belongs to from its own shape.
+  const target = command.includes(servers.iran.host) ? servers.iran : servers.foreign;
+  if (!target) return sendError(res, 400, 'no server to apply this to');
+
+  const result = await netcheck.applyFirewallFix((s, c, o) => ssh.sshExec(s, c, o), target, command);
+  if (!result.ok) return sendError(res, 400, result.error);
+  store.log({ type: 'firewall.fix', tunnelId: tunnel.id, command, output: result.output });
+  sendJson(res, 200, { ok: true, command, server: target.name, output: result.output });
 });
 
 router.post('/api/tunnels/:id/service', async (req, res, ctx) => {
