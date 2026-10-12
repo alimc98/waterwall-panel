@@ -378,6 +378,126 @@ function netcheckTests() {
 
 const netcheckPending = netcheckTests();
 
+// ---- certificate handling -------------------------------------------------
+// The domain field ends up inside an openssl -subj and, for Let's Encrypt,
+// inside a command line on a remote host. Validation has to reject shell
+// syntax here, before it is ever concatenated into anything.
+function certTests() {
+  const fs2 = require('node:fs');
+  const certs = require('../lib/certs');
+
+  // Accepted shapes.
+  for (const ok of ['example.com', 'a.b.co.uk', 'xn--80ak6aa92e.com', 'sub.domain.example.org']) {
+    assert.strictEqual(certs.validateDomain(ok).ok, true, ok + ' should be a valid domain');
+  }
+
+  // Normalisation: scheme and path are stripped, case is folded.
+  assert.strictEqual(certs.normaliseDomain('https://Example.COM/path'), 'example.com');
+  assert.strictEqual(certs.normaliseDomain('  EXAMPLE.com  '), 'example.com');
+
+  // Rejected shapes. The shell-injection cases matter most: this value is
+  // interpolated into a remote command line.
+  for (const bad of [
+    '',
+    '   ',
+    'not a domain',
+    'example.com; rm -rf /',
+    'example.com && curl evil',
+    'example.com|cat',
+    '-bad.com',
+    'bad-.com',
+    'example..com',
+    '.example.com',
+    'exam ple.com',
+    'http://',
+    'a'.repeat(250) + '.com',
+    '<script>',
+    '$(whoami)',
+    "`id`",
+  ]) {
+    assert.strictEqual(certs.validateDomain(bad).ok, false, JSON.stringify(bad) + ' must be rejected');
+  }
+
+  // Expiry arithmetic drives both the UI badge and the renewal decision.
+  const inDays = (n) => new Date(Date.now() + n * 86400000).toISOString();
+  assert.strictEqual(certs.statusOf({ notAfter: inDays(200) }), 'valid');
+  assert.strictEqual(certs.statusOf({ notAfter: inDays(10) }), 'expiring', 'inside 30 days must warn');
+  assert.strictEqual(certs.statusOf({ notAfter: inDays(-1) }), 'expired');
+  assert.strictEqual(certs.statusOf({ notAfter: null }), 'unknown');
+  assert.strictEqual(certs.daysUntil(null), null);
+  assert.strictEqual(certs.daysUntil(inDays(10)), 10);
+
+  // One managed location, so the panel and the core cannot disagree.
+  assert.strictEqual(certs.CERT_PATH, '/etc/waterwall/cert/fullchain.pem');
+  assert.strictEqual(certs.KEY_PATH, '/etc/waterwall/cert/privkey.pem');
+
+  // A template that lets the user configure a certificate path must also offer
+  // the automatic route: a form where you can paste a path but never fill in a
+  // domain is the gap this feature is meant to close.
+  //
+  // Deliberately keyed off certPath being *exposed*, not off the template
+  // mentioning TlsServer: Reality needs no certificate, and the packet-level
+  // templates only offer optional TLS termination for users.
+  const noDomainField = templates.ALL.filter((tpl) => {
+    const keys = (tpl.fields || []).map((f) => f.key);
+    return keys.includes('certPath') && !keys.includes('domain');
+  }).map((tpl) => tpl.id);
+  assert.deepStrictEqual(
+    noDomainField,
+    [],
+    'these templates expose certPath but no domain field: ' + noDomainField.join(', '),
+  );
+
+  // And no template may reintroduce a hardcoded /root certificate path, which
+  // would silently bypass the managed location.
+  const TPL_DIR = require('node:path').join(__dirname, '..', 'lib', 'templates') + require('node:path').sep;
+  const FILE_OF = {
+    'tcp-forward': 'basic.js', 'udp-forward': 'basic.js', 'tcp-udp-forward': 'basic.js',
+    'encrypted-tcp': 'basic.js', 'xor-obfuscated': 'basic.js',
+    'vless-tls': 'stream.js', 'vless-mux-tls': 'stream.js', 'vless-reality': 'stream.js',
+    'trojan-tls': 'stream.js', 'vless-http-ws-tls': 'stream.js', 'udp-over-tcp': 'stream.js',
+    'http-proxy': 'proxy.js', 'socks5-upstream': 'proxy.js',
+    'tun-wireguard': 'layer3.js', 'rootless-socks-wireguard': 'layer3.js', 'tun-tcp-tunnel': 'layer3.js',
+    'reverse-tls': 'reverse.js', 'reverse-plain': 'reverse.js', 'reverse-reality': 'reverse-reality.js',
+    'tcp-bit-swap': 'bitswap.js', 'tcp-bit-swap-mux': 'bitswap.js', 'tcp-bit-swap-mux-2': 'bitswap.js',
+    protoswap: 'protoswap.js',
+    'half-duplex': 'stream-adv.js', 'stream-fragmenter': 'stream-adv.js', 'connection-fisher': 'stream-adv.js',
+    'tun2socks': 'l3-new.js', 'ping-tunnel': 'l3-new.js',
+    'first-sni': 'stealth.js', 'sni-blender': 'stealth.js', 'disturber-lab': 'stealth.js',
+    'tcp-over-udp': 'transport.js', 'header-proxy': 'transport.js',
+    'router-split': 'ops.js', 'auth-users': 'ops.js', 'vless-hardened': 'ops.js',
+    speedtest: 'ops.js', 'tester-chain': 'ops.js',
+  };
+  const offenders = [];
+  for (const file of new Set(Object.values(FILE_OF))) {
+    const source = fs2.readFileSync(TPL_DIR + file, 'utf8');
+    if (source.includes('/root/fullchain.pem') || source.includes('/root/privkey.pem')) offenders.push(file);
+  }
+  assert.deepStrictEqual(offenders, [], 'these template files bypass the managed certificate path: ' + offenders.join(', '));
+}
+/** Template id -> file, following the mapping in lib/templates/index.js. */
+function idToFile(id) {
+  const map = {
+    'tcp-forward': 'basic.js', 'udp-forward': 'basic.js', 'tcp-udp-forward': 'basic.js',
+    'encrypted-tcp': 'basic.js', 'xor-obfuscated': 'basic.js',
+    'vless-tls': 'stream.js', 'vless-mux-tls': 'stream.js', 'vless-reality': 'stream.js',
+    'trojan-tls': 'stream.js', 'vless-http-ws-tls': 'stream.js', 'udp-over-tcp': 'stream.js',
+    'http-proxy': 'proxy.js', 'socks5-upstream': 'proxy.js',
+    'tun-wireguard': 'layer3.js', 'rootless-socks-wireguard': 'layer3.js', 'tun-tcp-tunnel': 'layer3.js',
+    'reverse-tls': 'reverse.js', 'reverse-plain': 'reverse.js', 'reverse-reality': 'reverse-reality.js',
+    'tcp-bit-swap': 'bitswap.js', 'tcp-bit-swap-mux': 'bitswap.js', 'tcp-bit-swap-mux-2': 'bitswap.js',
+    protoswap: 'protoswap.js',
+    'half-duplex': 'stream-adv.js', 'stream-fragmenter': 'stream-adv.js', 'connection-fisher': 'stream-adv.js',
+    'tun2socks': 'l3-new.js', 'ping-tunnel': 'l3-new.js',
+    'first-sni': 'stealth.js', 'sni-blender': 'stealth.js', 'disturber-lab': 'stealth.js',
+    'tcp-over-udp': 'transport.js', 'header-proxy': 'transport.js',
+    'router-split': 'ops.js', 'auth-users': 'ops.js', 'vless-hardened': 'ops.js',
+    speedtest: 'ops.js', 'tester-chain': 'ops.js',
+  };
+  return map[id] || 'basic.js';
+}
+certTests();
+
 // ---- store round trip -----------------------------------------------------
 assert.strictEqual(store.listServers().length, 2, 'server store');
 assert.ok(store.addTunnel({ name: 'x', template: 'tcp-forward' }).id, 'tunnel store');

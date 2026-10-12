@@ -12,6 +12,7 @@ const tests = require('./lib/tests');
 const protoscan = require('./lib/protoscan');
 const versions = require('./lib/versions');
 const netcheck = require('./lib/netcheck');
+const certs = require('./lib/certs');
 const { Router, sendJson, sendError, sendText, parseJsonBody, serveStatic, parseUrl } = require('./lib/http');
 const { timingSafeEqual, readBody } = require('./lib/util');
 
@@ -24,6 +25,7 @@ const PUBLIC_DIR = path.join(ROOT, 'public');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const store = new Store(DATA_DIR);
+const certStore = new certs.CertStore(DATA_DIR);
 const panelToken = process.env.WW_PANEL_TOKEN || store.getPanel().token;
 
 // ---------------------------------------------------------------- helpers
@@ -228,6 +230,84 @@ router.post('/api/servers/:id/service', async (req, res, ctx) => {
 });
 
 // ---- tunnels -------------------------------------------------------------
+// ---- certificates ---------------------------------------------------------
+/** Everything the panel knows about certificates, read back from the servers. */
+router.get('/api/certs', async (req, res) => {
+  if (guard(req, res)) return;
+  const servers = store.listServers();
+  const rows = [];
+  for (const server of servers) {
+    const live = await certs.inspect((sv, c, o) => ssh.sshExec(sv, c, o), server).catch((err) => ({
+      present: false,
+      error: err.message,
+    }));
+    const known = live.present && live.commonName ? certStore.find(live.commonName) : null;
+    rows.push({
+      server: { id: server.id, name: server.name, role: server.role, host: server.host },
+      live: { ...live, status: live.notAfter ? certs.statusOf(live) : 'missing', daysLeft: certs.daysUntil(live.notAfter) },
+      record: known || null,
+    });
+  }
+  sendJson(res, 200, { ok: true, certPath: certs.CERT_PATH, keyPath: certs.KEY_PATH, servers: rows });
+});
+
+/** Issue or renew a certificate on one server. */
+router.post('/api/certs', async (req, res) => {
+  if (guard(req, res)) return;
+  const body = await parseJsonBody(req);
+  const servers = store.listServers();
+  const server =
+    servers.find((x) => x.id === body.serverId) ||
+    servers.find((x) => x.role === (body.role || 'foreign')) ||
+    null;
+  if (!server) return sendError(res, 400, 'no server to issue on; pass serverId or register one with that role');
+
+  const domain = certs.normaliseDomain(body.domain);
+  const check = certs.validateDomain(domain);
+  if (!check.ok) return sendError(res, 400, check.error);
+
+  const mode = ['auto', 'letsencrypt', 'self-signed', 'none'].includes(body.mode) ? body.mode : 'auto';
+  if (mode === 'none') return sendError(res, 400, 'mode "none" issues nothing');
+
+  const result = await certs.ensure((sv, c, o) => ssh.sshExec(sv, c, o), server, {
+    domain,
+    mode,
+    email: String(body.email || '').trim(),
+    serverIp: body.serverIp || server.host,
+    force: body.force !== false,
+  });
+
+  if (!result.ok) {
+    store.log({ type: 'cert.fail', serverId: server.id, domain, error: result.error });
+    return sendJson(res, 200, { ok: false, error: result.error, reason: result.reason || null, domain });
+  }
+
+  const record = certStore.put({
+    domain: result.domain,
+    serverId: server.id,
+    serverName: server.name,
+    mode: result.mode,
+    commonName: result.commonName,
+    issuer: result.issuer || null,
+    notAfter: result.notAfter,
+    fingerprint: result.fingerprint,
+    certPath: result.certPath,
+    keyPath: result.keyPath,
+    fallbackNote: result.fallbackNote || null,
+  });
+  store.log({ type: 'cert.issue', serverId: server.id, domain, mode: result.mode });
+  sendJson(res, 200, { ok: true, cert: { ...record, status: certs.statusOf(record), daysLeft: certs.daysUntil(record.notAfter) } });
+});
+
+router.delete('/api/certs/:id', (req, res, ctx) => {
+  if (guard(req, res)) return;
+  const removed = certStore.remove(ctx.params.id);
+  if (!removed) return sendError(res, 404, 'certificate record not found');
+  // The file itself is left alone on purpose: deleting it out from under a
+  // running tunnel would take the service down, and the user may still be using it.
+  sendJson(res, 200, { ok: true, note: 'رکورد حذف شد؛ فایل گواهی روی سرور دست‌نخورده باقی ماند.' });
+});
+
 router.get('/api/tunnels', (req, res) => {
   if (guard(req, res)) return;
   sendJson(res, 200, { ok: true, tunnels: store.listTunnels() });
@@ -312,6 +392,48 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
     return sendError(res, 400, 'generated configuration is invalid', { problems: bundle.problems });
   }
   const servers = findServers(tunnel);
+
+  // A tunnel with a domain gets its certificate handled before anything is
+  // written, so the service never starts against a missing or expired file.
+  let certificate = null;
+  if (body.checkCertificates !== false) {
+    // The certificate belongs on whichever side actually holds TlsServer. Most
+    // templates put it on the exit box, but the reverse templates put it on the
+    // Iran box, and picking the wrong one would install a certificate where
+    // nothing reads it.
+    const target = tlsServerSide(bundle) === 'iran' ? servers.iran || servers.foreign : servers.foreign || servers.iran;
+    const domain = certs.normaliseDomain(tunnel.options?.domain);
+    if (target && domain && certs.validateDomain(domain).ok) {
+      const mode = tunnel.options?.certMode || 'auto';
+      if (mode !== 'none') {
+        const result = await certs.ensure((sv, c, o) => ssh.sshExec(sv, c, o), target, {
+          domain,
+          mode,
+          email: tunnel.options?.certEmail || '',
+          serverIp: target.host,
+        });
+        if (result.ok) {
+          certificate = certStore.put({
+            domain: result.domain,
+            serverId: target.id,
+            serverName: target.name,
+            mode: result.mode,
+            commonName: result.commonName,
+            issuer: result.issuer || null,
+            notAfter: result.notAfter,
+            fingerprint: result.fingerprint,
+            certPath: result.certPath,
+            keyPath: result.keyPath,
+          });
+        } else {
+          // Failing to issue is not fatal on its own: a certificate may already
+          // be installed by hand at the configured path.
+          certificate = { error: result.error, reason: result.reason || null, fatal: false };
+        }
+      }
+    }
+  }
+
   const results = {};
   for (const side of sides) {
     const server = servers[side];
@@ -354,15 +476,34 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
     }
   }
 
-  sendJson(res, 200, { ok: Object.values(results).every((r) => r.ok), results, reachability });
+  sendJson(res, 200, { ok: Object.values(results).every((r) => r.ok), results, reachability, certificate });
 });
 
 /**
- * The first port a side listens on for connections.
+ * Which side of a built bundle holds the TlsServer node.
  *
- * Read straight out of the emitted JSON so the reported port can never drift
- * from what the template actually produced.
+ * The certificate goes there. Most templates put it on the foreign box, but the
+ * reverse templates put the server side on the Iran box instead, so the side is
+ * decided by reading the node types rather than assuming.
  */
+function tlsServerSide(bundle) {
+  for (const side of ['iran', 'foreign']) {
+    for (const [file, text] of Object.entries(bundle.bundles?.[side] || {})) {
+      if (!file.startsWith('configs/')) continue;
+      try {
+        const parsed = JSON.parse(preprocessConfig(text).text);
+        const has = (parsed.nodes || []).some((n) => n.type === 'TlsServer');
+        if (has) return side;
+      } catch {
+        /* an unparseable config is already reported by validateBundle */
+      }
+    }
+  }
+  return 'foreign';
+}
+
+/**
+ * The first port a side listens on for connections.
 function listenerPort(bundle, side) {
   for (const [file, text] of Object.entries(bundle.bundles?.[side] || {})) {
     if (!file.startsWith('configs/')) continue;

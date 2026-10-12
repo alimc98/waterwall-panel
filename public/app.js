@@ -8,6 +8,10 @@ const state = {
   tunnels: [],
   templates: [],
   versions: null,
+  certs: null,
+  certsPageToken: 0,
+  lastCertPage: -1,
+  lastRenderedPage: null,
   page: 'dashboard',
   selectedTemplate: null,
   draft: null,        // working copy of the tunnel form
@@ -166,6 +170,15 @@ async function loadAll() {
   state.versions = data.versions || null;
 }
 
+/** Certificate state is fetched separately; it is not part of bootstrap. */
+async function loadCerts() {
+  try {
+    state.certs = await api('/api/certs');
+  } catch (err) {
+    state.certs = null;
+  }
+}
+
 // ------------------------------------------------------------ live events
 let eventSource = null;
 function connectEvents() {
@@ -227,6 +240,12 @@ function go(page) {
 
 function render() {
   const el = $('#content');
+  // A page change is the trigger for one-shot page setup. Bumping here rather
+  // than in one navigation helper covers every way into the page.
+  if (state.lastRenderedPage !== state.page) {
+    state.lastRenderedPage = state.page;
+    state.certsPageToken += 1;
+  }
   const fns = {
     dashboard: pageDashboard,
     servers: pageServers,
@@ -235,6 +254,7 @@ function render() {
     edit: pageEditTunnel,
     test: pageTest,
     api: pageApi,
+    certs: pageCerts,
   };
   el.innerHTML = (fns[state.page] || pageDashboard)();
   afterRender();
@@ -340,6 +360,107 @@ function versionCardHtml() {
           </details>`
         : ''
     }
+  </div>`;
+}
+
+// ================================================================= certificates
+/**
+ * Certificate page.
+ *
+ * The point of this screen is that a certificate can silently be wrong for a
+ * long time, so it shows each server's live state (read from the box now, not
+ * from the panel's cache), the managed location, and a form to issue one.
+ */
+function pageCerts() {
+  if (!state.certs) {
+    return '<div class="page-head"><h2>گواهی‌ها</h2></div><div class="card"><div class="empty">در حال خواندن…</div></div>';
+  }
+
+  const BADGE = {
+    valid: ['معتبر', 'ok'],
+    expiring: ['نزدیک انقضا', 'err'],
+    expired: ['منقضی', 'err'],
+    missing: ['ندارد', ''],
+    unknown: ['نامشخص', ''],
+  };
+
+  const servers = (state.certs.servers || [])
+    .map((row) => {
+      const live = row.live || {};
+      const key = !live.present ? 'missing' : live.status || 'unknown';
+      const [text, cls] = BADGE[key] || ['?', ''];
+      const days = live.daysLeft;
+      return `<tr>
+        <td><strong>${esc(row.server.name)}</strong><br><span class="badge">${esc(row.server.role)}</span></td>
+        <td class="ltr small">${esc(row.server.host)}</td>
+        <td class="ltr"><span class="badge ${cls}">${esc(text)}</span>${days !== null && days !== undefined ? `<div class="small muted ltr">${days} روز</div>` : ''}</td>
+        <td class="ltr small">${esc(live.commonName || live.reason || '—')}</td>
+        <td class="ltr small">${esc(live.notAfter ? fmtDate(live.notAfter) : '—')}</td>
+        <td class="ltr small" style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="${esc(live.fingerprint || '')}">${esc(live.fingerprint || '—')}</td>
+      </tr>`;
+    })
+    .join('');
+
+  return `
+  <div class="page-head">
+    <h2>گواهی‌ها</h2>
+    <span class="desc">ساخت خودکار گواهی TLS برای تونل‌ها</span>
+    <div class="spacer"></div>
+    <button class="primary" id="certIssue">➕ صدور گواهی</button>
+  </div>
+
+  <div class="card">
+    <h3>وضعیت روی سرورها</h3>
+    <p class="small muted" style="line-height:2">
+      گواهی‌ها در ${esc(state.certs.certPath)} نصب می‌شوند. وقتی در تونل فیلد «دامنه» را پر کنید،
+      پنل هنگام اعمال خودکار گواهی را می‌سازد یا تمدید می‌کند.
+    </p>
+    <table><thead><tr>
+      <th>سرور</th><th>آدرس</th><th>وضعیت</th><th>دامنه (CN)</th><th>انقضا</th><th>اثر انگشت</th>
+    </tr></thead><tbody>${servers || '<tr><td colspan="6" class="empty">سروری ثبت نشده است.</td></tr>'}</tbody></table>
+  </div>
+
+  <div class="card">
+    <h3>صدور گواهی جدید</h3>
+    <p class="small muted" style="line-height:2">
+      این فرم مستقل از تونل است. برای اینکه هر تونل خودکار گواهی بگیرد، در همان تونل
+      فیلد «دامنه» را پر کنید.
+    </p>
+    <div class="row">
+      <label class="f" style="flex:1;min-width:220px;margin:0">
+        <span class="lbl">دامنه</span>
+        <input type="text" id="certDomain" placeholder="example.com">
+      </label>
+      <label class="f" style="width:180px;margin:0">
+        <span class="lbl">روش</span>
+        <select id="certMode">
+          <option value="auto">خودکار (CA یا خودامضا)</option>
+          <option value="letsencrypt">فقط Let's Encrypt</option>
+          <option value="self-signed">فقط خودامضا</option>
+        </select>
+      </label>
+      <label class="f" style="width:180px;margin:0">
+        <span class="lbl">سرور</span>
+        <select id="certServer"></select>
+      </label>
+      <label class="f" style="width:180px;margin:0">
+        <span class="lbl">ایمیل (اختیاری)</span>
+        <input type="text" id="certEmail" placeholder="you@example.com">
+      </label>
+      <button class="primary" id="certIssueNow" style="margin-top:22px">صدور</button>
+    </div>
+    <div id="certOut" class="mt"></div>
+    <div style="margin-top:14px">
+      <details>
+        <summary class="small" style="cursor:pointer">پیش‌نیازهای Let's Encrypt</summary>
+        <ul class="small muted" style="line-height:2.1;padding-inline-start:20px">
+          <li>رکورد A دامنه باید به IP عمومی همان سرور اشاره کند</li>
+          <li>پورت ۸۰ روی آن سرور باید از اینترنت باز باشد (چالش http-01)</li>
+          <li>هیچ سرویس دیگری نباید روی پورت ۸۰ گوش بدهد</li>
+          <li>اگر این شرط‌ها برقرار نباشد، حالت «خودکار» بی‌سروصدا گواهی خودامضا می‌سازد</li>
+        </ul>
+      </details>
+    </div>
   </div>`;
 }
 
@@ -1399,7 +1520,90 @@ function pageApi() {
 }
 
 // =============================================================== afterRender
+/**
+ * Certificate page actions.
+ *
+ * A failed Let's Encrypt attempt in "auto" mode is not an error the user should
+ * have to interpret: the panel already fell back to a self-signed certificate,
+ * so the message says what happened and why rather than leaving the box empty.
+ */
+async function doIssueCert() {
+  const out = document.getElementById('certOut');
+  const domain = document.getElementById('certDomain').value.trim();
+  const mode = document.getElementById('certMode').value;
+  const serverId = document.getElementById('certServer').value;
+  const email = document.getElementById('certEmail').value.trim();
+
+  if (!domain) {
+    out.innerHTML = '<div class="err-box">دامنه را وارد کنید.</div>';
+    return;
+  }
+  out.innerHTML = '<div class="small muted">در حال صدور… این کار ممکن است تا یک دقیقه طول بکشد.</div>';
+
+  try {
+    const r = await api('/api/certs', { method: 'POST', body: { domain, mode, serverId, email } });
+    if (!r.ok) {
+      const reason = r.reason
+        ? '<br><span class="small">علت فنی: <span class="mono">' + esc(r.reason) + '</span></span>'
+        : '';
+      out.innerHTML = '<div class="err-box">' + esc(r.error || 'صدور ناموفق بود') + reason + '</div>';
+      return;
+    }
+    const c = r.cert;
+    const note = c.fallbackNote ? '<br><span class="small muted">' + esc(c.fallbackNote) + '</span>' : '';
+    out.innerHTML =
+      '<div class="ok-box"><b>' + esc(c.domain) + '</b> — ' + esc(c.mode) +
+      '<br>تا ' + esc(fmtDate(c.notAfter)) + ' (' + c.daysLeft + ' روز)' + note + '</div>';
+    await loadCerts();
+    render();
+  } catch (err) {
+    out.innerHTML = '<div class="err-box">' + esc(err.message) + '</div>';
+  }
+}
+
+async function fillCertServerPicker() {
+  const sel = document.getElementById('certServer');
+  if (!sel) return;
+  const servers = state.servers || [];
+  sel.innerHTML = servers.length
+    ? servers
+        .map((x) => '<option value="' + esc(x.id) + '">' + esc(x.name) + ' (' + esc(x.role === 'iran' ? 'ایران' : 'خارج') + ')</option>')
+        .join('')
+    : '<option value="">سروری ثبت نشده</option>';
+  // Default to the exit box, which is where most templates need a certificate.
+  const foreign = servers.find((x) => x.role === 'foreign');
+  if (foreign) sel.value = foreign.id;
+}
+
+/**
+ * Wire the certificate page actions.
+ *
+ * Called from afterRender(), where the page DOM exists: attaching these when
+ * the script first loads would find no elements, because the page is rendered
+ * on demand.
+ */
+function wireCertActions() {
+  const btn = document.getElementById('certIssueNow');
+  if (btn && btn.dataset.wired !== '1') {
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', doIssueCert);
+  }
+  const focus = document.getElementById('certIssue');
+  if (focus && focus.dataset.wired !== '1') {
+    focus.dataset.wired = '1';
+    focus.addEventListener('click', () => document.getElementById('certDomain')?.focus());
+  }
+  fillCertServerPicker();
+}
+
 function afterRender() {
+  wireCertActions();
+  // Reload certificate state only when the page is *opened*, never on every
+  // render: re-rendering from here would recurse forever.
+  if (state.page === 'certs' && state.lastCertPage !== state.certsPageToken) {
+    state.lastCertPage = state.certsPageToken;
+    loadCerts().then(render);
+  }
   // dashboard
   $('#quickNew')?.addEventListener('click', () => go('new'));
   $('#dashServers')?.addEventListener('click', () => go('servers'));

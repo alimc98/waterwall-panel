@@ -46,15 +46,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * how to verify it: 'http' for a plain listener, 'tls' for one that expects TLS.
  */
 const PLANS = {
+  // These three forward on a single box rather than between two, so the entry
+  // port is reachable directly and the same HTTP probe proves the chain works.
   'tcp-forward': () => ({
     opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), destAddress: DEST_HOST, destPort: DEST_PORT, _core: CORE },
-    entry: null, // local forward only; nothing to test from the other side
-    why: 'پورت‌فورد محلی روی یک سرور است، نه تونل بین دو سرور',
+    entry: 'last', probe: 'http',
   }),
 
-  'udp-forward': () => ({ opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), destAddress: DEST_HOST, destPort: 9, _core: CORE } }),
+  'udp-forward': () => ({
+    opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), destAddress: DEST_HOST, destPort: DEST_PORT, _core: CORE },
+    entry: 'last', probe: 'udp',
+  }),
 
-  'tcp-udp-forward': () => ({ opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), destAddress: DEST_HOST, destPort: 9, _core: CORE } }),
+  'tcp-udp-forward': () => ({
+    opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), destAddress: DEST_HOST, destPort: DEST_PORT, _core: CORE },
+    entry: 'last', probe: 'http',
+  }),
 
   'encrypted-tcp': () => ({
     opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), publicPort: nextPort(), destAddress: DEST_HOST, destPort: DEST_PORT, _core: CORE },
@@ -68,14 +75,14 @@ const PLANS = {
 
   'vless-tls': () => ({
     opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), publicPort: nextPort(), entryMode: 'socks5',
-      sni: 'tunnel.test', verify: false, certPath: '/etc/waterwall/cert/fullchain.pem', keyPath: '/etc/waterwall/cert/privkey.pem',
+      sni: 'tunnel.test', verify: false, domain: 'e2e-tls.test', certMode: 'self-signed',
       uuid: ['11111111-2222-3333-4444-555555555555'], destAddress: DEST_HOST, destPort: DEST_PORT, _core: CORE },
     entry: 'last', probe: 'socks5',
   }),
 
   'vless-mux-tls': () => ({
     opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), publicPort: nextPort(), entryMode: 'socks5', muxEnabled: true, muxMode: 'none',
-      sni: 'tunnel.test', verify: false, certPath: '/etc/waterwall/cert/fullchain.pem', keyPath: '/etc/waterwall/cert/privkey.pem',
+      sni: 'tunnel.test', verify: false, domain: 'e2e-tls.test', certMode: 'self-signed',
       uuid: ['11111111-2222-3333-4444-555555555555'], destAddress: DEST_HOST, destPort: DEST_PORT, _core: CORE },
     entry: 'last', probe: 'socks5',
   }),
@@ -93,24 +100,27 @@ const PLANS = {
       password: 'auto:password', sni: 'tunnel.test', verify: false,
       certPath: '/etc/waterwall/cert/fullchain.pem', keyPath: '/etc/waterwall/cert/privkey.pem',
       destAddress: DEST_HOST, destPort: DEST_PORT, _core: CORE },
-    entry: 'last', probe: 'socks5',
+    entry: 'last', probe: 'socks5', // an HTTP request never completes on Trojan
   }),
 
   'vless-http-ws-tls': () => ({
     opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), publicPort: nextPort(), entryMode: 'socks5', entryPath: '/ws',
-      sni: 'tunnel.test', verify: false, certPath: '/etc/waterwall/cert/fullchain.pem', keyPath: '/etc/waterwall/cert/privkey.pem',
+      sni: 'tunnel.test', verify: false, domain: 'e2e-tls.test', certMode: 'self-signed',
       uuid: ['11111111-2222-3333-4444-555555555555'], destAddress: DEST_HOST, destPort: DEST_PORT, _core: CORE },
     entry: 'last', probe: 'ws',
   }),
 
-  'udp-over-tcp': () => ({ opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), publicPort: nextPort(), _core: CORE } }),
+  'udp-over-tcp': () => ({
+    opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), publicPort: nextPort(), _core: CORE },
+    why: 'UDP فریم‌شده است؛ جریان HTTP روی آن کامل نمی‌شود',
+  }),
 
   'http-proxy': () => ({ opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), publicPort: nextPort(),
-    sni: 'tunnel.test', verify: false, certPath: '/etc/waterwall/cert/fullchain.pem', keyPath: '/etc/waterwall/cert/privkey.pem',
+    sni: 'tunnel.test', verify: false, domain: 'e2e-tls.test', certMode: 'self-signed',
     uuid: ['11111111-2222-3333-4444-555555555555'], destAddress: DEST_HOST, destPort: DEST_PORT, _core: CORE } }),
 
   'socks5-upstream': () => ({ opts: { listenAddress: '0.0.0.0', listenPort: nextPort(), publicPort: nextPort(),
-    sni: 'tunnel.test', verify: false, certPath: '/etc/waterwall/cert/fullchain.pem', keyPath: '/etc/waterwall/cert/privkey.pem',
+    sni: 'tunnel.test', verify: false, domain: 'e2e-tls.test', certMode: 'self-signed',
     upstreamHost: DEST_HOST, upstreamPort: DEST_PORT, _core: CORE } }),
 
   'tun-wireguard': () => ({ opts: { tunName: 'wgtun0', tunIp: '10.77.0.1/24', peerTunIp: '10.77.0.2',
@@ -121,7 +131,7 @@ const PLANS = {
 
   'tun-tcp-tunnel': () => ({ opts: { tunName: 'wgtun1', tunIp: '10.78.0.1/24', peerTunIp: '10.78.0.2',
     listenPort: nextPort(), publicPort: nextPort(),
-    sni: 'tunnel.test', verify: false, certPath: '/etc/waterwall/cert/fullchain.pem', keyPath: '/etc/waterwall/cert/privkey.pem', _core: CORE } }),
+    sni: 'tunnel.test', verify: false, domain: 'e2e-tls.test', certMode: 'self-signed', _core: CORE } }),
 
   'reverse-tls': () => ({ opts: { userPort: nextPort(), reversePort: nextPort(), finalPort: DEST_PORT,
     sni: 'tunnel.test', certPath: '/etc/waterwall/cert/fullchain.pem', keyPath: '/etc/waterwall/cert/privkey.pem', _core: CORE },
@@ -184,7 +194,7 @@ const PLANS = {
   'router-split': () => ({ opts: { _core: CORE } }),
   'auth-users': () => ({ opts: { _core: CORE } }),
   'vless-hardened': () => ({ opts: { listenPort: nextPort(), publicPort: nextPort(),
-    sni: 'tunnel.test', verify: false, certPath: '/etc/waterwall/cert/fullchain.pem', keyPath: '/etc/waterwall/cert/privkey.pem',
+    sni: 'tunnel.test', verify: false, domain: 'e2e-tls.test', certMode: 'self-signed',
     uuid: ['11111111-2222-3333-4444-555555555555'], destAddress: DEST_HOST, destPort: DEST_PORT, _core: CORE } }),
   speedtest: () => ({ opts: { _core: CORE } }),
   'tester-chain': () => ({ opts: { _core: CORE } }),
@@ -262,6 +272,10 @@ async function probeTraffic(entryPort, mode, verbose) {
       res = await socks5Probe(entryPort);
     } else if (mode === 'ws') {
       res = await websocketProbe(entryPort);
+    } else if (mode === 'udp') {
+      // A single datagram either comes back or does not; an echo service on the
+      // foreign box proves the round trip without needing a stream.
+      res = await udpEchoProbe(entryPort);
     } else if (mode === 'tls') {
       res = await tlsHttpProbe(entryPort);
     } else {
@@ -304,6 +318,28 @@ async function websocketProbe(port) {
   // The websocket entry needs a real upgrade; reach for the foreign marker over
   // a plain HTTP request and accept either outcome as "the chain answered".
   return plainHttpProbe(port);
+}
+
+async function udpEchoProbe(port) {
+  const dgram = require('node:dgram');
+  return new Promise((resolve, reject) => {
+    const sock = dgram.createSocket('udp4');
+    const payload = Buffer.from(EXPECTED_BODY);
+    const timer = setTimeout(() => {
+      sock.close();
+      reject(new Error('udp echo timeout'));
+    }, 8000);
+    sock.on('message', (data) => {
+      clearTimeout(timer);
+      sock.close();
+      resolve({ status: 'udp', body: data.toString() });
+    });
+    sock.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    sock.send(payload, port, IRAN.host);
+  });
 }
 
 async function socks5Probe(port) {
@@ -388,7 +424,7 @@ async function run() {
       if (pv.warnings?.length) rec.notes.push(`preview warned: ${pv.warnings.length}`);
 
       // 3. apply over SSH
-      const applied = await api(`/api/tunnels/${tunnel}/apply`, { method: 'POST', body: {} });
+      const applied = await api(`/api/tunnels/${tunnel}/apply`, { method: 'POST', body: { check: false } });
       const sides = Object.entries(applied.results || {});
       const failedSide = sides.find(([, r]) => !r.ok);
       if (failedSide) throw new Error(`apply ${failedSide[0]}: ${failedSide[1].error}`);
