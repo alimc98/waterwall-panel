@@ -1020,8 +1020,12 @@ async function doPreview() {
  * the link port through. Showing the verdict, and the exact rule that fixes it,
  * is the difference between "it says deployed but nothing works" and a one-line
  * fix the user can paste.
+ *
+ * The rule is not just shown, it can be applied: the panel holds the SSH key
+ * and the endpoint only accepts scoped `ufw allow` rules, so a blocked port is
+ * one click instead of an SSH session.
  */
-function reachabilityHtml(r) {
+function reachabilityHtml(r, tunnelId) {
   if (!r) return '';
   if (r.error) return `<div class="err-box">بررسی دسترسی انجام نشد: ${esc(r.error)}</div>`;
 
@@ -1045,19 +1049,26 @@ function reachabilityHtml(r) {
   };
 
   const problems = (r.problems || [])
-    .map(
-      (p) => `<div class="err-box">
+    .map((p, i) => {
+      // Only a rule the panel derived itself is offered back as a button; the
+      // endpoint refuses anything else by shape, so this stays an allow-only
+      // shortcut and never becomes a way to run a command.
+      const apply = p.fix
+        ? `<button class="small" data-fix="${esc(p.fix)}" data-fix-i="${i}" style="margin-top:6px">⚡ اعمال این قانون</button>
+           <span class="small muted" data-fix-out="${i}"></span>`
+        : '';
+      return `<div class="err-box">
         ${esc(p.message)}
-        ${p.fix ? `<br><span class="small">رفع: <code class="mono" style="direction:ltr;display:inline-block">${esc(p.fix)}</code></span>` : ''}
-      </div>`,
-    )
+        ${p.fix ? `<br><span class="small">رفع: <code class="mono" style="direction:ltr;display:inline-block">${esc(p.fix)}</code></span><br>${apply}` : ''}
+      </div>`;
+    })
     .join('');
 
   const good = r.ok
     ? '<div class="ok-box">✓ هر دو سرور به پورت‌های مورد نیاز یکدیگر دسترسی دارند.</div>'
     : '';
 
-  return `<div style="margin-top:14px">
+  return `<div style="margin-top:14px" data-reach="${esc(tunnelId || '')}">
     <h4 style="margin:0 0 8px;font-size:12px;color:var(--accent)">🔗 بررسی دسترسی بین دو سرور</h4>
     <table>
       <thead><tr><th>مسیر</th><th>جهت</th><th>پورت</th><th>وضعیت</th></tr></thead>
@@ -1072,6 +1083,36 @@ function reachabilityHtml(r) {
     </p>
     ${good}${problems}
   </div>`;
+}
+
+/**
+ * Apply a firewall rule the reachability check suggested.
+ *
+ * The command is taken straight from the report rather than from any field the
+ * user could edit, which keeps this one click and keeps the server side's shape
+ * check meaningful.
+ */
+async function doFirewallFix(btn) {
+  const box = document.querySelector(`[data-fix-out="${btn.dataset.fixI}"]`);
+  const tunnelId = btn.closest('[data-reach]')?.dataset.reach;
+  if (!tunnelId || !box) return;
+
+  box.textContent = 'در حال اعمال…';
+  box.className = 'small muted';
+  btn.disabled = true;
+  try {
+    const r = await api(`/api/tunnels/${tunnelId}/fix-firewall`, {
+      method: 'POST',
+      body: { command: btn.dataset.fix },
+    });
+    box.textContent = `✓ روی ${esc(r.server)} اعمال شد`;
+    box.className = 'small';
+    btn.remove();
+  } catch (err) {
+    box.textContent = `✗ ${err.message}`;
+    box.className = 'small';
+    btn.disabled = false;
+  }
 }
 
 async function doApply(dryRun = false) {
@@ -1096,7 +1137,7 @@ async function doApply(dryRun = false) {
       .join('');
     openModal(
       dryRun ? 'اعمال آزمایشی' : 'نتیجه اعمال',
-      (lines || '<p class="muted">چیزی برای نمایش نیست.</p>') + reachabilityHtml(r.reachability),
+      (lines || '<p class="muted">چیزی برای نمایش نیست.</p>') + reachabilityHtml(r.reachability, t.id),
       [{ text: 'بستن', class: 'primary', onClick: closeModal }],
     );
     if (r.ok && !r.reachability?.problems?.length) toast('روی سرورها اعمال شد', 'ok');
@@ -1999,6 +2040,15 @@ window.__wwToken = state.token;
 window.copy = copy;
 
 // ------------------------------------------------------------------ start
+// The reachability report lives inside a modal, so its buttons are created
+// after afterRender() has already run. Delegating from the document means the
+// handler works no matter when the markup appears, and no button can be missed
+// by a wiring step that has to remember to call it.
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest?.('[data-fix]');
+  if (btn) doFirewallFix(btn);
+});
+
 (async function start() {
   if (!state.token) return;
   try {

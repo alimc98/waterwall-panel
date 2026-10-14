@@ -25,7 +25,10 @@ const FOREIGN = { host: '192.227.211.124', role: 'foreign' };
 
 // Both boxes have a single core and 1 GiB, so every config is built for one
 // worker. Four workers on one vCPU is worse than useless.
-const CORE = { workers: 1, ramProfile: 'client', mtu: 1400, bbr: true, splice: true };
+// The test boxes are single-core with 1 GiB. Anything above one worker just
+// competes for the same CPU, and a flapping unit gets misread as a failure.
+const TINY_BOXES = true;
+const CORE = { workers: 1, ramProfile: TINY_BOXES ? 'minimal' : 'client', mtu: 1400, bbr: false, splice: true };
 
 // Ports handed out round-robin so two templates never collide.
 let portCursor = 21000;
@@ -202,7 +205,7 @@ const PLANS = {
 
 // ---------------------------------------------------------------- API client
 
-async function api(path, { method = 'GET', body } = {}) {
+async function api(path, { method = 'GET', body, partial = false } = {}) {
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
@@ -215,7 +218,18 @@ async function api(path, { method = 'GET', body } = {}) {
   } catch {
     throw new Error(`${method} ${path} -> HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
-  if (!res.ok || json.ok === false) throw new Error(json.error || `HTTP ${res.status}`);
+  if (!res.ok || json.ok === false) {
+    // A partial failure (apply reports per side) has no top-level `error`. Reading
+    // only that field turns "the Iran box refused the upload because SSH timed
+    // out" into the useless "HTTP 200", which is exactly what happened for most
+    // of the failures below.
+    if (partial) return json;
+    const nested = Object.entries(json.results || {})
+      .filter(([, r]) => r && r.ok === false)
+      .map(([side, r]) => `${side}: ${(r.error || '').trim() || 'failed'}`)
+      .join('; ');
+    throw new Error(json.error || nested || `HTTP ${res.status}`);
+  }
   return json;
 }
 
@@ -423,14 +437,19 @@ async function run() {
       if (!pv.ok) throw new Error(`preview: ${pv.problems?.join('; ')}`);
       if (pv.warnings?.length) rec.notes.push(`preview warned: ${pv.warnings.length}`);
 
-      // 3. apply over SSH
-      const applied = await api(`/api/tunnels/${tunnel}/apply`, { method: 'POST', body: { check: false } });
+      // 3. apply over SSH. `partial` because apply reports per side: one box
+      // failing must not hide what the other side did.
+      const applied = await api(`/api/tunnels/${tunnel}/apply`, {
+        method: 'POST',
+        body: { check: false },
+        partial: true,
+      });
       const sides = Object.entries(applied.results || {});
       const failedSide = sides.find(([, r]) => !r.ok);
       if (failedSide) throw new Error(`apply ${failedSide[0]}: ${failedSide[1].error}`);
       rec.applied = sides.map(([s]) => s).join('+');
 
-      await sleep(2500);
+      await sleep(6000);
 
       // 4. service + logs
       const states = { iran: await serviceState('iran', tunnel), foreign: await serviceState('foreign', tunnel) };
@@ -476,8 +495,9 @@ async function run() {
           /* the next template overwrites the files anyway */
         }
       }
-      // Let the service settle so the next template starts from a clean file set.
-      await sleep(600);
+      // Let the service settle so the next template starts from a clean file set. A
+      // single-core box needs longer than a workstation to absorb a restart.
+      await sleep(3000);
     }
 
     results.push(rec);
