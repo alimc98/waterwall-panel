@@ -19,10 +19,23 @@ const { timingSafeEqual, readBody } = require('./lib/util');
 const ROOT = __dirname;
 const DATA_DIR = process.env.WW_PANEL_DATA || path.join(ROOT, 'data');
 const PORT = Number(process.env.WW_PANEL_PORT || 8787);
-const HOST = process.env.WW_PANEL_HOST || '0.0.0.0';
+/**
+ * Loopback by default.
+ *
+ * This panel can run arbitrary commands on the registered servers (see
+ * POST /api/servers/:id/ssh), so listening on every interface by default would
+ * hand that capability to anyone who can reach the port. Set WW_PANEL_HOST to
+ * expose it on purpose.
+ */
+const HOST = process.env.WW_PANEL_HOST || '127.0.0.1';
 const PUBLIC_DIR = path.join(ROOT, 'public');
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
+/**
+ * The data directory holds the API token and any stored SSH passwords in plain
+ * text — they have to be readable to be used, so the protection is the file
+ * mode rather than encryption. 0700 keeps it to the panel's own user.
+ */
+fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
 const store = new Store(DATA_DIR);
 const certStore = new certs.CertStore(DATA_DIR);
@@ -32,8 +45,13 @@ const panelToken = process.env.WW_PANEL_TOKEN || store.getPanel().token;
 function bearer(req) {
   const header = req.headers.authorization || '';
   if (header.startsWith('Bearer ')) return header.slice(7).trim();
+  // `EventSource` cannot set request headers, so the event stream is the one
+  // endpoint that has to accept the token as a query parameter. Accepting it
+  // everywhere would write the token into access logs, browser history and
+  // Referer headers on every other request, for no gain.
   const url = parseUrl(req);
-  return url.searchParams.get('token') || '';
+  if (url.pathname === '/api/events') return url.searchParams.get('token') || '';
+  return '';
 }
 
 function isPanelUser(req) {
@@ -205,13 +223,25 @@ router.get('/api/servers/:id/probe', async (req, res, ctx) => {
   sendJson(res, 200, { ok: true, host: info, service });
 });
 
+/**
+ * Run one command on a server.
+ *
+ * This is deliberately unrestricted — a panel that cannot run a command is not
+ * much use when a service will not start — which makes it the highest-value
+ * target on the port. Two things keep that in check: the listener defaults to
+ * loopback, and every call is written to the audit log with the exact command,
+ * so an unexpected one is visible after the fact rather than only in shell
+ * history on a box the operator may not be watching.
+ */
 router.post('/api/servers/:id/ssh', async (req, res, ctx) => {
   if (guard(req, res)) return;
   const server = store.getServer(ctx.params.id);
   if (!server) return sendError(res, 404, 'server not found');
   const body = await parseJsonBody(req);
   if (!body.command) return sendError(res, 400, 'command is required');
-  const result = await ssh.sshExec(server, body.command, { timeout: 60000 });
+  const command = String(body.command);
+  const result = await ssh.sshExec(server, command, { timeout: 60000 });
+  store.log({ type: 'ssh.command', serverId: server.id, command, ok: !result.failed });
   sendJson(res, 200, { ok: !result.failed, ...result });
 });
 
@@ -504,6 +534,10 @@ function tlsServerSide(bundle) {
 
 /**
  * The first port a side listens on for connections.
+ *
+ * Read straight out of the emitted JSON so the reported port can never drift
+ * from what the template actually produced.
+ */
 function listenerPort(bundle, side) {
   for (const [file, text] of Object.entries(bundle.bundles?.[side] || {})) {
     if (!file.startsWith('configs/')) continue;
@@ -837,8 +871,37 @@ router.get('/api/events', (req, res) => {
 });
 
 // ---------------------------------------------------------------- server
+/**
+ * Response headers applied to every reply.
+ *
+ * The panel is a same-origin single-page app with no third-party assets, so the
+ * policy can be strict: scripts and styles come from this origin only. Inline
+ * style attributes are still needed (the UI sets them while rendering), which
+ * is why style-src keeps 'unsafe-inline' while script-src does not.
+ */
+const SECURITY_HEADERS = {
+  'x-content-type-options': 'nosniff',
+  // The event stream authenticates with a token in the query string, so a
+  // Referer leak would be a credential leak.
+  'referrer-policy': 'no-referrer',
+  'x-frame-options': 'DENY',
+  'content-security-policy': [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join('; '),
+};
+
 const server = require('node:http').createServer(async (req, res) => {
   const url = parseUrl(req);
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) res.setHeader(name, value);
   try {
     if (url.pathname.startsWith('/api/')) {
       const match = router.match(req.method, url.pathname);
@@ -873,23 +936,42 @@ const server = require('node:http').createServer(async (req, res) => {
     sendError(res, 404, 'not found');
   } catch (err) {
     console.error('[panel]', err);
-    if (!res.headersSent) sendError(res, 500, err.message || 'internal error');
+    // A handler may mark a failure as the client's fault (malformed JSON, bad
+    // URL escape); reporting those as 500 blames the server for the request.
+    if (!res.headersSent) sendError(res, err.statusCode || 500, err.message || 'internal error');
   }
 });
 
 server.listen(PORT, HOST, () => {
-  const lan = Object.values(require('node:os').networkInterfaces())
-    .flat()
-    .filter((i) => i && i.family === 'IPv4' && !i.internal)
-    .map((i) => i.address);
+  const isLoopback = HOST === '127.0.0.1' || HOST === 'localhost' || HOST === '::1' || HOST === '[::1]';
   console.log('');
   console.log('  WaterWall Panel');
   console.log('  ─────────────────────────────────────────');
   console.log(`  UI / API : http://${HOST}:${PORT}`);
-  lan.forEach((ip) => console.log(`  LAN      : http://${ip}:${PORT}`));
+  // Only advertise addresses a reader could actually reach. Listing LAN URLs
+  // while bound to loopback sends them to a connection refused.
+  if (!isLoopback) {
+    Object.values(require('node:os').networkInterfaces())
+      .flat()
+      .filter((i) => i && i.family === 'IPv4' && !i.internal)
+      .map((i) => i.address)
+      .forEach((ip) => console.log(`  LAN      : http://${ip}:${PORT}`));
+  }
   console.log(`  API token: ${panelToken}`);
   console.log(`  Data dir : ${DATA_DIR}`);
   console.log('');
+  const withPassword = store.listServers().filter((s) => s.sshPassword);
+  if (withPassword.length) {
+    console.log(`  ⚠  ${withPassword.length} server(s) store an SSH password in plain text in`);
+    console.log('     the data directory. Key authentication avoids storing it at all.');
+    console.log('');
+  }
+  if (!isLoopback) {
+    console.log(`  ⚠  Listening on ${HOST}. This panel can run commands on your servers,`);
+    console.log('     so anyone who can reach this port can too. Bind to 127.0.0.1');
+    console.log('     and use a tunnel unless you have deliberately opened it.');
+    console.log('');
+  }
   console.log('  Open the URL in a browser and sign in with the API token.');
   console.log('');
 });

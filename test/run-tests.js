@@ -496,6 +496,175 @@ function idToFile(id) {
   };
   return map[id] || 'basic.js';
 }
+/**
+ * Security regressions.
+ *
+ * These are here because each one was a real defect that ordinary template
+ * tests could not see: a containment check that accepted a sibling directory, a
+ * comment that swallowed a function, and an authentication rule that had to be
+ * observed on a live listener to be believed.
+ */
+async function securityTests() {
+  const httpLib = require('../lib/http');
+  const { spawn } = require('node:child_process');
+
+  const ok = (label) => {
+    pass += 1;
+    console.log(`  ✓ ${label}`);
+  };
+  // Awaited, because several of these steps are network calls and a plain
+  // try/catch around an async function would report a pass on a rejection.
+  const step = async (label, fn) => {
+    try {
+      await fn();
+      ok(label);
+    } catch (err) {
+      fail += 1;
+      failures.push(`${label}: ${err.message}`);
+      console.log(`  ✗ ${label}: ${err.message}`);
+    }
+  };
+
+  // ---- static file containment ------------------------------------------
+  const root = path.join(tmp, 'www');
+  fs.mkdirSync(root, { recursive: true });
+  fs.writeFileSync(path.join(root, 'index.html'), '<h1>panel</h1>');
+  // A sibling whose name merely starts with the root's. The old check was
+  // `startsWith(root)`, which this escapes.
+  const sibling = `${root}-secret`;
+  fs.mkdirSync(sibling, { recursive: true });
+  fs.writeFileSync(path.join(sibling, 'key.pem'), 'PRIVATE');
+
+  const hit = (urlPath) => {
+    const chunks = [];
+    const res = {
+      writeHead: () => {},
+      end: (b) => chunks.push(Buffer.isBuffer(b) ? b : Buffer.from(String(b))),
+      setHeader: () => {},
+      headersSent: false,
+    };
+    const served = httpLib.serveStatic(res, root, urlPath);
+    return { served, body: Buffer.concat(chunks).toString('utf8') };
+  };
+
+  await step('serveStatic serves a file inside the root', () => {
+    const r = hit('/index.html');
+    assert.strictEqual(r.served, true);
+    assert.ok(r.body.includes('panel'));
+  });
+
+  await step('serveStatic refuses a sibling sharing the root prefix', () => {
+    const r = hit(`/../${path.basename(sibling)}/key.pem`);
+    assert.ok(!r.body.includes('PRIVATE'), 'a sibling directory was readable');
+    assert.ok(!r.served || !r.body.includes('PRIVATE'));
+  });
+
+  await step('serveStatic refuses plain traversal', () => {
+    const r = hit('/../../server.js');
+    assert.ok(!r.body.includes('require('), 'server.js was readable through traversal');
+  });
+
+  await step('serveStatic treats a malformed escape as a bad request, not a crash', () => {
+    const r = hit('/%zz');
+    assert.strictEqual(r.served, true, 'malformed input must be answered, not fall through');
+    assert.ok(!r.body.includes('panel'), 'malformed input returned the index page');
+  });
+
+  // ---- request parsing ---------------------------------------------------
+  await step('a malformed JSON body is a 400, not a 500', async () => {
+    const req = {
+      headers: { 'content-type': 'application/json' },
+      on: (ev, cb) => {
+        if (ev === 'data') cb(Buffer.from('{not json'));
+        if (ev === 'end') cb();
+      },
+    };
+    let err = null;
+    try {
+      await httpLib.parseJsonBody(req);
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err, 'malformed JSON was accepted');
+    assert.strictEqual(err.statusCode, 400, `expected 400, got ${err.statusCode}`);
+  });
+
+  // ---- no function may be hidden inside a comment ------------------------
+  await step('server.js declares its helpers outside comments', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+    // Remove block comments the way a parser sees them, keeping offsets tidy.
+    const stripped = src.replace(/\/\*[\s\S]*?\*\//g, (m) => '/'.padEnd(m.length, '*'));
+    // `listenerPort` really was lost this way: two adjacent doc comments merged
+    // and the function between them became part of the first one. The apply
+    // route then failed inside its try/catch, so the check silently reported
+    // "listenerPort is not defined" for every tunnel.
+    for (const fn of ['listenerPort', 'tlsServerSide', 'findServers', 'redact']) {
+      assert.ok(stripped.includes(`function ${fn}(`), `${fn} is defined only inside a comment`);
+    }
+  });
+
+  // ---- the listener itself ----------------------------------------------
+  const token = 'sec-test-token-0123456789abcdef';
+  const port = 18000 + Math.floor(Math.random() * 2000);
+  const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
+    env: {
+      ...process.env,
+      WW_PANEL_DATA: path.join(tmp, 'www-data'),
+      WW_PANEL_PORT: String(port),
+      WW_PANEL_HOST: '127.0.0.1',
+      WW_PANEL_TOKEN: token,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('panel did not start')), 15000);
+      child.stdout.on('data', (d) => {
+        if (String(d).includes('API token')) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      child.on('error', reject);
+      child.on('exit', (code) => reject(new Error(`panel exited early (${code})`)));
+    });
+
+    await step('the panel binds loopback by default', async () => {
+      const r = await fetch(`${base}/api/health`);
+      assert.strictEqual(r.status, 200);
+      assert.strictEqual(r.headers.get('x-content-type-options'), 'nosniff');
+      assert.ok(r.headers.get('content-security-policy'), 'no content-security-policy header');
+      assert.strictEqual(r.headers.get('referrer-policy'), 'no-referrer');
+    });
+
+    await step('the API token in a query string is rejected outside the event stream', async () => {
+      const r = await fetch(`${base}/api/servers?token=${token}`);
+      assert.strictEqual(r.status, 401, 'a token in the URL authenticated a normal API call');
+    });
+
+    await step('the header form still authenticates', async () => {
+      const r = await fetch(`${base}/api/servers`, { headers: { authorization: `Bearer ${token}` } });
+      assert.strictEqual(r.status, 200);
+    });
+
+    await step('the event stream still accepts a query token', async () => {
+      // EventSource cannot set headers, so this one path has to.
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 2500);
+      const r = await fetch(`${base}/api/events?token=${token}`, { signal: ac.signal });
+      assert.strictEqual(r.status, 200, 'the event stream rejected the only auth it can use');
+      ac.abort();
+      clearTimeout(timer);
+    });
+  } finally {
+    child.kill();
+  }
+}
+const securityTestsPending = securityTests();
+
 certTests();
 
 // ---- store round trip -----------------------------------------------------
@@ -505,12 +674,20 @@ assert.strictEqual(store.getTunnel(store.listTunnels()[0].id).name, store.listTu
 
 fs.rmSync(tmp, { recursive: true, force: true });
 
-netcheckPending.then(() => {
-  console.log('');
-  console.log(`  ${pass} passed, ${fail} failed (${usedVariables} config variables resolved)`);
-});
-if (fail) {
-  console.log('');
-  failures.forEach((f) => console.log(`  - ${f}`));
-  process.exit(1);
-}
+// Both pending suites are awaited before the summary. Reporting failures (and
+// exiting) while they are still running would kill them and print a count that
+// does not include their results.
+Promise.all([netcheckPending, securityTestsPending])
+  .then(() => {
+    console.log('');
+    console.log(`  ${pass} passed, ${fail} failed (${usedVariables} config variables resolved)`);
+    if (fail) {
+      console.log('');
+      failures.forEach((f) => console.log(`  - ${f}`));
+      process.exitCode = 1;
+    }
+  })
+  .catch((err) => {
+    console.error('\n  test suite crashed:', err);
+    process.exitCode = 2;
+  });

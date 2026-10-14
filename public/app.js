@@ -25,12 +25,22 @@ const state = {
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
+/**
+ * Escape a value for HTML.
+ *
+ * The single quote is escaped too, even though the UI currently only puts these
+ * values in double-quoted attributes and text nodes. Escaping it costs nothing
+ * and removes a whole class of mistake: one template field placed inside
+ * `data-when='…'` was already relying on a quote that this function did not
+ * escape, and that is exactly the shape an attribute-breakout needs.
+ */
 function esc(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function toast(message, kind = '') {
@@ -1996,7 +2006,10 @@ function applyWhenConditions(tpl) {
 async function loadEvents() {
   const host = $('#dashLog');
   if (!host) return;
-  const res = await fetch(`/api/events?token=${encodeURIComponent(state.token)}`, {
+  // The header is enough here. The query parameter is only tolerated on the
+  // event stream because EventSource cannot send one, and carrying the token in
+  // a URL is what puts it into logs and history in the first place.
+  const res = await fetch('/api/events', {
     headers: { authorization: `Bearer ${state.token}` },
   });
   if (!res.ok) {

@@ -29,7 +29,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { execFile, exec } = require('node:child_process');
+// `execFile` only: a command is run as an argv array with no shell in between,
+// so a value containing shell metacharacters cannot become a second command.
+const { execFile } = require('node:child_process');
 
 const PANEL_URL = (process.env.WW_PANEL_URL || 'http://127.0.0.1:8787').replace(/\/+$/, '');
 const AGENT_TOKEN = process.env.WW_AGENT_TOKEN || '';

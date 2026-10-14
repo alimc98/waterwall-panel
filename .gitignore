@@ -31,3 +31,6 @@ push.she2e-results.txt
 e2e-results.txt
 e2e-run*.txt
 push.sh
+panel-boot.txt
+panel-err.txt
+boot*.txt
