@@ -93,6 +93,14 @@ function build(tpl) {
   // A template that asks for accounts must get one, or the server has nothing
   // to authenticate against and every probe is refused.
   if (has('users')) overrides.users = [{ username: TEST_USER, password: TEST_PASSWORD }];
+  // The speed test measures a real link. Unlimited-rate on two connections
+  // starves on the one-core box that runs both halves plus the harness, and
+  // then it never prints its summary. A small target rate still proves the
+  // measurement path end to end.
+  if (tpl.id === 'speedtest') {
+    overrides.targetMbps = 8;
+    overrides.durationMs = 6000;
+  }
 
   let tunnel = store.addTunnel({ name: tpl.id, template: tpl.id, options: overrides });
   let res = buildBundle(store, tunnel);

@@ -37,6 +37,10 @@ FOREIGN_NS = "wwforeign"
 IRAN_IP = "10.200.0.2"
 FOREIGN_IP = "10.200.0.3"
 HOST_IP = "10.200.0.1"
+# Pinned by setup_netns; see the comment there. Two ports of one bridge must
+# never share a MAC address.
+IRAN_MAC = "02:00:00:00:00:02"
+FOREIGN_MAC = "02:00:00:00:00:03"
 CERT_DIR = os.path.join(BASE, "cert")
 
 BAD = re.compile(r"\b(FATAL|ERROR|CRITICAL)\b")
@@ -151,6 +155,10 @@ def del_host_veths():
 
 
 def setup_netns():
+    # The bridge is the shared segment; re-create it if anything ever removed
+    # it. Without it the two namespaces are wired to nothing and every dial
+    # between them times out, which reads as a broken template.
+    ensure_bridge()
     del_namespaces()
     del_host_veths()
     for ns in (IRAN_NS, FOREIGN_NS):
@@ -158,8 +166,11 @@ def setup_netns():
         if rc != 0:
             return False, f"cannot create namespace {ns}: {out.strip()}"
 
-    pairs = [(IRAN_NS, "wwviran", IRAN_IP), (FOREIGN_NS, "wwvforeign", FOREIGN_IP)]
-    for ns, hostdev, ip in pairs:
+    pairs = [
+        (IRAN_NS, "wwviran", IRAN_IP, IRAN_MAC),
+        (FOREIGN_NS, "wwvforeign", FOREIGN_IP, FOREIGN_MAC),
+    ]
+    for ns, hostdev, ip, mac in pairs:
         out = ""
         for _ in range(3):
             sh(f"ip link add {hostdev} type veth peer name eth0")
@@ -172,7 +183,29 @@ def setup_netns():
             return False, f"cannot wire {ns}: {out.strip()[:200]}"
         sh(f"ip link set {hostdev} master {BRIDGE}")
         sh(f"ip link set {hostdev} up")
+        rc, out = sh(f"ip -d link show {hostdev}")
+        if f"master {BRIDGE}" not in out:
+            return False, f"{hostdev} is not attached to {BRIDGE}: {out.strip()[:200]}"
+        # A fresh veth pair can come up with the *same* address on both ends.
+        # One bridge, two ports, one MAC: the forwarding database keeps
+        # overwriting the entry and sends every frame to whichever port was
+        # learned last, so one direction is blackholed and the link times out
+        # at random. The addresses are pinned instead.
+        sh(f"ip netns exec {ns} ip link set eth0 address {mac}")
         sh(f"ip netns exec {ns} ip addr add {ip}/24 dev eth0")
+        # Kernel forwarding is off by default in a fresh namespace, and the
+        # host's setting does not reach inside it. A template whose far side
+        # forwards what arrives on its TUN (the full-tunnel ones) is silently
+        # dead without this: the core decrypts, writes the packet into the TUN,
+        # and the kernel drops it on the way out.
+        sh(f"ip netns exec {ns} sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1")
+        # ...and forwarding without a masquerade rule only half works. The
+        # host's own masquerade sits one hop too far out: conntrack hands the
+        # reply back as the inner address (10.77.0.1), which the host has no
+        # route to, so it leaks out the default route and the tunnel looks dead
+        # from the inside. A real server masquerades the tunnel subnet on its
+        # own public interface; the harness does the same inside the namespace.
+        sh(f"ip netns exec {ns} iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE >/dev/null 2>&1")
         sh(f"ip netns exec {ns} ip link set eth0 up")
         sh(f"ip netns exec {ns} ip link set lo up")
         # Default route out through the bridge, masqueraded by the host.
@@ -183,6 +216,28 @@ def setup_netns():
         rc, out = sh(f"ip netns exec {ns} ip -4 addr show dev eth0")
         if ip not in out:
             return False, f"{ns} has no {ip} on eth0: {out.strip()[:200]}"
+
+    # Pin the two MAC addresses into each other's neighbour table.
+    #
+    # A fresh namespace pair sometimes cannot resolve the other side: the first
+    # frame the bridge should forward is lost, ARP never completes, and the
+    # Iran core's very first dial fails with "No route to host". WaterWall
+    # retries that dial on its own schedule — tens of seconds for an
+    # authentication client — so one lost ARP looks exactly like a tunnel that
+    # does not work. The MACs are known here, so ARP does not have to be part
+    # of the test.
+    mac = {}
+    for ns in (IRAN_NS, FOREIGN_NS):
+        rc, out = sh(f"ip netns exec {ns} cat /sys/class/net/eth0/address")
+        mac[ns] = out.strip()
+        if rc != 0 or not mac[ns]:
+            return False, f"cannot read the MAC of {ns}: {out.strip()[:160]}"
+    if mac[IRAN_NS] == mac[FOREIGN_NS]:
+        # The bridge would send every frame to one port. Fail loudly instead of
+        # letting the template blame the tunnel.
+        return False, f"both namespaces share the MAC {mac[IRAN_NS]}; the bridge cannot separate them"
+    sh(f"ip netns exec {IRAN_NS} ip neigh replace {FOREIGN_IP} lladdr {mac[FOREIGN_NS]} dev eth0")
+    sh(f"ip netns exec {FOREIGN_NS} ip neigh replace {IRAN_IP} lladdr {mac[IRAN_NS]} dev eth0")
     return True, ""
 
 
@@ -416,6 +471,18 @@ def run_template(tpl_id, plan, only_probe=False, verbose=False):
         return result
 
     warm_ok, warm_detail = warm_link()
+    if not warm_ok:
+        # A fresh namespace pair occasionally comes up unable to reach its peer
+        # (a lost first frame, a bridge port the bridge has not learned yet).
+        # Rebuilding is seconds; a template judged against a dead link is a
+        # false failure that reads exactly like a tunnel bug.
+        result["errors"].append(f"harness link not up, rebuilding: {warm_detail}")
+        _, neigh = sh(f"ip netns exec {IRAN_NS} ip neigh show dev eth0")
+        _, routes = sh(f"ip netns exec {IRAN_NS} ip route show")
+        result["linkDiag"] = f"neigh: {neigh.strip()[:160]} | routes: {routes.strip()[:200]}"
+        ok, err = setup_netns()
+        if ok:
+            warm_ok, warm_detail = warm_link(timeout=10.0)
     result["link"] = warm_detail
     if not warm_ok:
         result["errors"].append(f"harness link not up: {warm_detail}")
@@ -522,7 +589,10 @@ def run_template(tpl_id, plan, only_probe=False, verbose=False):
         while not matched and time.time() < deadline:
             for side in ("iran", "foreign"):
                 text = read_console(dirs.get(side, ""))
-                hits = [ln.strip() for ln in text.splitlines() if pat.search(ln)]
+                # Only a clean line counts: a plan names the node that has to
+                # report success, and half of what that node logs is the
+                # failure it exists to detect ("TesterClient: worker 0 failed").
+                hits = [ln.strip() for ln in text.splitlines() if pat.search(ln) and not BAD.search(ln)]
                 if hits:
                     result["probes"].append(
                         {"proto": "log", "side": side, "ok": True, "detail": f"{len(hits)} lines matched {plan['logPattern']}: {hits[-1][:160]}"}
@@ -539,7 +609,14 @@ def run_template(tpl_id, plan, only_probe=False, verbose=False):
 
     fatal = [e for e in result["errors"] if "FATAL" in e]
     probes_ok = all(p.get("ok") for p in result["probes"]) if result["probes"] else True
-    started = all(not v["exitedEarly"] for v in result["startup"].values()) if result["startup"] else False
+    # A core that exits with 0 finished on purpose: TesterClient and
+    # SpeedTestClient are their own driver and end the process once the
+    # measurement is done. Only a non-zero exit is a failure.
+    started = (
+        all((not v["exitedEarly"]) or v["exitCode"] == 0 for v in result["startup"].values())
+        if result["startup"]
+        else False
+    )
     if probes_ok and not fatal and started:
         result["ok"] = True
     result["probeResult"] = probes_ok

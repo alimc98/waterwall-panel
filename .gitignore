@@ -34,7 +34,8 @@ test/live/out/
 test/live/run/
 test/live/results.json
 test/live/cert/
-__pycache__/e2e-results.txt
+__pycache__/
+e2e-results.txt
 e2e-results.txt
 e2e-run*.txt
 push.sh

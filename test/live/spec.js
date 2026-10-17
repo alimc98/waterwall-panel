@@ -73,20 +73,31 @@ module.exports = {
   'tun-wireguard': { entry: 'iran-ns', proto: 'tun-web' },
   'tun2socks': { entry: 'iran-ns', proto: 'tun-web' },
 
-  // --- raw-socket carriers that do have an endpoint on the far side -------
-  'tcp-bit-swap-mux': { entry: 'iran', proto: 'tcp' },
-  'tcp-bit-swap-mux-2': { entry: 'iran', proto: 'tcp' },
+  // --- mux carriers built on the tcp-bit-swap packet machinery ------------
+  // The verbose run shows the same carrier limitation as tcp-bit-swap below:
+  // the TUN / raw-socket / NFQUEUE path moves a few frames and then the far
+  // side drops them ("TunDevice: dropping malformed or unsupported IP input").
+  // Spoofed 12.12.12.x / 12.13.12.x packets cannot make that trip through
+  // NFQUEUE inside a nested namespace the way they would between two real
+  // servers, so only loading is verified here.
+  'tcp-bit-swap-mux': LOAD_ONLY('carrier only — same packet machinery as tcp-bit-swap, which cannot complete inside the namespace harness'),
+  'tcp-bit-swap-mux-2': LOAD_ONLY('carrier only — same packet machinery as tcp-bit-swap, which cannot complete inside the namespace harness'),
 
-  // --- rootless WireGuard, SOCKS5 in and a real connect out ---------------
+  // --- rootless SOCKS5, a real connect out, no TUN anywhere ----------------
   // The listener has to be UDP-capable: the Socks5Server asks for `udp: true`
-  // and resolves its relay from the node in front of it.
-  'rootless-socks-wireguard': { entry: 'iran', proto: 'socks5' },
+  // and resolves its relay from the node in front of it. The transport is the
+  // same packets-over-TLS pair that tun-tcp-tunnel proves; the WireGuard
+  // variant of this chain cannot receive on its transport side (the core only
+  // feeds WireGuardDevice from a chain-head UdpStatelessSocket).
+  'rootless-socks-tcp': { entry: 'iran', proto: 'socks5' },
 
   // --- self-driving templates: they test themselves, we read the logs -----
   speedtest: {
     entry: null,
     proto: 'log',
-    logPattern: 'SpeedTest',
+    // The client prints one JSON summary when the run is over; a failure line
+    // contains the node name too, so the pattern has to name the success.
+    logPattern: 'SpeedTestClient: json-summary.*"success":true',
     // The client runs a ten-second measurement before it reports anything.
     logSeconds: 30,
     reason: 'the client drives the test itself',

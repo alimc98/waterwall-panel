@@ -178,6 +178,7 @@ function hashOf(bundles) {
 
 function writeBundle(basePath, files) {
   const written = [];
+  let changed = false;
   for (const [rel, content] of Object.entries(files)) {
     const target = path.join(basePath, rel);
     fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -192,8 +193,9 @@ function writeBundle(basePath, files) {
     fs.writeFileSync(tmp, content);
     fs.renameSync(tmp, target);
     written.push(rel);
+    changed = true;
   }
-  return written;
+  return { written, changed };
 }
 
 /**
@@ -244,10 +246,17 @@ async function apply(bundles, basePath) {
   if (Object.keys(merged).length === 0) {
     return { changed: false, written: [], reason: 'no configuration assigned' };
   }
-  const written = writeBundle(basePath, merged);
+  const { written, changed } = writeBundle(basePath, merged);
   if (DRY_RUN) {
     log('[dry-run] would write', written.join(', '));
-    return { changed: true, written, dryRun: true };
+    return { changed, written, dryRun: true };
+  }
+  if (!changed) {
+    // Nothing on disk differs. Restarting here would drop every live
+    // connection on the server to reload a configuration that is already
+    // loaded — and the first poll after the agent is installed is always this
+    // case on a server the panel was set up from.
+    return { changed: false, written, reason: 'the files on disk already match' };
   }
   const service = process.env.WW_SERVICE || 'waterwall';
   const restart = await run('systemctl', ['restart', service]);

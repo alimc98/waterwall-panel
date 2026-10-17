@@ -471,7 +471,7 @@ function idToFile(id) {
     'vless-tls': 'stream.js', 'vless-mux-tls': 'stream.js', 'vless-reality': 'stream.js',
     'trojan-tls': 'stream.js', 'vless-http-ws-tls': 'stream.js', 'udp-over-tcp': 'stream.js',
     'http-proxy': 'proxy.js', 'socks5-upstream': 'proxy.js',
-    'tun-wireguard': 'layer3.js', 'rootless-socks-wireguard': 'layer3.js', 'tun-tcp-tunnel': 'layer3.js',
+    'tun-wireguard': 'layer3.js', 'rootless-socks-tcp': 'layer3.js', 'tun-tcp-tunnel': 'layer3.js',
     'reverse-tls': 'reverse.js', 'reverse-plain': 'reverse.js', 'reverse-reality': 'reverse-reality.js',
     'tcp-bit-swap': 'bitswap.js', 'tcp-bit-swap-mux': 'bitswap.js', 'tcp-bit-swap-mux-2': 'bitswap.js',
     protoswap: 'protoswap.js',

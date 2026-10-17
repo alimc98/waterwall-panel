@@ -301,10 +301,13 @@ Restart=always
 RestartSec=5
 Environment=WW_PANEL_URL=${PANEL_URL}
 Environment=WW_AGENT_TOKEN=${AGENT_TOKEN}
-Environment=WW_INTERVAL=${WW_AGENT_INTERVAL}
+# The names have to be the ones agent.js reads: WW_AGENT_INTERVAL and
+# WW_STATE. Exporting WW_INTERVAL/WW_STATE_DIR silently fell back to the
+# defaults, so a custom interval or state path never took effect.
+Environment=WW_AGENT_INTERVAL=${WW_AGENT_INTERVAL}
 Environment=WW_WATERWALL_PATH=${WW_BASE}
 Environment=WW_SERVICE=${WW_SERVICE}
-Environment=WW_STATE_DIR=${WW_STATE_DIR}
+Environment=WW_STATE=${WW_STATE_DIR}/state.json
 
 [Install]
 WantedBy=multi-user.target

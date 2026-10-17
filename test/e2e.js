@@ -3,9 +3,14 @@
 /**
  * End-to-end test of every template against two real servers.
  *
- * This drives the panel's own HTTP API rather than calling lib/build directly,
- * so it exercises the same path the UI uses: create -> preview -> apply ->
- * service -> traffic.
+ * LEGACY — prefer test/live (see test/live/README.md). That harness runs both
+ * halves in network namespaces on a single machine and never touches a live
+ * tunnel.
+ *
+ * This script drives the panel's own HTTP API against the two *live* servers,
+ * so it rewrites their core.json and restarts WaterWall on them for every
+ * template it tests. Run it only on servers whose tunnels you are willing to
+ * lose, and never while a client depends on the tunnel that is running.
  *
  * For each template it:
  *   1. builds options suited to the two live servers
@@ -129,8 +134,9 @@ const PLANS = {
   'tun-wireguard': () => ({ opts: { tunName: 'wgtun0', tunIp: '10.77.0.1/24', peerTunIp: '10.77.0.2',
     listenPort: nextPort(), publicPort: nextPort(), _core: { ...CORE, mtu: 1400 } } }),
 
-  'rootless-socks-wireguard': () => ({ opts: { listenAddress: '127.0.0.1', listenPort: nextPort(),
-    destAddress: DEST_HOST, destPort: DEST_PORT, _core: CORE } }),
+  'rootless-socks-tcp': () => ({ opts: { listenAddress: '127.0.0.1', listenPort: nextPort(),
+    publicPort: nextPort(), sni: 'tunnel.test', verify: false, domain: 'e2e-tls.test', certMode: 'self-signed',
+    _core: CORE } }),
 
   'tun-tcp-tunnel': () => ({ opts: { tunName: 'wgtun1', tunIp: '10.78.0.1/24', peerTunIp: '10.78.0.2',
     listenPort: nextPort(), publicPort: nextPort(),

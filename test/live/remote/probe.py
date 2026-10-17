@@ -60,19 +60,34 @@ def probe_tcp(host, port, _extra):
 
 
 def probe_udp(host, port, _extra):
+    """One socket, two datagrams.
+
+    The first datagram of a brand-new UDP source port can be lost while the
+    transport underneath comes up: a TCP/TLS carrier needs a connect and a
+    handshake, and the line's first payload races that. Real UDP clients —
+    DNS resolvers, WireGuard — retransmit the same query on the same socket,
+    and the retransmission rides the now-established line. Doing the same
+    here tests what a real client would experience.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(10)
     mark = marker()
     try:
-        s.sendto(mark, (host, port))
-        got, _ = s.recvfrom(65536)
-    except OSError as e:
-        return False, f"udp {host}:{port}: {e}"
+        for attempt in (0, 1):
+            s.settimeout(5.0 if attempt == 0 else 10.0)
+            try:
+                s.sendto(mark, (host, port))
+                got, _ = s.recvfrom(65536)
+            except OSError as e:
+                if attempt == 0:
+                    continue
+                return False, f"udp {host}:{port}: {e}"
+            if got == mark:
+                extra_note = "" if attempt == 0 else " (retransmission on the same socket)"
+                return True, f"udp {host}:{port}: {len(mark)} bytes echoed back unchanged{extra_note}"
+            return False, f"udp {host}:{port}: expected {mark!r}, got {got!r}"
     finally:
         s.close()
-    if got == mark:
-        return True, f"udp {host}:{port}: {len(mark)} bytes echoed back unchanged"
-    return False, f"udp {host}:{port}: expected {mark!r}, got {got!r}"
+    return False, f"udp {host}:{port}: no reply to two datagrams"
 
 
 def socks5_connect(sock, host, port, creds):

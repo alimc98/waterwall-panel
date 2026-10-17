@@ -776,7 +776,7 @@ sudo node server.js   # برای فعال شدن تست پروتکل
 | قالب | زنجیره |
 | --- | --- |
 | `tun-wireguard` | `TunDevice → WireGuardDevice → UdpStatelessSocket` (کلیدها درون‌چین، بدون `wg-quick`) |
-| `rootless-socks-wireguard` | `TcpListener → Socks5Server → ConnectionToPackets → WireGuardDevice → UdpStatelessSocket` |
+| `rootless-socks-tcp` | `TcpUdpListener → Socks5Server → ConnectionToPackets → PacketsToStream → TlsClient → TcpConnector` (بدون TUN، بدون root) |
 | `tun-tcp-tunnel` | `TunDevice → PacketsToStream → TlsClient` / `StreamToPackets → PacketsToConnection → TcpUdpConnector` |
 
 ### عملیات
