@@ -915,6 +915,7 @@ const server = require('node:http').createServer(async (req, res) => {
       '/agent.js': () => path.join(ROOT, 'agent', 'agent.js'),
       '/install-agent.sh': () => path.join(PUBLIC_DIR, 'install-agent.sh'),
       '/install.sh': () => path.join(ROOT, 'install.sh'),
+      '/panel-install.sh': () => path.join(ROOT, 'panel-install.sh'),
     };
     if (DOWNLOADS[url.pathname]) {
       const source = DOWNLOADS[url.pathname]();

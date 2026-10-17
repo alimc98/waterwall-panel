@@ -196,11 +196,51 @@ function writeBundle(basePath, files) {
   return written;
 }
 
-async function apply(bundles, basePath) {
+/**
+ * Flatten the bundles of every assigned tunnel into one file map.
+ *
+ * Each bundle carries its own `core.json` naming its own config file. Written
+ * last-writer-wins that leaves exactly one tunnel running and silently drops
+ * the rest, so the configs lists are unioned instead. The core settings
+ * (workers, mtu, log level, ...) come from the first bundle; every tunnel
+ * shares the same core settings anyway.
+ */
+function mergeBundles(bundles) {
   const merged = {};
+  const cores = [];
   for (const files of Object.values(bundles)) {
-    for (const [rel, content] of Object.entries(files)) merged[rel] = content;
+    for (const [rel, content] of Object.entries(files)) {
+      if (rel === 'core.json') cores.push(content);
+      else merged[rel] = content;
+    }
   }
+  if (cores.length === 1) {
+    // The ordinary case: one tunnel, written through byte for byte, so applying
+    // an unchanged tunnel touches nothing.
+    merged['core.json'] = cores[0];
+    return merged;
+  }
+  const configs = [];
+  let base = null;
+  for (const content of cores) {
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      continue;
+    }
+    if (!base) base = parsed;
+    for (const rel of parsed.configs || []) if (!configs.includes(rel)) configs.push(rel);
+  }
+  if (base) {
+    base.configs = configs;
+    merged['core.json'] = `${JSON.stringify(base, null, 2)}\n`;
+  }
+  return merged;
+}
+
+async function apply(bundles, basePath) {
+  const merged = mergeBundles(bundles);
   if (Object.keys(merged).length === 0) {
     return { changed: false, written: [], reason: 'no configuration assigned' };
   }
@@ -287,7 +327,13 @@ async function main() {
   process.on('SIGTERM', shutdown);
 }
 
-main().catch((err) => {
-  console.error('[ww-agent] fatal:', err);
-  process.exit(1);
-});
+module.exports = { mergeBundles };
+
+// Required from a test, started from systemd: only the script entry point runs
+// the polling loop.
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('[ww-agent] fatal:', err);
+    process.exit(1);
+  });
+}

@@ -27,7 +27,14 @@ Thumbs.db
 
 # local push helpers (read a token from the environment, never from disk)
 push.ps1
-push.she2e-results.txt
+push.sh
+
+# live harness output: generated bundles, per-run copies and logs, results
+test/live/out/
+test/live/run/
+test/live/results.json
+test/live/cert/
+__pycache__/e2e-results.txt
 e2e-results.txt
 e2e-run*.txt
 push.sh

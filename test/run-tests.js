@@ -850,12 +850,96 @@ function transportTests() {
   }
 }
 
+/**
+ * The agent's bundle merge.
+ *
+ * A server is assigned every enabled tunnel, and each tunnel's bundle carries
+ * its own core.json naming its own config file. Writing them last-one-wins
+ * leaves exactly one tunnel running and silently drops the others: every
+ * tunnel would build cleanly, deploy cleanly, and only one would ever come up.
+ */
+function agentTests() {
+  // agent.js refuses to load without a token, by design: it is a standalone
+  // poller for a server, not a library. It exports its pure helpers for here.
+  process.env.WW_AGENT_TOKEN = process.env.WW_AGENT_TOKEN || 'suite-token-not-used';
+  const { mergeBundles } = require('../agent/agent.js');
+
+  const core = (configs) => `${JSON.stringify({ configs, misc: { workers: 2 } }, null, 2)}\n`;
+
+  const cases = [
+    [
+      'a single tunnel is written through byte for byte',
+      () => {
+        const raw = core(['configs/a.json']);
+        const merged = mergeBundles({ t1: { 'core.json': raw, 'configs/a.json': '{"a":1}' } });
+        assert.strictEqual(merged['core.json'], raw, 'an unchanged tunnel must not be rewritten');
+        assert.strictEqual(merged['configs/a.json'], '{"a":1}');
+      },
+    ],
+    [
+      'two tunnels both stay in core.json',
+      () => {
+        const merged = mergeBundles({
+          t1: { 'core.json': core(['configs/a.json']), 'configs/a.json': '{"a":1}' },
+          t2: { 'core.json': core(['configs/b.json']), 'configs/b.json': '{"b":1}' },
+        });
+        assert.strictEqual(merged['configs/a.json'], '{"a":1}');
+        assert.strictEqual(merged['configs/b.json'], '{"b":1}');
+        const parsed = JSON.parse(merged['core.json']);
+        assert.deepStrictEqual(parsed.configs, ['configs/a.json', 'configs/b.json']);
+        assert.strictEqual(parsed.misc.workers, 2, 'core settings must survive the merge');
+      },
+    ],
+    [
+      'a config listed by two tunnels is not listed twice',
+      () => {
+        const merged = mergeBundles({
+          t1: {
+            'core.json': core(['configs/a.json', 'configs/shared.json']),
+            'configs/a.json': '{}',
+            'configs/shared.json': '{}',
+          },
+          t2: {
+            'core.json': core(['configs/b.json', 'configs/shared.json']),
+            'configs/b.json': '{}',
+            'configs/shared.json': '{}',
+          },
+        });
+        assert.deepStrictEqual(JSON.parse(merged['core.json']).configs, [
+          'configs/a.json',
+          'configs/shared.json',
+          'configs/b.json',
+        ]);
+      },
+    ],
+    [
+      'no assigned tunnels merge to nothing',
+      () => {
+        assert.deepStrictEqual(mergeBundles({}), {});
+      },
+    ],
+  ];
+
+  for (const [label, fn] of cases) {
+    try {
+      fn();
+      pass += 1;
+      console.log(`  ✓ ${label}`);
+    } catch (err) {
+      fail += 1;
+      failures.push(`${label}: ${err.message}`);
+      console.log(`  ✗ ${label}: ${err.message}`);
+    }
+  }
+}
+
 const securityTestsPending = securityTests();
 
 certTests();
 httpTransportTests();
 bridgeRuleTests();
 transportTests();
+agentTests();
 
 // ---- store round trip -----------------------------------------------------
 assert.strictEqual(store.listServers().length, 2, 'server store');
