@@ -172,6 +172,89 @@ async function localFacts() {
 }
 
 // ------------------------------------------------------------------ apply
+/**
+ * The WaterWall loader preprocesses a config before parsing it: it strips `//`
+ * comments outside strings and substitutes `$name$` placeholders from the
+ * file's own `variables` block. Configs the panel generates use both — that is
+ * what keeps them as readable as hand-written ones — so a plain JSON.parse
+ * refuses them even though the core loads them fine. Validation here has to
+ * accept exactly what the core accepts.
+ */
+function stripComments(text) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '/') {
+      while (i < text.length && text[i] !== '\n') i += 1;
+      out += '\n';
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * The top-level `variables` object of a config, walked by braces: the rest of
+ * the file is not parseable yet, because the placeholders are still bare.
+ */
+function readVariables(text) {
+  const key = /"variables"\s*:\s*\{/.exec(text);
+  if (!key) return {};
+  const start = key.index + key[0].length - 1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(start, i + 1));
+        } catch {
+          return {};
+        }
+      }
+    }
+  }
+  return {};
+}
+
+/**
+ * Substitute `$name$` the way the loader does. A name with no entry in the
+ * variables block is left alone: JSON.parse then refuses the file, which is
+ * the correct outcome — the core would refuse it too.
+ */
+function resolveVariables(text) {
+  const stripped = stripComments(String(text));
+  const variables = readVariables(stripped);
+  return stripped.replace(/\$([A-Za-z0-9_.-]+)\$/g, (match, name) =>
+    Object.prototype.hasOwnProperty.call(variables, name) ? JSON.stringify(variables[name]) : match);
+}
+
 function hashOf(bundles) {
   return crypto.createHash('sha256').update(JSON.stringify(bundles)).digest('hex');
 }
@@ -182,8 +265,10 @@ function writeBundle(basePath, files) {
   for (const [rel, content] of Object.entries(files)) {
     const target = path.join(basePath, rel);
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    // Validate JSON before touching the running service
-    if (rel.endsWith('.json')) JSON.parse(content);
+    // Validate JSON before touching the running service (with the loader's own
+    // comment stripping and variable substitution, so a config that keeps its
+    // `variables` block is accepted rather than refused).
+    if (rel.endsWith('.json')) JSON.parse(resolveVariables(content));
     if (fs.existsSync(target) && fs.readFileSync(target, 'utf8') === content) {
       written.push(rel);
       continue;
@@ -227,7 +312,7 @@ function mergeBundles(bundles) {
   for (const content of cores) {
     let parsed;
     try {
-      parsed = JSON.parse(content);
+      parsed = JSON.parse(resolveVariables(content));
     } catch {
       continue;
     }

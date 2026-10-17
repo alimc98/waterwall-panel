@@ -53,11 +53,44 @@ const tunnel = store.addTunnel({
   enabled: true,
   options: { listenPort: 8081, destAddress: '192.0.2.20', destPort: 9001 },
 });
+// A second tunnel whose config *keeps* its variables block (useVariables on):
+// WaterWall substitutes `$name$` from that block when it loads the file, so the
+// bytes on disk are valid for the core but not for a plain JSON.parse. The
+// agent used to validate with a plain parse, refuse the whole bundle and never
+// apply anything ("poll failed: ... is not valid JSON") — which is exactly the
+// failure the first real deployment hit.
+const cdnTunnel = store.addTunnel({
+  name: 'agent-e2e-cdn',
+  template: 'cdn-reverse-wss',
+  enabled: true,
+  options: {
+    cdnHost: 'cdn.example.com',
+    cdnPort: 443,
+    edgeAddress: '198.51.100.9',
+    originTls: true,
+    userPort: 2087,
+    originPort: 443,
+    domain: 'cdn.example.com',
+    certMode: 'self-signed',
+    verify: true,
+    localServiceAddress: '127.0.0.1',
+    finalPort: 8486,
+    useVariables: true,
+  },
+});
 // The token comes from the environment (WW_PANEL_TOKEN), exactly as it does in
 // the systemd unit the installer writes; panel.json is not needed for this.
 
 const expected = buildBundle(store, store.getTunnel(tunnel.id));
 assert.strictEqual(expected.ok, true, `the panel must build the tunnel: ${expected.problems.join('; ')}`);
+const expectedCdn = buildBundle(store, store.getTunnel(cdnTunnel.id));
+assert.strictEqual(expectedCdn.ok, true, `the panel must build the CDN tunnel: ${expectedCdn.problems.join('; ')}`);
+{
+  // Keep the fixture honest: if this bundle ever stops carrying bare
+  // placeholders, the test silently stops covering the preprocessing path.
+  const files = Object.values(expectedCdn.bundles.iran).join('\n');
+  assert.match(files, /\$[A-Za-z0-9_.-]+\$/, 'the CDN fixture must carry $placeholder$ values');
+}
 
 let panel;
 let failures = 0;
@@ -134,7 +167,13 @@ async function main() {
     for (const rel of Object.keys(expected.bundles.iran)) {
       assert.ok(agentLog.includes(rel), `${rel} was not part of the apply: ${agentLog.slice(-300)}`);
     }
+    for (const rel of Object.keys(expectedCdn.bundles.iran)) {
+      assert.ok(agentLog.includes(rel), `${rel} was not part of the CDN apply: ${agentLog.slice(-300)}`);
+    }
   });
+
+  check('the placeholder-bearing config does not fail the apply', () =>
+    assert.doesNotMatch(agentLog, /not valid JSON|poll failed/, agentLog.slice(-500)));
 
   // Status has to land on the panel: this is what fills lastSeen/lastStatus.
   let seen = null;
@@ -162,6 +201,8 @@ async function main() {
   const payload = await fetched.json();
   check('the bundle is exactly what the panel builds', () =>
     assert.deepStrictEqual(payload.bundles[tunnel.id], expected.bundles.iran));
+  check('the CDN bundle is exactly what the panel builds', () =>
+    assert.deepStrictEqual(payload.bundles[cdnTunnel.id], expectedCdn.bundles.iran));
 
   agent.kill();
   panel.kill();

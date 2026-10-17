@@ -313,7 +313,12 @@ Environment=WW_STATE=${WW_STATE_DIR}/state.json
 WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload
-  systemctl enable --now "${WW_AGENT_SERVICE}.service"
+  systemctl enable "${WW_AGENT_SERVICE}.service"
+  # `enable --now` starts a stopped unit but leaves a running one alone, so a
+  # re-run with a new agent.js used to upgrade the file on disk and keep the old
+  # code executing. The agent holds no state between polls, so restarting is
+  # free.
+  systemctl restart "${WW_AGENT_SERVICE}.service"
   info "agent unit  : ${WW_AGENT_SERVICE}.service (started)"
 }
 
@@ -387,8 +392,15 @@ BANNER
     # Start the core only when a config exists, otherwise it exits immediately
     # and the unit just flaps.
     if [ -f "$WW_BASE/core.json" ]; then
-      systemctl enable --now "${WW_SERVICE}.service"
-      info "waterwall   : started (${WW_SERVICE})"
+      if systemctl is-active --quiet "${WW_SERVICE}.service"; then
+        # Already running: restarting here would drop every live connection to
+        # reload code it is already running. A binary upgrade takes effect on
+        # the next deliberate restart.
+        info "waterwall   : already running (${WW_SERVICE}); not restarted"
+      else
+        systemctl enable --now "${WW_SERVICE}.service"
+        info "waterwall   : started (${WW_SERVICE})"
+      fi
     else
       systemctl enable "${WW_SERVICE}.service" 2>/dev/null || true
       warn "no ${WW_BASE}/core.json yet, so WaterWall was enabled but not started."
