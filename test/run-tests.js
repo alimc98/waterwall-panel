@@ -10,6 +10,7 @@ const templates = require('../lib/templates');
 const { buildBundle, resolveOptions } = require('../lib/build');
 const { Store } = require('../lib/store');
 const { validateBundle, preprocessConfig } = require('../lib/generator');
+const { transportProblem } = require('../lib/ssh');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -815,11 +816,46 @@ function httpTransportTests() {
   }
 }
 
+/**
+ * The transport guard.
+ *
+ * Password auth shells out to `sshpass`, which is Unix-only, so a password
+ * stored on a Windows panel makes every deploy fail with the bare
+ * `spawn sshpass ENOENT` — a message that names the symptom and not the fix.
+ * The replacement is a pure function, so both branches are proven here instead
+ * of only on whichever platform happens to break.
+ */
+function transportTests() {
+  const byKey = { host: 'example.com', sshUser: 'root', sshKeyPath: '/tmp/key' };
+  const byPassword = { host: 'example.com', sshUser: 'root', sshPassword: 'secret' };
+
+  const cases = [
+    ['a key file needs no sshpass', transportProblem(byKey, false), null],
+    ['a password works when sshpass is present', transportProblem(byPassword, true), null],
+    ['a password without sshpass is refused', transportProblem(byPassword, false), /sshpass/],
+    ['that refusal names the fix', transportProblem(byPassword, false), /key path/i],
+  ];
+
+  for (const [label, actual, expected] of cases) {
+    const ok =
+      expected === null ? actual === null : typeof actual === 'string' && expected.test(actual);
+    if (ok) {
+      pass += 1;
+      console.log(`  ✓ ${label}`);
+    } else {
+      fail += 1;
+      failures.push(`${label} (got ${JSON.stringify(actual)})`);
+      console.log(`  ✗ ${label}`);
+    }
+  }
+}
+
 const securityTestsPending = securityTests();
 
 certTests();
 httpTransportTests();
 bridgeRuleTests();
+transportTests();
 
 // ---- store round trip -----------------------------------------------------
 assert.strictEqual(store.listServers().length, 2, 'server store');
