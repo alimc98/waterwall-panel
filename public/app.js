@@ -2039,10 +2039,22 @@ async function loadEvents() {
     for (const part of parts) {
       const dataLine = part.split('\n').find((l) => l.startsWith('data:'));
       if (!dataLine) continue;
+      const evName = (/(?:^|\n)event:\s*(\S+)/.exec(part) || [])[1] || '';
       try {
         const e = JSON.parse(dataLine.slice(5).trim());
         lines.push(e);
-        push(`${new Date(e.at).toLocaleTimeString('fa-IR')}  ${e.type}  ${JSON.stringify(e).slice(0, 160)}`);
+        // Stored log entries carry their own `at` and `type`. The live
+        // broadcasts (server-status, servers, tunnels) carry neither, which
+        // used to render as "Invalid Date  undefined  {…}" for every status
+        // report in the feed — once per server every 15 seconds.
+        const stamp = new Date(e.at || Date.now()).toLocaleTimeString('fa-IR');
+        const name = e.type || evName || 'رویداد';
+        const body = Array.isArray(e)
+          ? `${e.length} مورد`
+          : e.status && typeof e.status === 'object'
+            ? `${String(e.serverId || '').slice(0, 8)} ${e.status.service || ''}`.trim()
+            : JSON.stringify(e).slice(0, 160);
+        push(`${stamp}  ${name}  ${body}`);
       } catch {
         /* ignore */
       }
