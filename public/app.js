@@ -723,7 +723,7 @@ function pageTunnels() {
         <td><span class="badge ${t.enabled ? 'ok' : 'mute'}">${t.enabled ? 'فعال' : 'غیرفعال'}</span></td>
         <td class="small">${fmtDate(t.updatedAt)}</td>
         <td style="white-space:nowrap">
-          <button class="sm primary" data-tn-open="${t.id}">باز کردن</button>
+          <button class="sm primary" data-tn-open="${t.id}">✏️ ویرایش</button>
           <button class="sm" data-tn-preview="${t.id}">پیش‌نمایش</button>
           <button class="sm" data-tn-del="${t.id}">حذف</button>
         </td>
@@ -760,6 +760,20 @@ function pageEditTunnel() {
   if (!t) return pageTunnels();
   const tpl = state.templates.find((x) => x.id === t.template);
   const p = state.preview;
+  const iran = state.servers.filter((s) => s.role === 'iran');
+  const foreign = state.servers.filter((s) => s.role === 'foreign');
+  const serverOpts = (list, selected) =>
+    list.length
+      ? list
+          .map((s) => `<option value="${s.id}" ${s.id === selected ? 'selected' : ''}>${esc(s.name)}</option>`)
+          .join('')
+      : '<option value="">— ثبت نشده —</option>';
+  const groups = {};
+  for (const f of tpl?.fields || []) {
+    const g = f.group || 'general';
+    groups[g] = groups[g] || [];
+    groups[g].push(f);
+  }
 
   return `
   <div class="page-head">
@@ -769,6 +783,35 @@ function pageEditTunnel() {
     <button id="editBack">بازگشت</button>
     <button class="primary" id="editSave">💾 ذخیره</button>
     <button class="ok" id="editApply">🚀 ذخیره و اعمال روی سرورها</button>
+  </div>
+
+  <div class="card">
+    <h3>⚙️ تنظیمات تونل</h3>
+    <p class="small muted">همهٔ فیلدهایی که موقع ساخت پر کردید اینجاست. مقدارها را همین‌جا عوض کنید و «💾 ذخیره» را بزنید. تونل‌های فعال حداکثر ۱۵ ثانیه بعد خودکار روی هر دو سرور اعمال می‌شوند؛ اگر می‌خواهید همین حالا اعمال شود «🚀 ذخیره و اعمال روی سرورها» را بزنید.</p>
+    <div class="grid c2">
+      <label class="f"><span class="lbl">نام تونل <span class="req">*</span></span>
+        <input type="text" id="et_name" value="${esc(t.name)}"></label>
+      <label class="f"><span class="lbl">وضعیت</span>
+        <label class="switch"><input type="checkbox" id="et_enabled" ${t.enabled ? 'checked' : ''}><span class="track"></span><span>${t.enabled ? 'فعال' : 'غیرفعال'}</span></label>
+      </label>
+    </div>
+    <label class="f"><span class="lbl">توضیحات</span><input type="text" id="et_notes" value="${esc(t.notes || '')}"></label>
+    <div class="grid c2">
+      <label class="f"><span class="lbl">سرور ایران</span>
+        <select id="et_iran">${serverOpts(iran, t.targetServers?.iran)}</select></label>
+      <label class="f"><span class="lbl">سرور خارج</span>
+        <select id="et_foreign">${serverOpts(foreign, t.targetServers?.foreign)}</select></label>
+    </div>
+    <p class="small muted">سناریو: <b>${esc(tpl?.titleFa || t.template)}</b> — برای عوض کردن سناریو یک تونل جدید بسازید.</p>
+
+    ${Object.entries(groups)
+      .map(
+        ([g, fields]) => `<fieldset class="group">
+        <legend>${esc(groupLabel(g))}</legend>
+        ${fields.map((f) => fieldHtml(f, (t.options || {})[f.key])).join('')}
+      </fieldset>`,
+      )
+      .join('')}
   </div>
 
   <div class="card">
@@ -983,10 +1026,31 @@ function usersHtml(t) {
 async function saveTunnel(silent = false) {
   const t = state.draft;
   if (!t) return;
+  const tpl = state.templates.find((x) => x.id === t.template);
+  const body = { name: t.name, notes: t.notes, enabled: t.enabled, options: t.options };
+  // On the detail page the settings form is the source of truth. Without it
+  // (nothing else calls this today) the draft values are sent unchanged.
+  if ($('#et_name') && tpl) {
+    const name = $('#et_name').value.trim();
+    if (!name) {
+      toast('نام تونل را وارد کنید', 'err');
+      return null;
+    }
+    body.name = name;
+    body.notes = $('#et_notes').value.trim();
+    body.enabled = $('#et_enabled').checked;
+    // Merge over the stored options: keys a template's `ensureOptions` added
+    // (WireGuard keypairs and friends) are not form fields and must survive.
+    body.options = { ...t.options, ...collectForm(tpl, { keepEmpty: true, fallback: t.options }) };
+    body.targetServers = {
+      iran: $('#et_iran')?.value || null,
+      foreign: $('#et_foreign')?.value || null,
+    };
+  }
   try {
     const r = await api(`/api/tunnels/${t.id}`, {
       method: 'PATCH',
-      body: { name: t.name, notes: t.notes, enabled: t.enabled, options: t.options },
+      body,
     });
     state.draft = { ...r.tunnel, options: { ...r.tunnel.options } };
     state.currentTunnel = r.tunnel;
@@ -1003,18 +1067,24 @@ async function saveTunnel(silent = false) {
 async function doPreview() {
   const t = state.draft;
   if (!t) return;
+  const tpl = state.templates.find((x) => x.id === t.template);
+  // Preview what the form holds right now, not the values of the last save.
+  const options =
+    $('#et_name') && tpl ? { ...t.options, ...collectForm(tpl, { keepEmpty: true, fallback: t.options }) } : t.options;
   try {
     const r = await api('/api/preview', {
       method: 'POST',
-      body: { template: t.template, name: t.name, options: t.options, targetServers: t.targetServers },
+      body: { template: t.template, name: $('#et_name')?.value.trim() || t.name, options, targetServers: t.targetServers },
     });
     state.preview = r;
     state.activePreviewTab = Object.keys(r.bundles || {})[0] || 'iran';
     state.previewFile = null;
     if (r.optionsPatch) {
       // Persist generated secrets (WireGuard keypairs) so they stay stable.
-      await api(`/api/tunnels/${t.id}`, { method: 'PATCH', body: { options: { ...t.options, ...r.optionsPatch } } });
-      state.draft.options = { ...t.options, ...r.optionsPatch };
+      await api(`/api/tunnels/${t.id}`, { method: 'PATCH', body: { options: { ...options, ...r.optionsPatch } } });
+      state.draft.options = { ...options, ...r.optionsPatch };
+    } else {
+      state.draft.options = options;
     }
     render();
     if (r.problems?.length) toast('کانفیگ مشکل دارد', 'err');
@@ -1301,26 +1371,37 @@ function groupLabel(g) {
   );
 }
 
-function fieldHtml(f) {
+function fieldHtml(f, value) {
   const id = `nf_${f.key}`;
   const req = f.required ? '<span class="req">*</span>' : '';
   const hint = f.help ? `<span class="hint">${esc(f.help)}</span>` : '';
+  // The create form passes nothing (defaults apply); the edit form passes the
+  // stored option so every field opens with the value it is running with.
+  const val = value === undefined ? f.default : value;
   let input = '';
 
   switch (f.type) {
     case 'number':
-      input = `<input type="number" id="${id}" data-key="${f.key}" data-type="number" value="${esc(f.default ?? '')}" ${f.min !== undefined ? `min="${f.min}"` : ''} ${f.max !== undefined ? `max="${f.max}"` : ''}>`;
+      input = `<input type="number" id="${id}" data-key="${f.key}" data-type="number" value="${esc(val ?? '')}" ${f.min !== undefined ? `min="${f.min}"` : ''} ${f.max !== undefined ? `max="${f.max}"` : ''}>`;
       break;
-    case 'password':
-      input = `<div class="row" style="gap:6px"><input type="password" id="${id}" data-key="${f.key}" data-type="text" value="" placeholder="${esc(String(f.default || '').replace('auto:', 'خودکار: '))}">
+    case 'password': {
+      // An `auto:` default is a request for a generated secret, not text to
+      // show. Empty means "leave this alone": on create the server resolves the
+      // auto default, on edit the old value goes back unchanged.
+      const shown = typeof val === 'string' && val.startsWith('auto:') ? '' : String(val ?? '');
+      const placeholder = String(f.default || '').startsWith('auto:')
+        ? `خودکار: ${String(f.default).slice(5)}`
+        : 'مقدار';
+      input = `<div class="row" style="gap:6px"><input type="password" id="${id}" data-key="${f.key}" data-type="text" value="${esc(shown)}" placeholder="${esc(placeholder)}">
         <button class="sm" data-gen="${f.key}">🎲</button></div>`;
       break;
+    }
     case 'boolean':
-      input = `<label class="switch"><input type="checkbox" id="${id}" data-key="${f.key}" data-type="boolean" ${f.default ? 'checked' : ''}><span class="track"></span><span>${esc(f.label)}</span></label>`;
+      input = `<label class="switch"><input type="checkbox" id="${id}" data-key="${f.key}" data-type="boolean" ${val ? 'checked' : ''}><span class="track"></span><span>${esc(f.label)}</span></label>`;
       break;
     case 'select':
       input = `<select id="${id}" data-key="${f.key}" data-type="text">${(f.options || [])
-        .map((o) => `<option value="${esc(o)}" ${o === f.default ? 'selected' : ''}>${esc(o)}</option>`)
+        .map((o) => `<option value="${esc(o)}" ${String(o) === String(val) ? 'selected' : ''}>${esc(o)}</option>`)
         .join('')}</select>`;
       break;
     case 'list':
@@ -1330,7 +1411,7 @@ function fieldHtml(f) {
         </div><div class="chips" id="chips_${f.key}"></div>`;
       break;
     case 'csv':
-      input = `<input type="text" id="${id}" data-key="${f.key}" data-type="csv" value="${esc((f.default || []).join(', '))}">`;
+      input = `<input type="text" id="${id}" data-key="${f.key}" data-type="csv" value="${esc((Array.isArray(val) ? val : []).join(', '))}">`;
       break;
     case 'keyvalue':
       input = `<div data-kv="${f.key}"></div><button class="sm mt" data-kvadd="${f.key}">+ کاربر</button>`;
@@ -1339,14 +1420,14 @@ function fieldHtml(f) {
       input = `<div data-users="${f.key}"></div><button class="sm mt" data-useradd="${f.key}">+ کاربر</button>`;
       break;
     default:
-      input = `<input type="text" id="${id}" data-key="${f.key}" data-type="text" value="${esc(f.default ?? '')}">`;
+      input = `<input type="text" id="${id}" data-key="${f.key}" data-type="text" value="${esc(val ?? '')}">`;
   }
   return `<label class="f" data-field="${f.key}" ${f.when ? `data-when='${esc(JSON.stringify(f.when))}'` : ''}>
       <span class="lbl">${esc(f.label)} ${req}</span>${input}${hint}
     </label>`;
 }
 
-function collectForm(tpl) {
+function collectForm(tpl, { keepEmpty = false, fallback = null } = {}) {
   const options = {};
   for (const f of tpl.fields) {
     if (f.type === 'boolean') {
@@ -1358,7 +1439,12 @@ function collectForm(tpl) {
     if (!el) continue;
     const raw = el.value;
     if (f.type === 'number') {
-      if (raw === '') continue;
+      if (raw === '') {
+        // Cleared on the edit form: '' makes the server fall back to the
+        // template default instead of silently keeping the stale value.
+        if (keepEmpty) options[f.key] = '';
+        continue;
+      }
       options[f.key] = Number(raw);
     } else if (f.type === 'list') {
       options[f.key] = String(raw || '')
@@ -1369,6 +1455,16 @@ function collectForm(tpl) {
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean);
+    } else if (f.type === 'password') {
+      // An empty box means "leave the current secret alone". On the edit form
+      // the old value has to go back in, otherwise the server resolves the
+      // field's `auto:` default into a fresh secret and the live tunnel breaks.
+      if (raw !== '') options[f.key] = raw;
+      else if (keepEmpty && fallback && fallback[f.key] !== undefined) options[f.key] = fallback[f.key];
+    } else if (keepEmpty) {
+      // Editing: a field the user cleared stays cleared (the create form lets
+      // empty mean "use the template default").
+      options[f.key] = raw;
     } else if (raw !== '') {
       options[f.key] = raw;
     }
@@ -1736,6 +1832,9 @@ function afterRender() {
   if (state.selectedTemplate) initDynamicFields(state.selectedTemplate);
 
   // tunnel detail
+  if (state.page === 'edit' && state.draft) {
+    initDynamicFields(state.templates.find((x) => x.id === state.draft.template), state.draft.options);
+  }
   $('#editBack')?.addEventListener('click', () => go('tunnels'));
   $('#doPreview')?.addEventListener('click', doPreview);
   $('#editSave')?.addEventListener('click', async () => {
@@ -1884,20 +1983,24 @@ function afterRender() {
 }
 
 // --------------------------------------------------------- dynamic fields
-function initDynamicFields(tpl) {
+function initDynamicFields(tpl, values) {
+  if (!tpl) return;
+  // `values` is the option map of a saved tunnel (edit page); without it the
+  // template defaults seed the create form exactly as before.
+  const val = (f) => (values && values[f.key] !== undefined ? values[f.key] : f.default);
   // chips for list fields
   for (const f of tpl.fields.filter((x) => x.type === 'list')) {
-    renderChips(f.key, [].concat(f.default || []));
+    renderChips(f.key, [].concat(val(f) || []));
   }
   // keyvalue rows
   for (const f of tpl.fields.filter((x) => x.type === 'keyvalue')) {
     const host = $(`[data-kv="${f.key}"]`);
-    (f.default || []).forEach((row) => addKvRow(host, row));
+    [].concat(val(f) || []).forEach((row) => addKvRow(host, row));
   }
   // user rows
   for (const f of tpl.fields.filter((x) => x.type === 'users')) {
     const host = $(`[data-users="${f.key}"]`);
-    (f.default || []).forEach((row) => addUserRow(host, row));
+    [].concat(val(f) || []).forEach((row) => addUserRow(host, row));
   }
   // generate buttons
   $$('[data-gen]').forEach((b) => {
