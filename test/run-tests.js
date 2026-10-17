@@ -451,23 +451,10 @@ function certTests() {
   // And no template may reintroduce a hardcoded /root certificate path, which
   // would silently bypass the managed location.
   const TPL_DIR = require('node:path').join(__dirname, '..', 'lib', 'templates') + require('node:path').sep;
-  const FILE_OF = {
-    'tcp-forward': 'basic.js', 'udp-forward': 'basic.js', 'tcp-udp-forward': 'basic.js',
-    'encrypted-tcp': 'basic.js', 'xor-obfuscated': 'basic.js',
-    'vless-tls': 'stream.js', 'vless-mux-tls': 'stream.js', 'vless-reality': 'stream.js',
-    'trojan-tls': 'stream.js', 'vless-http-ws-tls': 'stream.js', 'udp-over-tcp': 'stream.js',
-    'http-proxy': 'proxy.js', 'socks5-upstream': 'proxy.js',
-    'tun-wireguard': 'layer3.js', 'rootless-socks-wireguard': 'layer3.js', 'tun-tcp-tunnel': 'layer3.js',
-    'reverse-tls': 'reverse.js', 'reverse-plain': 'reverse.js', 'reverse-reality': 'reverse-reality.js',
-    'tcp-bit-swap': 'bitswap.js', 'tcp-bit-swap-mux': 'bitswap.js', 'tcp-bit-swap-mux-2': 'bitswap.js',
-    protoswap: 'protoswap.js',
-    'half-duplex': 'stream-adv.js', 'stream-fragmenter': 'stream-adv.js', 'connection-fisher': 'stream-adv.js',
-    'tun2socks': 'l3-new.js', 'ping-tunnel': 'l3-new.js',
-    'first-sni': 'stealth.js', 'sni-blender': 'stealth.js', 'disturber-lab': 'stealth.js',
-    'tcp-over-udp': 'transport.js', 'header-proxy': 'transport.js',
-    'router-split': 'ops.js', 'auth-users': 'ops.js', 'vless-hardened': 'ops.js',
-    speedtest: 'ops.js', 'tester-chain': 'ops.js',
-  };
+  // Derived from the catalogue rather than written out again: a second copy of
+  // the id-to-file map silently stops covering whatever was added last, which is
+  // exactly the file most likely to contain a fresh mistake.
+  const FILE_OF = Object.fromEntries(templates.ALL.map((t) => [t.id, idToFile(t.id)]));
   const offenders = [];
   for (const file of new Set(Object.values(FILE_OF))) {
     const source = fs2.readFileSync(TPL_DIR + file, 'utf8');
@@ -493,6 +480,7 @@ function idToFile(id) {
     'tcp-over-udp': 'transport.js', 'header-proxy': 'transport.js',
     'router-split': 'ops.js', 'auth-users': 'ops.js', 'vless-hardened': 'ops.js',
     speedtest: 'ops.js', 'tester-chain': 'ops.js',
+    'cdn-reverse-wss': 'cdn.js',
   };
   return map[id] || 'basic.js';
 }
@@ -663,9 +651,175 @@ async function securityTests() {
     child.kill();
   }
 }
+/**
+ * The Bridge pairing rule.
+ *
+ * `validateBundle` is the last gate before a config is written to a server, so
+ * the rule it enforces has to be checked against the exact shape it exists to
+ * reject. It is not a rule the JSON schema can express and not one WaterWall
+ * reports until it loads the file, which on a live box means the tunnel is down
+ * and the only clue is a line in a log nobody is watching yet.
+ */
+function bridgeRuleTests() {
+  const bridgeConfig = (reverseBridge) => ({
+    'configs/bridge.json': JSON.stringify({
+      nodes: [
+        { name: 'users_inbound', type: 'TcpListener', version: 0, settings: { port: 443 }, next: 'bridge_users' },
+        { name: 'bridge_users', type: 'Bridge', version: 0, settings: { pair: 'bridge_reverse' } },
+        reverseBridge,
+        { name: 'reverse_server', type: 'ReverseServer', version: 0, settings: {}, next: 'bridge_reverse' },
+      ],
+    }),
+  });
+
+  const rejected = bridgeConfig({
+    name: 'bridge_reverse',
+    type: 'Bridge',
+    version: 0,
+    settings: { pair: 'bridge_users' },
+    next: 'bridge_users',
+  });
+  const accepted = bridgeConfig({
+    name: 'bridge_reverse',
+    type: 'Bridge',
+    version: 0,
+    settings: { pair: 'bridge_users' },
+  });
+
+  const caught = validateBundle(rejected).some((p) => /both pairs and points at/.test(p));
+  const clean = validateBundle(accepted).length === 0;
+
+  if (caught && clean) {
+    pass += 1;
+    console.log('  ✓ a Bridge that also names its partner as next is rejected, the correct pair is not');
+  } else {
+    fail += 1;
+    if (!caught) {
+      failures.push('validateBundle accepted a Bridge pair that names the partner as next');
+      console.log('  ✗ validateBundle accepted a Bridge pair that names the partner as next');
+    }
+    if (!clean) {
+      const problems = validateBundle(accepted).join('; ');
+      failures.push(`validateBundle rejected a correct Bridge pair: ${problems}`);
+      console.log(`  ✗ validateBundle rejected a correct Bridge pair: ${problems}`);
+    }
+  }
+}
+
+/**
+ * HTTP transport agreement.
+ *
+ * `HttpClient` and `HttpServer` negotiate nothing at runtime. Each node picks
+ * its own framing from its own settings, and the server *requires* whatever it
+ * is told to require. A value present on only one side therefore produces a
+ * config that builds, validates and loads, and then never completes a single
+ * handshake — which is exactly how the VLESS-over-WebSocket template shipped a
+ * server-side `websocket-origin` and `websocket-subprotocol` that its own client
+ * never sent. Every one of these pairs has to come from a single source.
+ */
+function httpTransportTests() {
+  const REQUIRED_TO_MATCH = ['path', 'websocket', 'http-version'];
+  const REQUIRED_IF_SET = ['websocket-origin', 'websocket-subprotocol'];
+  const findings = [];
+
+  // Normalise the version aliases the docs list, so "1.1" and "http1.1" agree.
+  const version = (v) => {
+    const s = String(v ?? '').toLowerCase();
+    if (['1', '1.1', 'http1', 'http1.1'].includes(s)) return '1.1';
+    if (['2', '2.0', 'http2', 'h2'].includes(s)) return '2';
+    return s;
+  };
+
+  for (const tpl of templates.ALL) {
+    let tunnel = store.addTunnel({ name: `http-${tpl.id}`, template: tpl.id, options: {} });
+    let result = buildBundle(store, tunnel);
+    if (result.optionsPatch) {
+      tunnel = store.updateTunnel(tunnel.id, { options: { ...tunnel.options, ...result.optionsPatch } });
+      result = buildBundle(store, tunnel);
+    }
+
+    const clients = [];
+    const servers = [];
+    for (const side of ['iran', 'foreign']) {
+      for (const [file, text] of Object.entries(result.bundles?.[side] || {})) {
+        let parsed;
+        try {
+          parsed = JSON.parse(preprocessConfig(text).text);
+        } catch {
+          continue;
+        }
+        for (const n of parsed.nodes || []) {
+          if (n.type === 'HttpClient') clients.push({ side, file, s: n.settings || {} });
+          if (n.type === 'HttpServer') servers.push({ side, file, s: n.settings || {} });
+        }
+      }
+    }
+    if (!clients.length || !servers.length) continue;
+
+    for (const c of clients) {
+      for (const s of servers) {
+        for (const key of REQUIRED_TO_MATCH) {
+          const a = key === 'http-version' ? version(c.s[key]) : c.s[key];
+          const b = key === 'http-version' ? version(s.s[key]) : s.s[key];
+          if (String(a) !== String(b)) {
+            findings.push(`${tpl.id}: ${key} is ${JSON.stringify(c.s[key])} on the client but ${JSON.stringify(s.s[key])} on the server`);
+          }
+        }
+        for (const key of REQUIRED_IF_SET) {
+          if (s.s[key] !== undefined && c.s[key] !== s.s[key]) {
+            findings.push(
+              `${tpl.id}: the server requires ${key}=${JSON.stringify(s.s[key])} but the client sends ${JSON.stringify(c.s[key] ?? '(nothing)')}`,
+            );
+          }
+        }
+        // A WebSocket opening handshake is an HTTP/1.1 GET; the docs are explicit
+        // that the server rejects anything else.
+        if (s.s.websocket && String(s.s.method || 'POST').toUpperCase() !== 'GET') {
+          findings.push(`${tpl.id}: websocket server uses method ${JSON.stringify(s.s.method)} instead of GET`);
+        }
+      }
+    }
+
+    // The ALPN offered must be one the chosen HTTP mode can speak. ALPN and the
+    // HTTP mode are chosen by two independent nodes and never reconciled at
+    // runtime, so they have to be derived from one value at build time.
+    const wanted = version(clients[0].s['http-version']) === '2' ? 'h2' : 'http/1.1';
+    for (const side of ['iran', 'foreign']) {
+      for (const [file, text] of Object.entries(result.bundles?.[side] || {})) {
+        let chain;
+        try {
+          chain = JSON.parse(preprocessConfig(text).text);
+        } catch {
+          continue;
+        }
+        for (const n of chain.nodes || []) {
+          if (n.type !== 'TlsClient' && n.type !== 'TlsServer') continue;
+          const offered = n.settings?.alpns || n.settings?.['select-alpns'];
+          if (!Array.isArray(offered) || offered.includes(wanted)) continue;
+          findings.push(
+            `${tpl.id}: ${side}/${file} ${n.name} offers ALPN ${JSON.stringify(offered)} but the HTTP transport needs ${JSON.stringify(wanted)}`,
+          );
+        }
+      }
+    }
+  }
+
+  if (findings.length) {
+    fail += 1;
+    failures.push(...findings);
+    console.log(`  ✗ HTTP transport agreement: ${findings.length} mismatch(es)`);
+    findings.forEach((f) => console.log(`      - ${f}`));
+  } else {
+    pass += 1;
+    console.log('  ✓ HTTP transport agreement (client and server settings match)');
+  }
+}
+
 const securityTestsPending = securityTests();
 
 certTests();
+httpTransportTests();
+bridgeRuleTests();
 
 // ---- store round trip -----------------------------------------------------
 assert.strictEqual(store.listServers().length, 2, 'server store');

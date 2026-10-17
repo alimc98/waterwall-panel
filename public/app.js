@@ -1282,6 +1282,7 @@ function groupLabel(g) {
       vless: 'VLESS',
       trojan: 'Trojan',
       http: 'HTTP / WebSocket',
+      cdn: 'CDN',
       core: 'تنظیمات core.json',
       advanced: 'پیشرفته',
       wg: 'WireGuard',
