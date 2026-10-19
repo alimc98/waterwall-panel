@@ -341,7 +341,27 @@ async function apply(bundles, basePath) {
     // connection on the server to reload a configuration that is already
     // loaded — and the first poll after the agent is installed is always this
     // case on a server the panel was set up from.
-    return { changed: false, written, reason: 'the files on disk already match' };
+    //
+    // However, "no file changed" is not the same as "the service is healthy".
+    // A manual stop, a failed start or a crash leaves the files identical and
+    // the tunnel down forever if the agent only watches hashes. Start an
+    // inactive service; never restart an active one.
+    const service = process.env.WW_SERVICE || 'waterwall';
+    const status = await serviceStatus(service);
+    if (status.active !== 'active') {
+      const start = await run('systemctl', ['start', service]);
+      const after = await serviceStatus(service);
+      return {
+        changed: false,
+        written,
+        reason: start.ok
+          ? 'the files on disk already match; the inactive service was started'
+          : 'the files on disk already match, but the inactive service could not be started',
+        service: after,
+        ...(start.ok ? {} : { error: start.stderr || 'systemctl start failed' }),
+      };
+    }
+    return { changed: false, written, reason: 'the files on disk already match', service: status };
   }
   const service = process.env.WW_SERVICE || 'waterwall';
   const restart = await run('systemctl', ['restart', service]);
