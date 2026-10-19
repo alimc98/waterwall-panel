@@ -716,10 +716,11 @@ function pageTunnels() {
   const rows = state.tunnels
     .map((t) => {
       const tpl = state.templates.find((x) => x.id === t.template);
+      const exits = foreignList(t.targetServers?.foreign).length;
       return `
       <tr>
         <td><strong>${esc(t.name)}</strong>${t.notes ? `<br><span class="small muted">${esc(t.notes)}</span>` : ''}</td>
-        <td><span class="badge">${tpl?.icon || ''} ${esc(tpl?.titleFa || t.template)}</span></td>
+        <td><span class="badge">${tpl?.icon || ''} ${esc(tpl?.titleFa || t.template)}</span>${exits > 1 ? `<br><span class="small muted">${exits} سرور خارج</span>` : ''}</td>
         <td><span class="badge ${t.enabled ? 'ok' : 'mute'}">${t.enabled ? 'فعال' : 'غیرفعال'}</span></td>
         <td class="small">${fmtDate(t.updatedAt)}</td>
         <td style="white-space:nowrap">
@@ -774,6 +775,7 @@ function pageEditTunnel() {
     groups[g] = groups[g] || [];
     groups[g].push(f);
   }
+  const foreignSelected = foreignList(t.targetServers?.foreign);
 
   return `
   <div class="page-head">
@@ -799,9 +801,22 @@ function pageEditTunnel() {
     <div class="grid c2">
       <label class="f"><span class="lbl">سرور ایران</span>
         <select id="et_iran">${serverOpts(iran, t.targetServers?.iran)}</select></label>
-      <label class="f"><span class="lbl">سرور خارج</span>
-        <select id="et_foreign">${serverOpts(foreign, t.targetServers?.foreign)}</select></label>
+      ${
+        tpl?.multiExit
+          ? ''
+          : `<label class="f"><span class="lbl">سرور خارج</span>
+        <select id="et_foreign">${serverOpts(foreign, t.targetServers?.foreign)}</select></label>`
+      }
     </div>
+    ${
+      tpl?.multiExit
+        ? `<label class="f"><span class="lbl">سرورهای خارج <span class="badge ok">چند-سروری</span></span>${foreignPickerHtml(
+            'et',
+            foreign,
+            foreignSelected.length ? foreignSelected : foreign.length ? [foreign[0].id] : [],
+          )}</label>`
+        : ''
+    }
     <p class="small muted">سناریو: <b>${esc(tpl?.titleFa || t.template)}</b> — برای عوض کردن سناریو یک تونل جدید بسازید.</p>
 
     ${Object.entries(groups)
@@ -1042,10 +1057,11 @@ async function saveTunnel(silent = false) {
     // Merge over the stored options: keys a template's `ensureOptions` added
     // (WireGuard keypairs and friends) are not form fields and must survive.
     body.options = { ...t.options, ...collectForm(tpl, { keepEmpty: true, fallback: t.options }) };
-    body.targetServers = {
-      iran: $('#et_iran')?.value || null,
-      foreign: $('#et_foreign')?.value || null,
-    };
+    body.targetServers = readTargets('et');
+    if ($('#et_foreign_list') && !body.targetServers.foreign.length) {
+      toast('حداقل یک سرور خارج انتخاب کنید', 'err');
+      return null;
+    }
   }
   try {
     const r = await api(`/api/tunnels/${t.id}`, {
@@ -1071,11 +1087,13 @@ async function doPreview() {
   // Preview what the form holds right now, not the values of the last save.
   const options =
     $('#et_name') && tpl ? { ...t.options, ...collectForm(tpl, { keepEmpty: true, fallback: t.options }) } : t.options;
+  const targetServers = $('#et_name') ? readTargets('et') : t.targetServers;
   try {
     const r = await api('/api/preview', {
       method: 'POST',
-      body: { template: t.template, name: $('#et_name')?.value.trim() || t.name, options, targetServers: t.targetServers },
+      body: { template: t.template, name: $('#et_name')?.value.trim() || t.name, options, targetServers },
     });
+    state.draft.targetServers = targetServers;
     state.preview = r;
     state.activePreviewTab = Object.keys(r.bundles || {})[0] || 'iran';
     state.previewFile = null;
@@ -1208,11 +1226,16 @@ async function doApply(dryRun = false) {
     const lines = Object.entries(r.results)
       .map(([side, res]) => {
         const label = side === 'iran' ? '🇮🇷 ایران' : '🌍 خارج';
-        return res.ok
-          ? `<div class="ok-box">${label}: ${esc(res.dryRun ? 'dry-run OK — ' : '')}${esc((res.files || res.uploaded || []).join(', '))}${
+        const detail = res.servers
+          ? `${res.servers.map((p) => `${p.ok ? '✓' : '✗'} ${esc(p.server)}${p.error ? ` — ${esc(p.error)}` : ''}`).join('<br>')}${
+              res.files || res.uploaded ? `<br><span class="small muted">${esc((res.files || res.uploaded).join(', '))}</span>` : ''
+            }`
+          : `${esc(res.dryRun ? 'dry-run OK — ' : '')}${esc((res.files || res.uploaded || []).join(', '))}${
               res.service?.output ? `<br>سرویس: ${esc(res.service.output)}` : ''
-            }</div>`
-          : `<div class="err-box">${label}: ${esc(res.error)}</div>`;
+            }`;
+        return res.ok
+          ? `<div class="ok-box">${label}${res.servers ? ` (${res.servers.length} سرور): ` : ': '}${detail}</div>`
+          : `<div class="err-box">${label}: ${detail || esc(res.error || '')}</div>`;
       })
       .join('');
     openModal(
@@ -1291,6 +1314,38 @@ function pageNewTunnel() {
   ${state.selectedTemplate ? templateFormHtml(state.selectedTemplate) : '<div class="card"><div class="empty"><div class="ic">⬅️</div>از فهرست بالا یک سناریو انتخاب کنید.</div></div>'}`;
 }
 
+/** `targetServers.foreign` is a single id for ordinary templates and an array
+ *  for reverse tunnels; the UI wants a list either way. */
+function foreignList(value) {
+  if (Array.isArray(value)) return value.filter(Boolean);
+  return value ? [value] : [];
+}
+
+/** Checkbox list of every exit server (templates marked `multiExit`). */
+function foreignPickerHtml(prefix, servers, selected) {
+  if (!servers.length) {
+    return '<div class="empty" style="padding:14px"><span class="small muted">سرور خارجی ثبت نشده است — از صفحهٔ «سرورها» اضافه کنید.</span></div>';
+  }
+  const chosen = foreignList(selected);
+  return `<div class="pick-list" id="${prefix}_foreign_list">
+    ${servers
+      .map(
+        (s) => `<label class="pick"><input type="checkbox" value="${s.id}" ${chosen.includes(s.id) ? 'checked' : ''}>
+          <span>${esc(s.name)}</span><span class="mono small muted">${esc(s.host)}</span></label>`,
+      )
+      .join('')}
+  </div>
+  <span class="hint">هر تعداد سرور خارج می‌توانید انتخاب کنید: بار بینشان تقسیم می‌شود و اگر یکی قطع شود بقیه در مدار می‌مانند.</span>`;
+}
+
+/** Target selection currently visible in the create (`nt`) or edit (`et`) form. */
+function readTargets(prefix) {
+  const iran = $(`#${prefix}_iran`)?.value || null;
+  const list = $(`#${prefix}_foreign_list`);
+  if (list) return { iran, foreign: $$('input[type="checkbox"]:checked', list).map((i) => i.value) };
+  return { iran, foreign: $(`#${prefix}_foreign`)?.value || null };
+}
+
 function templateFormHtml(tpl) {
   const iran = state.servers.filter((s) => s.role === 'iran');
   const foreign = state.servers.filter((s) => s.role === 'foreign');
@@ -1314,13 +1369,15 @@ function templateFormHtml(tpl) {
     <div class="grid c2">
       <label class="f"><span class="lbl">نام تونل <span class="req">*</span></span>
         <input type="text" id="nt_name" value=""></label>
-      <div class="grid c2" style="gap:10px">
-        <label class="f"><span class="lbl">سرور ایران</span>
-          <select id="nt_iran">${iran.length ? iran.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join('') : '<option value="">— ثبت نشده —</option>'}</select></label>
-        <label class="f"><span class="lbl">سرور خارج</span>
-          <select id="nt_foreign">${foreign.length ? foreign.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join('') : '<option value="">— ثبت نشده —</option>'}</select></label>
-      </div>
+      <label class="f"><span class="lbl">سرور ایران</span>
+        <select id="nt_iran">${iran.length ? iran.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join('') : '<option value="">— ثبت نشده —</option>'}</select></label>
     </div>
+    ${
+      tpl.multiExit
+        ? `<label class="f"><span class="lbl">سرورهای خارج <span class="badge ok">چند-سروری</span></span>${foreignPickerHtml('nt', foreign, foreign.length ? [foreign[0].id] : [])}</label>`
+        : `<label class="f"><span class="lbl">سرور خارج</span>
+        <select id="nt_foreign">${foreign.length ? foreign.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join('') : '<option value="">— ثبت نشده —</option>'}</select></label>`
+    }
     <label class="f"><span class="lbl">توضیحات</span><input type="text" id="nt_notes" placeholder="اختیاری"></label>
 
     ${Object.entries(groups)
@@ -1507,6 +1564,11 @@ async function createTunnel(tpl) {
     toast('نام تونل را وارد کنید', 'err');
     return;
   }
+  const targets = readTargets('nt');
+  if ($('#nt_foreign_list') && !targets.foreign.length) {
+    toast('حداقل یک سرور خارج انتخاب کنید', 'err');
+    return;
+  }
   const options = collectForm(tpl);
   try {
     const r = await api('/api/tunnels', {
@@ -1516,7 +1578,7 @@ async function createTunnel(tpl) {
         template: tpl.id,
         notes: $('#nt_notes').value.trim(),
         options,
-        targetServers: { iran: $('#nt_iran').value || null, foreign: $('#nt_foreign').value || null },
+        targetServers: targets,
       },
     });
     state.tunnels.push(r.tunnel);

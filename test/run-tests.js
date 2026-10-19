@@ -69,6 +69,61 @@ for (const tpl of templates.ALL) {
   }
 }
 
+// ---- multi-exit reverse tunnels ------------------------------------------
+// A reverse entry can front any number of exit servers. Every exit runs the
+// same foreign config and joins the ReverseServer pool on the Iran side, so the
+// Iran whitelist has to name all of them and the UI has to know the template
+// supports it.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-multi-exit-'));
+  const multiStore = new Store(dir);
+  multiStore.addServer({ id: 'ir', name: 'Iran', role: 'iran', host: '203.0.113.10' });
+  multiStore.addServer({ id: 'ex1', name: 'Exit 1', role: 'foreign', host: '198.51.100.1' });
+  multiStore.addServer({ id: 'ex2', name: 'Exit 2', role: 'foreign', host: '198.51.100.2' });
+  multiStore.addServer({ id: 'ex3', name: 'Exit 3', role: 'foreign', host: '198.51.100.3' });
+
+  const tunnel = multiStore.addTunnel({
+    name: 'multi-exit',
+    template: 'reverse-reality',
+    targetServers: { iran: 'ir', foreign: ['ex1', 'ex2', 'ex3'] },
+    options: {},
+  });
+  const built = buildBundle(multiStore, tunnel);
+  assert.strictEqual(built.ok, true);
+  assert.deepStrictEqual(built.options.foreignHosts, ['198.51.100.1', '198.51.100.2', '198.51.100.3']);
+
+  const iranCfg = built.bundles.iran['configs/reverse-reality.json'];
+  const resolved = preprocessConfig(iranCfg);
+  assert.deepStrictEqual(resolved.problems, []);
+  for (const host of built.options.foreignHosts) {
+    assert.ok(resolved.text.includes(`"${host}/32"`), `the Iran whitelist must contain ${host}/32`);
+  }
+
+  // Every exit runs the same bundle: it names the Iran entry, never the exit's
+  // own address, so one build can be shipped to the whole fleet.
+  const foreignText = Object.values(built.bundles.foreign).join('\n');
+  assert.ok(foreignText.includes('203.0.113.10'), 'the exit bundle must dial the Iran entry');
+  assert.ok(!foreignText.includes('198.51.100'), 'the exit bundle must not embed a specific exit host');
+
+  assert.strictEqual(templates.get('reverse-reality').multiExit, true);
+  assert.strictEqual(templates.catalog().find((x) => x.id === 'reverse-reality').multiExit, true);
+  assert.strictEqual(templates.catalog().find((x) => x.id === 'tcp-forward').multiExit, false);
+
+  // The old single-id shape still resolves to exactly one exit.
+  const single = multiStore.addTunnel({
+    name: 'single-exit',
+    template: 'reverse-reality',
+    targetServers: { iran: 'ir', foreign: 'ex2' },
+    options: {},
+  });
+  const one = buildBundle(multiStore, single);
+  assert.deepStrictEqual(one.options.foreignHosts, ['198.51.100.2']);
+  assert.ok(preprocessConfig(one.bundles.iran['configs/reverse-reality.json']).text.includes('198.51.100.2/32'));
+
+  pass += 1;
+  console.log(`  ✓ ${'multi-exit'.padEnd(24)} 3 exits whitelisted, one bundle for all`);
+}
+
 // ---- shared secrets must be identical on both sides ----------------------
 // Both ends of a tunnel have to agree on secrets (Reality password, UUID, ...).
 // If a build generates them independently the tunnel silently breaks, so every

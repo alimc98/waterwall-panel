@@ -13,6 +13,7 @@ const protoscan = require('./lib/protoscan');
 const versions = require('./lib/versions');
 const netcheck = require('./lib/netcheck');
 const certs = require('./lib/certs');
+const { resolveTargets, isTarget } = require('./lib/targets');
 const { Router, sendJson, sendError, sendText, parseJsonBody, serveStatic, parseUrl } = require('./lib/http');
 const { timingSafeEqual, readBody } = require('./lib/util');
 
@@ -87,15 +88,20 @@ function broadcast(event, data) {
 
 store.onLog((entry) => broadcast('log', entry));
 
+/**
+ * Every server a tunnel is deployed to. Reverse tunnels can name several exits,
+ * so the foreign side is a list; `findServers` below keeps the old shape for the
+ * routes that act on one server (logs, firewall hints, certificates).
+ */
+function findTargets(tunnel) {
+  return resolveTargets(store.listServers(), tunnel);
+}
+
 function findServers(tunnel) {
-  const servers = store.listServers();
-  const pick = (role, explicitId) => {
-    if (explicitId) return servers.find((s) => s.id === explicitId) || null;
-    return servers.find((s) => s.role === role) || null;
-  };
+  const { iran, foreign } = findTargets(tunnel);
   return {
-    iran: pick('iran', tunnel?.targetServers?.iran),
-    foreign: pick('foreign', tunnel?.targetServers?.foreign),
+    iran,
+    foreign: foreign[0] || null,
   };
 }
 
@@ -421,7 +427,8 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   if (bundle.problems.length) {
     return sendError(res, 400, 'generated configuration is invalid', { problems: bundle.problems });
   }
-  const servers = findServers(tunnel);
+  const targets = findTargets(tunnel);
+  const servers = { iran: targets.iran, foreign: targets.foreign[0] || null };
 
   // A tunnel with a domain gets its certificate handled before anything is
   // written, so the service never starts against a missing or expired file.
@@ -466,27 +473,47 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
 
   const results = {};
   for (const side of sides) {
-    const server = servers[side];
     const files = bundle.bundles[side];
     if (!files) {
       results[side] = { ok: false, error: 'template does not produce a config for this side' };
       continue;
     }
-    if (!server) {
+    // A reverse tunnel can have a whole fleet of exits; every one of them gets
+    // the same foreign bundle, because the config names the Iran entry, not the
+    // exit's own address.
+    const fleet = side === 'iran' ? (targets.iran ? [targets.iran] : []) : targets.foreign;
+    if (!fleet.length) {
       results[side] = { ok: false, error: `no server registered with role "${side}"` };
       continue;
     }
     if (body.dryRun) {
-      results[side] = { ok: true, dryRun: true, files: Object.keys(files) };
+      results[side] = {
+        ok: true,
+        dryRun: true,
+        files: Object.keys(files),
+        ...(fleet.length > 1 ? { servers: fleet.map((s) => ({ ok: true, server: s.name })) } : {}),
+      };
       continue;
     }
-    const uploaded = await ssh.uploadFiles(server, files, server.waterwallPath);
-    if (!uploaded.ok) {
-      results[side] = { ok: false, error: uploaded.error };
-      continue;
+    const per = [];
+    for (const server of fleet) {
+      const uploaded = await ssh.uploadFiles(server, files, server.waterwallPath);
+      if (!uploaded.ok) {
+        per.push({ ok: false, server: server.name, error: uploaded.error });
+        continue;
+      }
+      const svc = body.restart === false ? { ok: true, output: 'restart skipped' } : await ssh.serviceAction(server, 'restart');
+      per.push({ ok: true, server: server.name, uploaded: Object.keys(files), service: svc });
     }
-    const svc = body.restart === false ? { ok: true, output: 'restart skipped' } : await ssh.serviceAction(server, 'restart');
-    results[side] = { ok: true, uploaded: Object.keys(files), service: svc };
+    results[side] =
+      per.length === 1
+        ? per[0]
+        : {
+            ok: per.every((p) => p.ok),
+            servers: per,
+            uploaded: [...new Set(per.flatMap((p) => p.uploaded || []))],
+            service: per.map((p) => `${p.server}: ${p.service?.output || p.error || ''}`).join('\n'),
+          };
   }
   store.log({ type: 'tunnel.apply', tunnelId: tunnel.id, sides, results });
   broadcast('tunnels', store.listTunnels());
@@ -587,15 +614,26 @@ router.post('/api/tunnels/:id/service', async (req, res, ctx) => {
   const tunnel = store.getTunnel(ctx.params.id);
   if (!tunnel) return sendError(res, 404, 'tunnel not found');
   const body = await parseJsonBody(req);
-  const servers = findServers(tunnel);
+  const targets = findTargets(tunnel);
   const results = {};
   for (const side of body.sides || ['iran', 'foreign']) {
-    const server = servers[side];
-    if (!server) {
+    const fleet = side === 'iran' ? (targets.iran ? [targets.iran] : []) : targets.foreign;
+    if (!fleet.length) {
       results[side] = { ok: false, error: 'server not found' };
       continue;
     }
-    results[side] = await ssh.serviceAction(server, body.action || 'restart');
+    const per = [];
+    for (const server of fleet) {
+      per.push({ server: server.name, ...(await ssh.serviceAction(server, body.action || 'restart')) });
+    }
+    results[side] =
+      per.length === 1
+        ? per[0]
+        : {
+            ok: per.every((p) => p.ok),
+            servers: per,
+            output: per.map((p) => `${p.server}: ${p.output || p.error || ''}`).join('\n'),
+          };
   }
   sendJson(res, 200, { ok: true, results });
 });
@@ -825,16 +863,23 @@ router.get('/api/agent/config', (req, res) => {
     ? all.filter((t) => tunnelIds.split(',').includes(t.id))
     : all;
   const bundles = {};
+  const meta = [];
   for (const tunnel of selected) {
+    const targets = resolveTargets(store.listServers(), tunnel);
+    // Only the servers this tunnel actually points at get its bundle. The old
+    // role-wide behaviour stays for tunnels with no explicit targets.
+    if (!isTarget(targets, tunnel, server)) continue;
     const built = buildBundle(store, tunnel);
-    if (built.bundles[server.role]) bundles[tunnel.id] = built.bundles[server.role];
+    if (!built.bundles[server.role]) continue;
+    bundles[tunnel.id] = built.bundles[server.role];
+    meta.push({ id: tunnel.id, name: tunnel.name, template: tunnel.template, updatedAt: tunnel.updatedAt });
   }
   sendJson(res, 200, {
     ok: true,
     server: { id: server.id, role: server.role, waterwallPath: server.waterwallPath, serviceName: server.serviceName },
     revision: store.getPanel().revision || 0,
     bundles,
-    meta: selected.map((t) => ({ id: t.id, name: t.name, template: t.template, updatedAt: t.updatedAt })),
+    meta,
   });
 });
 

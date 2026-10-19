@@ -174,6 +174,15 @@ select { cursor: pointer; }
 .switch input:checked + .track::after { right: 20px; background: #fff; }
 .list-input { display: flex; gap: 8px; }
 .list-input input { flex: 1; }
+/* Checkbox list of exit servers: reverse tunnels can have any number. */
+.pick-list {
+  display: grid; gap: 4px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 9px; padding: 7px;
+}
+.pick { display: flex; align-items: center; gap: 9px; padding: 6px 8px; border-radius: 7px; cursor: pointer; font-size: 13px; }
+.pick:hover { background: rgba(91,140,255,.08); }
+.pick input { width: 15px; height: 15px; accent-color: var(--accent); }
+.pick .mono { direction: ltr; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .chip {
   font-family: var(--mono); font-size: 11px; direction: ltr;

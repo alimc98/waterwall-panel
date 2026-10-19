@@ -25,7 +25,7 @@ const path = require('node:path');
 
 const repo = path.join(__dirname, '..');
 const { Store } = require(path.join(repo, 'lib', 'store'));
-const { buildBundle } = require(path.join(repo, 'lib', 'build'));
+const { buildBundle, resolveOptions } = require(path.join(repo, 'lib', 'build'));
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-agent-e2e-'));
 const dataDir = path.join(tmp, 'panel-data');
@@ -35,6 +35,7 @@ fs.mkdirSync(wwDir, { recursive: true });
 
 const TOKEN = 'panel-token-for-the-agent-test-0123456789abcdef';
 const AGENT_TOKEN = 'iran-agent-token-0123456789abcdef';
+const FOREIGN2_TOKEN = 'foreign2-agent-token-0123456789abcdef';
 
 const store = new Store(dataDir);
 store.addServer({
@@ -47,10 +48,21 @@ store.addServer({
   agentToken: AGENT_TOKEN,
 });
 store.addServer({ id: 'srv-foreign', name: 'Foreign', role: 'foreign', host: '192.0.2.20', waterwallPath: wwDir });
+// A second exit that no tunnel points at: it must not receive other tunnels'
+// configs just because it has the same role.
+store.addServer({
+  id: 'srv-foreign-2',
+  name: 'Foreign 2',
+  role: 'foreign',
+  host: '192.0.2.30',
+  waterwallPath: wwDir,
+  agentToken: FOREIGN2_TOKEN,
+});
 const tunnel = store.addTunnel({
   name: 'agent-e2e',
   template: 'tcp-forward',
   enabled: true,
+  targetServers: { iran: 'srv-iran', foreign: 'srv-foreign' },
   options: { listenPort: 8081, destAddress: '192.0.2.20', destPort: 9001 },
 });
 // A second tunnel whose config *keeps* its variables block (useVariables on):
@@ -63,6 +75,7 @@ const cdnTunnel = store.addTunnel({
   name: 'agent-e2e-cdn',
   template: 'cdn-reverse-wss',
   enabled: true,
+  targetServers: { iran: 'srv-iran', foreign: 'srv-foreign' },
   options: {
     cdnHost: 'cdn.example.com',
     cdnPort: 443,
@@ -77,6 +90,17 @@ const cdnTunnel = store.addTunnel({
     finalPort: 8486,
     useVariables: true,
   },
+});
+// One entry, two exits: both foreign agents get this same bundle, and no other
+// foreign server does.
+const multiTunnel = store.addTunnel({
+  name: 'agent-e2e-multi',
+  template: 'reverse-reality',
+  enabled: true,
+  targetServers: { iran: 'srv-iran', foreign: ['srv-foreign', 'srv-foreign-2'] },
+  // Persist generated secrets, exactly as POST /api/tunnels does; otherwise the
+  // panel would roll a fresh Reality password on every build.
+  options: resolveOptions('reverse-reality', {}),
 });
 // The token comes from the environment (WW_PANEL_TOKEN), exactly as it does in
 // the systemd unit the installer writes; panel.json is not needed for this.
@@ -203,6 +227,24 @@ async function main() {
     assert.deepStrictEqual(payload.bundles[tunnel.id], expected.bundles.iran));
   check('the CDN bundle is exactly what the panel builds', () =>
     assert.deepStrictEqual(payload.bundles[cdnTunnel.id], expectedCdn.bundles.iran));
+
+  // Multi-exit: every targeted exit gets the same foreign bundle, and an exit
+  // nobody pointed at gets nothing.
+  const expectedMulti = buildBundle(store, store.getTunnel(multiTunnel.id));
+  check('the Iran agent gets the entry side of the multi-exit tunnel', () =>
+    assert.deepStrictEqual(payload.bundles[multiTunnel.id], expectedMulti.bundles.iran));
+
+  const f2res = await fetch('http://127.0.0.1:8791/api/agent/config', { headers: { 'x-ww-agent-token': FOREIGN2_TOKEN } });
+  check('a targeted exit agent is accepted', () => assert.strictEqual(f2res.status, 200));
+  const f2 = await f2res.json();
+  check('a targeted exit gets the shared exit bundle', () => {
+    assert.deepStrictEqual(f2.bundles[multiTunnel.id], expectedMulti.bundles.foreign);
+    assert.deepStrictEqual(Object.keys(f2.bundles), [multiTunnel.id]);
+  });
+  check('an exit no tunnel targets receives nothing', () => {
+    assert.strictEqual(f2.bundles[tunnel.id], undefined);
+    assert.strictEqual(f2.bundles[cdnTunnel.id], undefined);
+  });
 
   agent.kill();
   panel.kill();

@@ -31,7 +31,9 @@ push.sh
 
 # live harness output: generated bundles, per-run copies and logs, results
 test/live/out/
+test/live/out-multi/
 test/live/run/
+test/live/run-multi/
 test/live/results.json
 test/live/cert/
 __pycache__/
