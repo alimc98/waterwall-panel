@@ -489,7 +489,7 @@ function pageServers() {
       <tr>
         <td>
           <strong>${esc(s.name)}</strong><br>
-          <span class="badge ${s.role === 'iran' ? 'ok' : ''}">${s.role === 'iran' ? 'ایران' : 'خارج'}</span>
+          <span class="badge ${s.role === 'iran' ? 'ok' : ''}">${roleLabel(s.role)}</span>
         </td>
         <td class="ltr">${esc(s.sshUser)}@${esc(s.host)}:${s.sshPort}</td>
         <td class="ltr small">${esc(s.waterwallPath)}</td>
@@ -515,7 +515,7 @@ function pageServers() {
   return `
   <div class="page-head">
     <h2>سرورها</h2>
-    <span class="desc">سرور ایران و سرور خارج که واتروال روی آن‌ها اجرا می‌شود</span>
+    <span class="desc">سرور ایران، رله و خارج که واتروال روی آن‌ها اجرا می‌شود</span>
     <div class="spacer"></div>
     <button class="primary" id="addServer">➕ افزودن سرور</button>
   </div>
@@ -591,6 +591,7 @@ function serverForm(server = {}) {
     <label class="f"><span class="lbl">نقش <span class="req">*</span></span>
       <select id="f_role">
         <option value="iran" ${server.role === 'iran' ? 'selected' : ''}>سرور ایران (ورودی)</option>
+        <option value="relay" ${server.role === 'relay' ? 'selected' : ''}>سرور رله (میانی)</option>
         <option value="foreign" ${server.role === 'foreign' || !server.role ? 'selected' : ''}>سرور خارج (خروجی)</option>
       </select></label>
   </div>
@@ -763,6 +764,8 @@ function pageEditTunnel() {
   const p = state.preview;
   const iran = state.servers.filter((s) => s.role === 'iran');
   const foreign = state.servers.filter((s) => s.role === 'foreign');
+  const relay = state.servers.filter((s) => s.role === 'relay');
+  const hasRelay = (tpl?.sides || []).includes('relay');
   const serverOpts = (list, selected) =>
     list.length
       ? list
@@ -802,9 +805,12 @@ function pageEditTunnel() {
       <label class="f"><span class="lbl">سرور ایران</span>
         <select id="et_iran">${serverOpts(iran, t.targetServers?.iran)}</select></label>
       ${
-        tpl?.multiExit
-          ? ''
-          : `<label class="f"><span class="lbl">سرور خارج</span>
+        hasRelay
+          ? `<label class="f"><span class="lbl">سرور رله <span class="badge ok">میانی</span></span>
+        <select id="et_relay">${serverOpts(relay, t.targetServers?.relay)}</select></label>`
+          : tpl?.multiExit
+            ? ''
+            : `<label class="f"><span class="lbl">سرور خارج</span>
         <select id="et_foreign">${serverOpts(foreign, t.targetServers?.foreign)}</select></label>`
       }
     </div>
@@ -961,14 +967,14 @@ function previewHtml(p) {
 
   return `
   <div class="tabs">
-    ${sides.map((s) => `<span class="tab ${s === side ? 'active' : ''}" data-side="${s}">${s === 'iran' ? '🇮🇷 ایران' : '🌍 خارج'}</span>`).join('')}
+    ${sides.map((s) => `<span class="tab ${s === side ? 'active' : ''}" data-side="${s}">${sideLabel(s)}</span>`).join('')}
     ${names.map((f) => `<span class="tab ${f === active ? 'active' : ''}" data-file="${esc(f)}">${esc(f)}</span>`).join('')}
   </div>
   <pre class="code" id="previewCode">${highlight(files[active])}</pre>
   <div class="row mt">
     <button class="sm" id="copyFile">📋 کپی این فایل</button>
     <button class="sm" id="downloadAll">⬇️ دانلود همه فایل‌ها</button>
-    <span class="small muted">فایل‌های سمت ${side === 'iran' ? 'ایران' : 'خارج'}</span>
+    <span class="small muted">فایل‌های سمت ${roleLabel(side)}</span>
   </div>`;
 }
 
@@ -1060,6 +1066,10 @@ async function saveTunnel(silent = false) {
     body.targetServers = readTargets('et');
     if ($('#et_foreign_list') && !body.targetServers.foreign.length) {
       toast('حداقل یک سرور خارج انتخاب کنید', 'err');
+      return null;
+    }
+    if ($('#et_relay') && !body.targetServers.relay) {
+      toast('یک سرور رله انتخاب کنید (یا ابتدا آن را در صفحهٔ سرورها ثبت کنید)', 'err');
       return null;
     }
   }
@@ -1225,7 +1235,7 @@ async function doApply(dryRun = false) {
     });
     const lines = Object.entries(r.results)
       .map(([side, res]) => {
-        const label = side === 'iran' ? '🇮🇷 ایران' : '🌍 خارج';
+        const label = sideLabel(side);
         const detail = res.servers
           ? `${res.servers.map((p) => `${p.ok ? '✓' : '✗'} ${esc(p.server)}${p.error ? ` — ${esc(p.error)}` : ''}`).join('<br>')}${
               res.files || res.uploaded ? `<br><span class="small muted">${esc((res.files || res.uploaded).join(', '))}</span>` : ''
@@ -1321,6 +1331,19 @@ function foreignList(value) {
   return value ? [value] : [];
 }
 
+/** Human label for a server role / bundle side. */
+function roleLabel(role) {
+  if (role === 'iran') return 'ایران';
+  if (role === 'relay') return 'رله';
+  return 'خارج';
+}
+
+function sideLabel(side) {
+  if (side === 'iran') return '🇮🇷 ایران';
+  if (side === 'relay') return '🔀 رله';
+  return '🌍 خارج';
+}
+
 /** Checkbox list of every exit server (templates marked `multiExit`). */
 function foreignPickerHtml(prefix, servers, selected) {
   if (!servers.length) {
@@ -1341,14 +1364,20 @@ function foreignPickerHtml(prefix, servers, selected) {
 /** Target selection currently visible in the create (`nt`) or edit (`et`) form. */
 function readTargets(prefix) {
   const iran = $(`#${prefix}_iran`)?.value || null;
+  const relay = $(`#${prefix}_relay`)?.value || null;
   const list = $(`#${prefix}_foreign_list`);
-  if (list) return { iran, foreign: $$('input[type="checkbox"]:checked', list).map((i) => i.value) };
-  return { iran, foreign: $(`#${prefix}_foreign`)?.value || null };
+  const targets = { iran };
+  if (relay) targets.relay = relay;
+  if (list) targets.foreign = $$('input[type="checkbox"]:checked', list).map((i) => i.value);
+  else targets.foreign = $(`#${prefix}_foreign`)?.value || null;
+  return targets;
 }
 
 function templateFormHtml(tpl) {
   const iran = state.servers.filter((s) => s.role === 'iran');
   const foreign = state.servers.filter((s) => s.role === 'foreign');
+  const relay = state.servers.filter((s) => s.role === 'relay');
+  const hasRelay = (tpl.sides || []).includes('relay');
   const groups = {};
   for (const f of tpl.fields) {
     const g = f.group || 'general';
@@ -1372,6 +1401,13 @@ function templateFormHtml(tpl) {
       <label class="f"><span class="lbl">سرور ایران</span>
         <select id="nt_iran">${iran.length ? iran.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join('') : '<option value="">— ثبت نشده —</option>'}</select></label>
     </div>
+    ${
+      hasRelay
+        ? `<label class="f"><span class="lbl">سرور رله <span class="badge ok">میانی</span></span>
+        <select id="nt_relay">${relay.length ? relay.map((s) => `<option value="${s.id}">${esc(s.name)} (${esc(s.host)})</option>`).join('') : '<option value="">— ثبت نشده —</option>'}</select>
+        <span class="hint">ترافیک کاربران از ایران به این سرور و از آن به سرور خارج می‌رود؛ IP سرور خارج هیچ‌وقت به ایران نمی‌رسد.</span></label>`
+        : ''
+    }
     ${
       tpl.multiExit
         ? `<label class="f"><span class="lbl">سرورهای خارج <span class="badge ok">چند-سروری</span></span>${foreignPickerHtml('nt', foreign, foreign.length ? [foreign[0].id] : [])}</label>`
@@ -1417,6 +1453,7 @@ function groupLabel(g) {
       transport: 'انتقال',
       dns: 'DNS',
       reverse: 'لینک معکوس',
+      relay: 'رله',
       service: 'سرویس محلی مقصد',
       routes: 'مسیریابی',
       auth: 'احراز هویت',
@@ -1454,7 +1491,9 @@ function fieldHtml(f, value) {
       break;
     }
     case 'boolean':
-      input = `<label class="switch"><input type="checkbox" id="${id}" data-key="${f.key}" data-type="boolean" ${val ? 'checked' : ''}><span class="track"></span><span>${esc(f.label)}</span></label>`;
+      // The wrapping label already prints f.label; repeating it inside the
+      // switch rendered every boolean twice.
+      input = `<label class="switch"><input type="checkbox" id="${id}" data-key="${f.key}" data-type="boolean" ${val ? 'checked' : ''}><span class="track"></span></label>`;
       break;
     case 'select':
       input = `<select id="${id}" data-key="${f.key}" data-type="text">${(f.options || [])
@@ -1567,6 +1606,10 @@ async function createTunnel(tpl) {
   const targets = readTargets('nt');
   if ($('#nt_foreign_list') && !targets.foreign.length) {
     toast('حداقل یک سرور خارج انتخاب کنید', 'err');
+    return;
+  }
+  if ($('#nt_relay') && !targets.relay) {
+    toast('یک سرور رله انتخاب کنید (یا ابتدا آن را در صفحهٔ سرورها ثبت کنید)', 'err');
     return;
   }
   const options = collectForm(tpl);
@@ -1701,7 +1744,7 @@ function pageApi() {
                 .map(
                   (s) => `<tr>
             <td>${esc(s.name)}</td>
-            <td><span class="badge ${s.role === 'iran' ? 'ok' : ''}">${s.role === 'iran' ? 'ایران' : 'خارج'}</span></td>
+            <td><span class="badge ${s.role === 'iran' ? 'ok' : ''}">${roleLabel(s.role)}</span></td>
             <td class="ltr small">${esc(s.agentToken)}</td>
             <td><button class="sm" onclick="copy('${esc(s.agentToken)}','توکن')">کپی</button>
                 <button class="sm" data-srv-conn="${s.id}">دستور نصب</button></td>
@@ -1777,7 +1820,7 @@ async function fillCertServerPicker() {
   const servers = state.servers || [];
   sel.innerHTML = servers.length
     ? servers
-        .map((x) => '<option value="' + esc(x.id) + '">' + esc(x.name) + ' (' + esc(x.role === 'iran' ? 'ایران' : 'خارج') + ')</option>')
+        .map((x) => '<option value="' + esc(x.id) + '">' + esc(x.name) + ' (' + esc(roleLabel(x.role)) + ')</option>')
         .join('')
     : '<option value="">سروری ثبت نشده</option>';
   // Default to the exit box, which is where most templates need a certificate.

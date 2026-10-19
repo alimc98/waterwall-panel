@@ -62,6 +62,7 @@ chmod 0700 /opt/waterwall-panel/data
 TOKEN="$(node -e 'process.stdout.write(require("crypto").randomBytes(32).toString("hex"))')"
 cat > /etc/waterwall-panel.env <<EOF
 WW_PANEL_HOST=0.0.0.0
+WW_PANEL_HOST=0.0.0.0
 WW_PANEL_PORT=8787
 WW_PANEL_DATA=/opt/waterwall-panel/data
 WW_PANEL_TOKEN=$TOKEN
@@ -246,7 +247,7 @@ ss -lntup | grep -E 'waterwall|2087|443'
 
 | نشانه | کار | توضیح |
 | --- | --- | --- |
-| صفحهٔ پنل باز نمی‌شود | `ss -lntp \| grep 8787` | اگر روی `127.0.0.1` گوش می‌دهد، با `--host 0.0.0.0` نصب کنید |
+| صفحهٔ پنل باز نمی‌شود | `ss -lntp \| grep 8787` | اگر روی `127.0.0.1:8787` گوش می‌دهد، در `/etc/waterwall-panel.env` مقدار `WW_PANEL_HOST=0.0.0.0` را بگذارید و `systemctl restart waterwall-panel` را اجرا کنید |
 | `401` روی API | توکن غلط | توکن واقعی: `grep WW_PANEL_TOKEN /etc/waterwall-panel.env` |
 | ایجنت وضعیت نمی‌دهد | `journalctl -u ww-agent -f` | آدرس پنل و `--agent-token` باید دقیق باشد |
 | واتروال بالا نمی‌آید | `journalctl -u waterwall -n 50` | خطوط `FATAL` دقیقاً می‌گویند کدام کلید تنظیمات مشکل دارد |

@@ -115,13 +115,20 @@ def disable_nat():
 
 def del_namespaces():
     for ns in (IRAN_NS, FOREIGN_NS):
+        # A test namespace must only ever hold the veth we created. If a real
+        # NIC somehow ended up inside it (an older harness used the host-side
+        # peer name `eth0`), deleting the namespace would destroy that NIC.
+        # Move it back to the root namespace first, then delete the namespace.
+        rc, out = sh(f"ip netns exec {ns} ip -d link show eth0 2>/dev/null")
+        if rc == 0 and "veth" not in out:
+            sh(f"ip netns exec {ns} ip link set eth0 netns 1")
         # Removing a namespace takes its end of the veth pair with it.
         sh(f"ip netns del {ns} 2>/dev/null")
 
 
 def del_bridge():
     sh(f"ip link del {BRIDGE} 2>/dev/null")
-    for dev in ("wwviran", "wwvforeign"):
+    for dev in ("wwviran", "wwvforeign", "wwpeer0", "wwpeer1"):
         sh(f"ip link del {dev} 2>/dev/null")
 
 
@@ -145,12 +152,12 @@ def del_host_veths():
 
     Deleting a namespace normally takes its end of the veth with it, but a
     device that is still busy can survive, and then the next
-    `ip link add ... type veth peer name eth0` fails with "File exists" and the
-    namespace ends up with no eth0 at all. That failure is invisible until a
+    `ip link add ... type veth peer name wwpeer0` fails with "File exists" and
+    the namespace ends up with no eth0 at all. That failure is invisible until a
     probe much later reports "Network is unreachable", so it is cleaned here
     and checked for below.
     """
-    for dev in ("wwviran", "wwvforeign"):
+    for dev in ("wwviran", "wwvforeign", "wwpeer0", "wwpeer1"):
         sh(f"ip link del {dev} 2>/dev/null")
 
 
@@ -167,16 +174,26 @@ def setup_netns():
             return False, f"cannot create namespace {ns}: {out.strip()}"
 
     pairs = [
-        (IRAN_NS, "wwviran", IRAN_IP, IRAN_MAC),
-        (FOREIGN_NS, "wwvforeign", FOREIGN_IP, FOREIGN_MAC),
+        (IRAN_NS, "wwviran", "wwpeer0", IRAN_IP, IRAN_MAC),
+        (FOREIGN_NS, "wwvforeign", "wwpeer1", FOREIGN_IP, FOREIGN_MAC),
     ]
-    for ns, hostdev, ip, mac in pairs:
+    for ns, hostdev, peerdev, ip, mac in pairs:
         out = ""
         for _ in range(3):
-            sh(f"ip link add {hostdev} type veth peer name eth0")
-            rc, out = sh(f"ip link set eth0 netns {ns}")
+            # Never use `eth0` as the host-side peer name: on a normal VPS the
+            # public NIC is already called eth0, and `ip link set eth0 netns`
+            # would move the real NIC into the test namespace. The peer is
+            # created under a unique name and renamed to eth0 *inside* the
+            # namespace, where it cannot collide with the host.
+            rc, out = sh(f"ip link add {hostdev} type veth peer name {peerdev}")
+            if rc != 0:
+                time.sleep(0.5)
+                continue
+            rc, out = sh(f"ip link set {peerdev} netns {ns}")
             if rc == 0:
-                break
+                rc, out = sh(f"ip netns exec {ns} ip link set {peerdev} name eth0")
+                if rc == 0:
+                    break
             sh(f"ip link del {hostdev} 2>/dev/null")
             time.sleep(0.5)
         else:

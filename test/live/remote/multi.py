@@ -54,6 +54,7 @@ BAD = run.BAD
 def cleanup_third():
     run.sh(f"ip netns del {THIRD_NS} 2>/dev/null")
     run.sh(f"ip link del {THIRD_DEV} 2>/dev/null")
+    run.sh("ip link del wwpeer2 2>/dev/null")
 
 
 def setup_third():
@@ -65,10 +66,18 @@ def setup_third():
     rc, out = run.sh(f"ip netns add {THIRD_NS}")
     if rc != 0:
         return False, f"cannot create {THIRD_NS}: {out.strip()}"
-    run.sh(f"ip link add {THIRD_DEV} type veth peer name eth0")
-    rc, out = run.sh(f"ip link set eth0 netns {THIRD_NS}")
+    # Same rule as run.setup_netns: the peer must not be named eth0 on the host,
+    # or the public NIC would be moved into the namespace. Create it under a
+    # unique name, move it, then rename it inside the namespace.
+    rc, out = run.sh(f"ip link add {THIRD_DEV} type veth peer name wwpeer2")
     if rc != 0:
-        return False, f"cannot move eth0 into {THIRD_NS}: {out.strip()}"
+        return False, f"cannot create veth for {THIRD_NS}: {out.strip()}"
+    rc, out = run.sh(f"ip link set wwpeer2 netns {THIRD_NS}")
+    if rc != 0:
+        return False, f"cannot move wwpeer2 into {THIRD_NS}: {out.strip()}"
+    rc, out = run.sh(f"ip netns exec {THIRD_NS} ip link set wwpeer2 name eth0")
+    if rc != 0:
+        return False, f"cannot rename the peer in {THIRD_NS}: {out.strip()}"
     run.sh(f"ip link set {THIRD_DEV} master {run.BRIDGE}")
     run.sh(f"ip link set {THIRD_DEV} up")
     rc, out = run.sh(f"ip -d link show {THIRD_DEV}")

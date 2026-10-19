@@ -13,7 +13,7 @@ const protoscan = require('./lib/protoscan');
 const versions = require('./lib/versions');
 const netcheck = require('./lib/netcheck');
 const certs = require('./lib/certs');
-const { resolveTargets, isTarget } = require('./lib/targets');
+const { resolveTargets, targetsForSide, isTarget } = require('./lib/targets');
 const { Router, sendJson, sendError, sendText, parseJsonBody, serveStatic, parseUrl } = require('./lib/http');
 const { timingSafeEqual, readBody } = require('./lib/util');
 
@@ -98,9 +98,10 @@ function findTargets(tunnel) {
 }
 
 function findServers(tunnel) {
-  const { iran, foreign } = findTargets(tunnel);
+  const { iran, foreign, relay } = findTargets(tunnel);
   return {
     iran,
+    relay,
     foreign: foreign[0] || null,
   };
 }
@@ -422,13 +423,20 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   const tunnel = store.getTunnel(ctx.params.id);
   if (!tunnel) return sendError(res, 404, 'tunnel not found');
   const body = await parseJsonBody(req);
-  const sides = body.sides || ['iran', 'foreign'];
   const bundle = buildBundle(store, tunnel);
   if (bundle.problems.length) {
     return sendError(res, 400, 'generated configuration is invalid', { problems: bundle.problems });
   }
+  // Only sides the template actually produced can be deployed. Defaulting to
+  // the bundle keys (rather than a hard-coded pair) is what makes a two-sided
+  // reverse tunnel and a three-sided relay tunnel both work without a flag.
+  const sides = Array.isArray(body.sides) && body.sides.length ? body.sides : Object.keys(bundle.bundles);
   const targets = findTargets(tunnel);
-  const servers = { iran: targets.iran, foreign: targets.foreign[0] || null };
+  const servers = {
+    iran: targets.iran,
+    relay: targets.relay,
+    foreign: targets.foreign[0] || null,
+  };
 
   // A tunnel with a domain gets its certificate handled before anything is
   // written, so the service never starts against a missing or expired file.
@@ -438,7 +446,8 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
     // templates put it on the exit box, but the reverse templates put it on the
     // Iran box, and picking the wrong one would install a certificate where
     // nothing reads it.
-    const target = tlsServerSide(bundle) === 'iran' ? servers.iran || servers.foreign : servers.foreign || servers.iran;
+    const certSide = tlsServerSide(bundle);
+    const target = servers[certSide] || servers.iran || servers.foreign;
     const domain = certs.normaliseDomain(tunnel.options?.domain);
     if (target && domain && certs.validateDomain(domain).ok) {
       const mode = tunnel.options?.certMode || 'auto';
@@ -480,10 +489,10 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
     }
     // A reverse tunnel can have a whole fleet of exits; every one of them gets
     // the same foreign bundle, because the config names the Iran entry, not the
-    // exit's own address.
-    const fleet = side === 'iran' ? (targets.iran ? [targets.iran] : []) : targets.foreign;
+    // exit's own address. The relay side is a single middle server.
+    const fleet = targetsForSide(targets, side);
     if (!fleet.length) {
-      results[side] = { ok: false, error: `no server registered with role "${side}"` };
+      results[side] = { ok: false, error: `no server registered for side "${side}"` };
       continue;
     }
     if (body.dryRun) {
@@ -522,7 +531,7 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   // firewall never let the link port through. Measuring it here turns a silent
   // failure into an explicit, actionable message instead of a config hunt.
   let reachability = null;
-  if (body.check !== false && servers.iran && servers.foreign) {
+  if (body.check !== false && servers.iran && servers.foreign && !bundle.bundles.relay) {
     try {
       reachability = await netcheck.checkTunnel((s, c, o) => ssh.sshExec(s, c, o), servers, {
         link: listenerPort(bundle, 'foreign'),
@@ -544,7 +553,7 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
  * decided by reading the node types rather than assuming.
  */
 function tlsServerSide(bundle) {
-  for (const side of ['iran', 'foreign']) {
+  for (const side of Object.keys(bundle.bundles || {})) {
     for (const [file, text] of Object.entries(bundle.bundles?.[side] || {})) {
       if (!file.startsWith('configs/')) continue;
       try {
@@ -600,7 +609,8 @@ router.post('/api/tunnels/:id/fix-firewall', async (req, res, ctx) => {
   if (!command) return sendError(res, 400, 'command is required');
 
   // Work out which server the rule belongs to from its own shape.
-  const target = command.includes(servers.iran.host) ? servers.iran : servers.foreign;
+  const target =
+    [servers.iran, servers.relay, servers.foreign].find((srv) => srv && command.includes(srv.host)) || servers.foreign;
   if (!target) return sendError(res, 400, 'no server to apply this to');
 
   const result = await netcheck.applyFirewallFix((s, c, o) => ssh.sshExec(s, c, o), target, command);
@@ -615,9 +625,11 @@ router.post('/api/tunnels/:id/service', async (req, res, ctx) => {
   if (!tunnel) return sendError(res, 404, 'tunnel not found');
   const body = await parseJsonBody(req);
   const targets = findTargets(tunnel);
+  const defaultSides = ['iran', 'relay', 'foreign'].filter((side) => targetsForSide(targets, side).length);
+  const sides = Array.isArray(body.sides) && body.sides.length ? body.sides : defaultSides;
   const results = {};
-  for (const side of body.sides || ['iran', 'foreign']) {
-    const fleet = side === 'iran' ? (targets.iran ? [targets.iran] : []) : targets.foreign;
+  for (const side of sides) {
+    const fleet = targetsForSide(targets, side);
     if (!fleet.length) {
       results[side] = { ok: false, error: 'server not found' };
       continue;

@@ -19,6 +19,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wwpanel-test-'));
 const store = new Store(tmp);
 
 store.addServer({ id: 'srv-iran', name: 'Iran', role: 'iran', host: '10.0.0.1' });
+store.addServer({ id: 'srv-relay', name: 'Relay', role: 'relay', host: '10.0.0.2' });
 store.addServer({ id: 'srv-foreign', name: 'Foreign', role: 'foreign', host: '198.51.100.7' });
 
 let pass = 0;
@@ -29,7 +30,12 @@ const failures = [];
 for (const tpl of templates.ALL) {
   try {
     // Two passes: the second one runs with the provisioned options already stored.
-    let tunnel = store.addTunnel({ name: `test-${tpl.id}`, template: tpl.id, options: {} });
+    let tunnel = store.addTunnel({
+      name: `test-${tpl.id}`,
+      template: tpl.id,
+      targetServers: tpl.id === 'relay-reality' ? { relay: 'srv-relay' } : {},
+      options: {},
+    });
     let result = buildBundle(store, tunnel);
     if (result.optionsPatch) {
       tunnel = store.updateTunnel(tunnel.id, { options: { ...tunnel.options, ...result.optionsPatch } });
@@ -124,6 +130,206 @@ for (const tpl of templates.ALL) {
   console.log(`  ✓ ${'multi-exit'.padEnd(24)} 3 exits whitelisted, one bundle for all`);
 }
 
+// ---- three-hop relay + encryption layer ----------------------------------
+// The relay is a different shape from both ordinary and reverse tunnels: three
+// bundles, two Reality endpoints on the relay, and a reverse pool that the exits
+// dial. These checks pin the topology so a future refactor cannot silently
+// produce a two-sided or wrongly-whitelisted chain.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-relay-'));
+  const relayStore = new Store(dir);
+  relayStore.addServer({ id: 'ir', name: 'Iran', role: 'iran', host: '203.0.113.10' });
+  relayStore.addServer({ id: 'rl', name: 'Relay', role: 'relay', host: '198.51.100.50' });
+  relayStore.addServer({ id: 'e1', name: 'Exit 1', role: 'foreign', host: '198.51.100.1' });
+  relayStore.addServer({ id: 'e2', name: 'Exit 2', role: 'foreign', host: '198.51.100.2' });
+
+  const tunnel = relayStore.addTunnel({
+    name: 'relay-chain',
+    template: 'relay-reality',
+    targetServers: { iran: 'ir', relay: 'rl', foreign: ['e1', 'e2'] },
+    options: resolveOptions('relay-reality', {}),
+  });
+  const built = buildBundle(relayStore, tunnel);
+  assert.strictEqual(built.ok, true, built.problems.join('; '));
+  assert.deepStrictEqual(Object.keys(built.bundles), ['iran', 'relay', 'foreign']);
+
+  const parseSide = (side) => {
+    const file = Object.keys(built.bundles[side]).find((f) => f.startsWith('configs/'));
+    assert.ok(file, `${side}: no config file`);
+    return JSON.parse(preprocessConfig(built.bundles[side][file]).text);
+  };
+  const iranCfg = parseSide('iran');
+  const relayCfg = parseSide('relay');
+  const exitCfg = parseSide('foreign');
+  const find = (cfg, name) => cfg.nodes.find((n) => n.name === name);
+
+  // Entry: users -> RealityClient -> relay.
+  assert.strictEqual(find(iranCfg, 'users_inbound').next, 'reality-client');
+  assert.strictEqual(find(iranCfg, 'reality-client').next, 'tcp_to_relay');
+  assert.strictEqual(find(iranCfg, 'tcp_to_relay').settings.address, '198.51.100.50');
+  assert.strictEqual(find(iranCfg, 'tcp_to_relay').settings.port, 9443);
+
+  // Relay: the Iran leg feeds the user side of the bridge pair, while the exits
+  // feed the reverse side through their own RealityServer.
+  assert.strictEqual(find(relayCfg, 'relay_in').next, 'reality_entry');
+  assert.strictEqual(find(relayCfg, 'reality_entry').next, 'bridge_user_side');
+  assert.strictEqual(find(relayCfg, 'reality_exit').next, 'reverse_server');
+  assert.strictEqual(find(relayCfg, 'reverse_server').next, 'bridge_reverse_side');
+  assert.strictEqual(find(relayCfg, 'exit_in').next, 'reality_exit');
+  assert.deepStrictEqual(find(relayCfg, 'relay_in').settings.whitelist, ['203.0.113.10/32']);
+  assert.deepStrictEqual(find(relayCfg, 'exit_in').settings.whitelist, ['198.51.100.1/32', '198.51.100.2/32']);
+  assert.strictEqual(find(relayCfg, 'relay_in').settings.port, 9443);
+  assert.strictEqual(find(relayCfg, 'exit_in').settings.port, 9444);
+  assert.strictEqual(find(relayCfg, 'reality_entry').settings.password, tunnel.options.entryPassword);
+  assert.strictEqual(find(relayCfg, 'reality_exit').settings.password, tunnel.options.exitPassword);
+  assert.notStrictEqual(tunnel.options.entryPassword, tunnel.options.exitPassword);
+
+  // Exit: dials the relay backhaul, never embeds its own public address, and
+  // opens no listener at all.
+  assert.strictEqual(find(exitCfg, 'reverse_client').next, 'reality-client');
+  assert.strictEqual(find(exitCfg, 'reality-client').next, 'tcp_to_relay');
+  assert.strictEqual(find(exitCfg, 'tcp_to_relay').settings.address, '198.51.100.50');
+  assert.strictEqual(find(exitCfg, 'tcp_to_relay').settings.port, 9444);
+  assert.strictEqual(find(exitCfg, 'reality-client').settings.password, tunnel.options.exitPassword);
+  assert.ok(!exitCfg.nodes.some((n) => /Listener$/.test(n.type)), 'the exit must not open a listener');
+  const exitText = Object.values(built.bundles.foreign).join('\n');
+  assert.ok(!exitText.includes('198.51.100.1'), 'the exit bundle must not embed exit 1');
+  assert.ok(!exitText.includes('198.51.100.2'), 'the exit bundle must not embed exit 2');
+  assert.ok(exitText.includes('198.51.100.50'), 'the exit must dial the relay');
+
+  // No certificate is needed on any hop.
+  for (const side of ['iran', 'relay', 'foreign']) {
+    assert.ok(!parseSide(side).nodes.some((n) => n.type === 'TlsServer'), `${side}: unexpected TlsServer`);
+  }
+
+  // The catalog exposes the third side and the multi-exit capability.
+  const entry = templates.catalog().find((x) => x.id === 'relay-reality');
+  assert.deepStrictEqual(entry.sides, ['iran', 'relay', 'foreign']);
+  assert.strictEqual(entry.multiExit, true);
+
+  // A manual backhaul whitelist must win over the auto-generated exit list;
+  // otherwise an exit behind NAT can never be admitted.
+  const manual = relayStore.addTunnel({
+    name: 'relay-manual-whitelist',
+    template: 'relay-reality',
+    targetServers: { iran: 'ir', relay: 'rl', foreign: ['e1', 'e2'] },
+    options: resolveOptions('relay-reality', {
+      relayWhitelist: ['10.9.9.9/32'],
+      backhaulWhitelist: ['10.8.8.0/24'],
+    }),
+  });
+  const manualBuilt = buildBundle(relayStore, manual);
+  assert.strictEqual(manualBuilt.ok, true, manualBuilt.problems.join('; '));
+  const manualFile = Object.keys(manualBuilt.bundles.relay).find((f) => f.startsWith('configs/'));
+  const manualRelay = JSON.parse(preprocessConfig(manualBuilt.bundles.relay[manualFile]).text);
+  assert.deepStrictEqual(find(manualRelay, 'relay_in').settings.whitelist, ['10.9.9.9/32']);
+  assert.deepStrictEqual(find(manualRelay, 'exit_in').settings.whitelist, ['10.8.8.0/24']);
+
+  // Same variable toggle on the three-sided template: with variables off every
+  // side must be concrete, not a half-substituted @sentinel.
+  const literal = relayStore.addTunnel({
+    name: 'relay-literal',
+    template: 'relay-reality',
+    targetServers: { iran: 'ir', relay: 'rl', foreign: ['e1', 'e2'] },
+    options: resolveOptions('relay-reality', { useVariables: false }),
+  });
+  const literalBuilt = buildBundle(relayStore, literal);
+  assert.strictEqual(literalBuilt.ok, true, literalBuilt.problems.join('; '));
+  for (const side of ['iran', 'relay', 'foreign']) {
+    const file = Object.keys(literalBuilt.bundles[side]).find((f) => f.startsWith('configs/'));
+    const text = literalBuilt.bundles[side][file];
+    assert.ok(!text.includes('"@'), `${side}: useVariables=false left an @sentinel in the config`);
+    const cfg = JSON.parse(text);
+    assert.strictEqual(cfg.variables, undefined, `${side}: useVariables=false must omit variables`);
+  }
+
+  // A relay-less API call must fail cleanly, not silently pick the first relay.
+  const missing = relayStore.addTunnel({
+    name: 'relay-missing',
+    template: 'relay-reality',
+    targetServers: { iran: 'ir', foreign: 'e1' },
+    options: {},
+  });
+  const missingBuild = buildBundle(relayStore, missing);
+  assert.strictEqual(missingBuild.ok, false);
+  assert.match(missingBuild.problems.join(' '), /relay/);
+
+  pass += 1;
+  console.log(`  ✓ ${'relay-chain'.padEnd(24)} 3 sides, 2 Reality hops, exits closed`);
+}
+
+// Optional AEAD layer inside an existing CDN tunnel. Off by default so a live
+// tunnel's bytes do not change; on, both sides must agree on password and
+// algorithm and sit inside the WebSocket/Mux carrier.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-enc-'));
+  const encStore = new Store(dir);
+  encStore.addServer({ id: 'ir', name: 'Iran', role: 'iran', host: '203.0.113.10' });
+  encStore.addServer({ id: 'ex', name: 'Exit', role: 'foreign', host: '198.51.100.1' });
+
+  const plain = encStore.addTunnel({
+    name: 'cdn-plain',
+    template: 'cdn-reverse-wss',
+    targetServers: { iran: 'ir', foreign: 'ex' },
+    options: resolveOptions('cdn-reverse-wss', {}),
+  });
+  const plainBuild = buildBundle(encStore, plain);
+  assert.strictEqual(plainBuild.ok, true, plainBuild.problems.join('; '));
+  for (const side of ['iran', 'foreign']) {
+    const file = Object.keys(plainBuild.bundles[side]).find((f) => f.startsWith('configs/'));
+    const cfg = JSON.parse(preprocessConfig(plainBuild.bundles[side][file]).text);
+    assert.ok(!cfg.nodes.some((n) => /^Encryption(Client|Server)$/.test(n.type)), `${side}: encryption must be off by default`);
+  }
+
+  const enc = encStore.addTunnel({
+    name: 'cdn-encrypted',
+    template: 'cdn-reverse-wss',
+    targetServers: { iran: 'ir', foreign: 'ex' },
+    options: { ...resolveOptions('cdn-reverse-wss', {}), linkEncryption: true },
+  });
+  const encBuild = buildBundle(encStore, enc);
+  assert.strictEqual(encBuild.ok, true, encBuild.problems.join('; '));
+  const parseEnc = (side) => {
+    const file = Object.keys(encBuild.bundles[side]).find((f) => f.startsWith('configs/'));
+    return JSON.parse(preprocessConfig(encBuild.bundles[side][file]).text);
+  };
+  const iranEnc = parseEnc('iran');
+  const exitEnc = parseEnc('foreign');
+  const server = iranEnc.nodes.find((n) => n.type === 'EncryptionServer');
+  const client = exitEnc.nodes.find((n) => n.type === 'EncryptionClient');
+  assert.ok(server && client, 'both peers must be emitted');
+  assert.strictEqual(server.next, 'reverse_server');
+  assert.strictEqual(iranEnc.nodes.find((n) => n.type === 'MuxServer').next, 'encryption_server');
+  assert.strictEqual(exitEnc.nodes.find((n) => n.type === 'ReverseClient').next, 'encryption_client');
+  assert.strictEqual(client.next, 'mux_client');
+  assert.strictEqual(server.settings.password, client.settings.password);
+  assert.strictEqual(server.settings.algorithm, client.settings.algorithm);
+
+  // The "Use $variables$" toggle must produce concrete values when it is off,
+  // not leave internal @sentinels in the JSON. This regressed once for the new
+  // encryption nodes because their sentinels were applied unconditionally.
+  const literal = encStore.addTunnel({
+    name: 'cdn-encrypted-literal',
+    template: 'cdn-reverse-wss',
+    targetServers: { iran: 'ir', foreign: 'ex' },
+    options: resolveOptions('cdn-reverse-wss', { linkEncryption: true, useVariables: false }),
+  });
+  const literalBuild = buildBundle(encStore, literal);
+  assert.strictEqual(literalBuild.ok, true, literalBuild.problems.join('; '));
+  for (const side of ['iran', 'foreign']) {
+    const file = Object.keys(literalBuild.bundles[side]).find((f) => f.startsWith('configs/'));
+    const text = literalBuild.bundles[side][file];
+    assert.ok(!text.includes('"@'), `${side}: useVariables=false left an @sentinel in the config`);
+    const cfg = JSON.parse(text);
+    assert.strictEqual(cfg.variables, undefined, `${side}: useVariables=false must omit variables`);
+    const node = cfg.nodes.find((n) => /^Encryption(Client|Server)$/.test(n.type));
+    assert.ok(node && !String(node.settings.password).startsWith('@'), `${side}: password was not concrete`);
+  }
+
+  pass += 1;
+  console.log(`  ✓ ${'cdn-encryption'.padEnd(24)} AEAD inside WebSocket, off by default`);
+}
+
 // ---- shared secrets must be identical on both sides ----------------------
 // Both ends of a tunnel have to agree on secrets (Reality password, UUID, ...).
 // If a build generates them independently the tunnel silently breaks, so every
@@ -132,6 +338,7 @@ for (const tpl of templates.ALL) {
   const created = store.addTunnel({
     name: `secrets-${tpl.id}`,
     template: tpl.id,
+    targetServers: tpl.id === 'relay-reality' ? { relay: 'srv-relay' } : {},
     options: resolveOptions(tpl.id, {}),
   });
 
@@ -177,6 +384,28 @@ for (const tpl of templates.ALL) {
           `${tpl.id}: "${key}" differs between the Iran and foreign configs (${inIran[1]} vs ${inForeign[1]})`,
         );
       }
+    }
+  }
+}
+
+// ---- the "Use $variables$" toggle must never leak internal sentinels ------
+// A sentinel is an internal `@name` marker, not valid WaterWall syntax. When
+// the toggle is off, every generated config must contain concrete values. This
+// covers every template, not just the ones that happened to be refactored.
+for (const tpl of templates.ALL) {
+  const created = store.addTunnel({
+    name: `literal-${tpl.id}`,
+    template: tpl.id,
+    targetServers: tpl.id === 'relay-reality' ? { relay: 'srv-relay' } : {},
+    options: resolveOptions(tpl.id, { useVariables: false }),
+  });
+  const built = buildBundle(store, created);
+  assert.strictEqual(built.ok, true, `${tpl.id}: ${built.problems.join('; ')}`);
+  for (const [side, files] of Object.entries(built.bundles)) {
+    for (const [file, text] of Object.entries(files)) {
+      if (!file.startsWith('configs/')) continue;
+      const leaked = text.match(/"@[A-Za-z0-9_.-]+"/g);
+      assert.ok(!leaked, `${tpl.id} ${side} ${file}: useVariables=false leaked ${leaked?.join(', ')}`);
     }
   }
 }
@@ -997,7 +1226,7 @@ transportTests();
 agentTests();
 
 // ---- store round trip -----------------------------------------------------
-assert.strictEqual(store.listServers().length, 2, 'server store');
+assert.strictEqual(store.listServers().length, 3, 'server store');
 assert.ok(store.addTunnel({ name: 'x', template: 'tcp-forward' }).id, 'tunnel store');
 assert.strictEqual(store.getTunnel(store.listTunnels()[0].id).name, store.listTunnels()[0].name, 'tunnel lookup');
 

@@ -36,6 +36,7 @@ fs.mkdirSync(wwDir, { recursive: true });
 const TOKEN = 'panel-token-for-the-agent-test-0123456789abcdef';
 const AGENT_TOKEN = 'iran-agent-token-0123456789abcdef';
 const FOREIGN2_TOKEN = 'foreign2-agent-token-0123456789abcdef';
+const RELAY_TOKEN = 'relay-agent-token-0123456789abcdef';
 
 const store = new Store(dataDir);
 store.addServer({
@@ -48,6 +49,16 @@ store.addServer({
   agentToken: AGENT_TOKEN,
 });
 store.addServer({ id: 'srv-foreign', name: 'Foreign', role: 'foreign', host: '192.0.2.20', waterwallPath: wwDir });
+// The middle hop of a three-server chain. It must receive only tunnels that
+// explicitly name it, never every tunnel just because it is registered.
+store.addServer({
+  id: 'srv-relay',
+  name: 'Relay',
+  role: 'relay',
+  host: '192.0.2.15',
+  waterwallPath: wwDir,
+  agentToken: RELAY_TOKEN,
+});
 // A second exit that no tunnel points at: it must not receive other tunnels'
 // configs just because it has the same role.
 store.addServer({
@@ -102,6 +113,14 @@ const multiTunnel = store.addTunnel({
   // panel would roll a fresh Reality password on every build.
   options: resolveOptions('reverse-reality', {}),
 });
+// Three-sided chain: the relay agent must receive only its own middle bundle.
+const relayTunnel = store.addTunnel({
+  name: 'agent-e2e-relay',
+  template: 'relay-reality',
+  enabled: true,
+  targetServers: { iran: 'srv-iran', relay: 'srv-relay', foreign: 'srv-foreign' },
+  options: resolveOptions('relay-reality', {}),
+});
 // The token comes from the environment (WW_PANEL_TOKEN), exactly as it does in
 // the systemd unit the installer writes; panel.json is not needed for this.
 
@@ -109,6 +128,9 @@ const expected = buildBundle(store, store.getTunnel(tunnel.id));
 assert.strictEqual(expected.ok, true, `the panel must build the tunnel: ${expected.problems.join('; ')}`);
 const expectedCdn = buildBundle(store, store.getTunnel(cdnTunnel.id));
 assert.strictEqual(expectedCdn.ok, true, `the panel must build the CDN tunnel: ${expectedCdn.problems.join('; ')}`);
+const expectedRelay = buildBundle(store, store.getTunnel(relayTunnel.id));
+assert.strictEqual(expectedRelay.ok, true, `the panel must build the relay tunnel: ${expectedRelay.problems.join('; ')}`);
+assert.deepStrictEqual(Object.keys(expectedRelay.bundles), ['iran', 'relay', 'foreign']);
 {
   // Keep the fixture honest: if this bundle ever stops carrying bare
   // placeholders, the test silently stops covering the preprocessing path.
@@ -233,6 +255,18 @@ async function main() {
   const expectedMulti = buildBundle(store, store.getTunnel(multiTunnel.id));
   check('the Iran agent gets the entry side of the multi-exit tunnel', () =>
     assert.deepStrictEqual(payload.bundles[multiTunnel.id], expectedMulti.bundles.iran));
+  check('the Iran agent gets the entry side of the relay tunnel', () =>
+    assert.deepStrictEqual(payload.bundles[relayTunnel.id], expectedRelay.bundles.iran));
+
+  const relayRes = await fetch('http://127.0.0.1:8791/api/agent/config', {
+    headers: { 'x-ww-agent-token': RELAY_TOKEN },
+  });
+  check('the relay agent is accepted', () => assert.strictEqual(relayRes.status, 200));
+  const relayPayload = await relayRes.json();
+  check('the relay agent gets only the middle bundle', () => {
+    assert.deepStrictEqual(relayPayload.bundles[relayTunnel.id], expectedRelay.bundles.relay);
+    assert.deepStrictEqual(Object.keys(relayPayload.bundles), [relayTunnel.id]);
+  });
 
   const f2res = await fetch('http://127.0.0.1:8791/api/agent/config', { headers: { 'x-ww-agent-token': FOREIGN2_TOKEN } });
   check('a targeted exit agent is accepted', () => assert.strictEqual(f2res.status, 200));

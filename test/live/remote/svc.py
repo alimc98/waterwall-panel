@@ -67,8 +67,9 @@ class UdpEcho(socketserver.BaseRequestHandler):
         sock.sendto(data, self.client_address)
 
 
-class Reuse(socketserver.TCPServer):
+class Reuse(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
 
 class ReuseUdp(socketserver.UDPServer):
