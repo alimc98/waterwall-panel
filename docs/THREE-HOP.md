@@ -1,8 +1,8 @@
 # زنجیرهٔ سه‌سروری در پنل واتروال
 
 این راهنما نشان می‌دهد چطور همان زنجیرهٔ **کاربر → آلمان → ایران → ترکیه** را با پنل
-`waterwall-panel` بسازید. اگر فقط کانفیگ‌های دستی را می‌خواهید،
-[`README-fa.md`](../README-fa.md) را ببینید؛ این سند مخصوص پنل است.
+`waterwall-panel` بسازید. اگر فقط کانفیگ‌های دستی را می‌خواهید، فایل
+`README-fa.md` در ریشهٔ پروژهٔ WaterWall را ببینید؛ این سند مخصوص پنل است.
 
 > پنل ذاتاً **دوطرفه** است: یک سمت `iran` (ورودی) و یک سمت `foreign` (خروجی).
 > برای سه سرور، دو تونل می‌سازیم:
@@ -392,3 +392,76 @@ configs/panel-generated/
 اگر به UDP واقعی (بازی، تماس صوتی، QUIC) نیاز دارید، باید زنجیره را با
 `TcpUdpListener`/`UdpConnector` و یک لایهٔ UDP جداگانه گسترش دهید؛ این طراحی
 عمداً ساده و مقاوم نگه داشته شده است.
+
+---
+
+## ۱۵) امنیت و عملکرد
+
+### لایه‌های رمزنگاری
+
+| بخش | رمزنگاری | چه کسی رمزگشایی می‌کند |
+|---|---|---|
+| کاربر → آلمان | Xray VLESS + Reality + TLS 1.3 + `xtls-rprx-vision` | آلمان (Xray) |
+| آلمان → ترکیه | WaterWall Reality v2 + AEAD (`chacha20-poly1305` یا `aes-256-gcm`) + استتار TLS 1.3 | ترکیه (RealityServer) |
+| ایران | فقط L4 TCP relay | هیچ‌کس؛ محتوا را نمی‌بیند |
+
+- `RealityClient`/`RealityServer` یک handshake واقعی TLS 1.3 با سایت پوشش انجام می‌دهند؛ probe بدون رمز به سایت پوشش می‌رسد.
+- `x25519mlkem768` در `RealityClient` پیش‌فرض `true` است؛ حتی اگر در کانفیگ پنل نوشته نشده باشد فعال است.
+- `MuxClient` به‌صورت پیش‌فرض `keepalive=true`، `ping-interval=15000` و `tolerance-ms=45000` دارد؛ کانفیگ دستی این‌ها را صریح نوشته و کانفیگ پنل به default تکیه می‌کند.
+- IP ایران در لینک کاربر نیست؛ لینک فقط `GERMANY_IP:443` را دارد.
+
+### امنیت سرور (حداقل)
+
+1. SSH فقط با کلید: `PasswordAuthentication no` و `PermitRootLogin prohibit-password` یا `no`.
+2. فایروال:
+   - آلمان: `443/tcp` از همه، `22/tcp` از IP مدیریت، `1080`/`8787` فقط loopback.
+   - ایران: `443/tcp` فقط از IP آلمان، `22/tcp` از IP مدیریت.
+   - ترکیه: `443/tcp` فقط از IP ایران، `22/tcp` از IP مدیریت.
+3. `fail2ban` + `unattended-upgrades`.
+4. پنل روی `127.0.0.1:8787`؛ دسترسی با `ssh -L 8787:127.0.0.1:8787 user@PANEL_HOST`؛ توکن `data/panel.json` با `chmod 600`.
+5. سرویس‌ها با کاربر اختصاصی و `NoNewPrivileges`، `PrivateTmp`، `ProtectSystem`، `ProtectHome` و `AmbientCapabilities=CAP_NET_BIND_SERVICE`.
+6. اسرار تصادفی: `openssl rand -hex 16` برای password/salt، `xray uuid`، `xray x25519` و `openssl rand -hex 8` برای shortId. رمز Xray و WaterWall را جدا نگه دارید.
+7. NTP: `timedatectl set-ntp true` و بررسی `timedatectl`.
+8. لاگ را روی `warning` نگه دارید و لاگ verbose را طولانی‌مدت نگه ندارید.
+
+### پینگ
+
+```text
+RTT_total ≈ RTT(user→Germany) + RTT(Germany→Iran) + RTT(Iran→Turkey)
+```
+
+برای کاربر ایرانی، مسیر آلمان→ایران در hairpin دو بار طی می‌شود؛ این هزینهٔ اصلی است، نه رمزنگاری. با `mtr` هر سه مسیر را اندازه بگیرید. اگر یک مسیر loss/jitter دارد، ارائه‌دهنده/لوکیشن را عوض کنید.
+
+- BBR + `fq`: فایل `configs/sysctl/99-waterwall.conf` در ریشهٔ پروژه.
+- `Mux` duration را روی `300000ms` نگه دارید؛ کمتر از ۶۰ ثانیه نکنید.
+- `chacha20-poly1305` پیش‌فرض است؛ روی CPU با AES-NI می‌توانید `aes-256-gcm` را تست کنید.
+- Mux داخل Xray را روشن نکنید؛ `xtls-rprx-vision` کافی است.
+- Reality کل زنجیره را از splice محروم می‌کند (`kNodeFlagBlocksSplice`)؛ این هزینهٔ CPU/throughput است، نه RTT. روی VPS با AES-NI و ۲ worker معمولاً مشکلی نیست.
+- UDP فقط برای DNS؛ برای voice/gaming مسیر جدا لازم است.
+
+### تست
+
+```bash
+# از آلمان
+curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
+ping -c 20 IRAN_IP
+mtr -rwzbc 50 IRAN_IP
+
+# از ایران
+ping -c 20 GERMANY_IP
+ping -c 20 TURKEY_IP
+
+# اگر ICMP بسته است، برای ping/mtr موقتاً از IP مقابل باز کنید:
+# sudo ufw allow from PEER_IP to any proto icmp
+
+# throughput را برای هر hop جدا تست کنید (نه آلمان→ترکیه مستقیم):
+# روی ایران، موقتاً 5201 را از IP آلمان باز کنید و iperf3 -s اجرا کنید:
+# sudo ufw allow from GERMANY_IP to any port 5201 proto tcp
+# iperf3 -s
+# سپس از آلمان: iperf3 -c IRAN_IP -t 30
+# و بعد rule را حذف کنید: sudo ufw delete allow from GERMANY_IP to any port 5201 proto tcp
+# برای ایران→ترکیه همین کار را با IP ایران روی ترکیه تکرار کنید.
+```
+
+> جزئیات کامل‌تر (SSH، UFW، fail2ban، systemd، BBR و جدول تنظیمات) در بخش ۱۳ فایل
+> `README-fa.md` در ریشهٔ پروژهٔ WaterWall آمده است.
