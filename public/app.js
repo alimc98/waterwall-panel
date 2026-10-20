@@ -802,7 +802,7 @@ function pageEditTunnel() {
       <label class="f"><span class="lbl">سرور ایران</span>
         <select id="et_iran">${serverOpts(iran, t.targetServers?.iran)}</select></label>
       ${
-        tpl?.multiExit
+        tpl?.multiExit || tpl?.sides?.includes('foreign') === false
           ? ''
           : `<label class="f"><span class="lbl">سرور خارج</span>
         <select id="et_foreign">${serverOpts(foreign, t.targetServers?.foreign)}</select></label>`
@@ -1375,7 +1375,9 @@ function templateFormHtml(tpl) {
     ${
       tpl.multiExit
         ? `<label class="f"><span class="lbl">سرورهای خارج <span class="badge ok">چند-سروری</span></span>${foreignPickerHtml('nt', foreign, foreign.length ? [foreign[0].id] : [])}</label>`
-        : `<label class="f"><span class="lbl">سرور خارج</span>
+        : tpl.sides?.includes('foreign') === false
+          ? ''
+          : `<label class="f"><span class="lbl">سرور خارج</span>
         <select id="nt_foreign">${foreign.length ? foreign.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join('') : '<option value="">— ثبت نشده —</option>'}</select></label>`
     }
     <label class="f"><span class="lbl">توضیحات</span><input type="text" id="nt_notes" placeholder="اختیاری"></label>

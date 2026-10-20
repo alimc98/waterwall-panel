@@ -422,11 +422,14 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   const tunnel = store.getTunnel(ctx.params.id);
   if (!tunnel) return sendError(res, 404, 'tunnel not found');
   const body = await parseJsonBody(req);
-  const sides = body.sides || ['iran', 'foreign'];
   const bundle = buildBundle(store, tunnel);
   if (bundle.problems.length) {
     return sendError(res, 400, 'generated configuration is invalid', { problems: bundle.problems });
   }
+  // Apply only the sides the template actually builds. A single-sided middle
+  // relay has no foreign bundle, so the old fixed default would report a bogus
+  // failure for a side that does not exist.
+  const sides = body.sides || Object.keys(bundle.bundles);
   const targets = findTargets(tunnel);
   const servers = { iran: targets.iran, foreign: targets.foreign[0] || null };
 
@@ -522,7 +525,7 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   // firewall never let the link port through. Measuring it here turns a silent
   // failure into an explicit, actionable message instead of a config hunt.
   let reachability = null;
-  if (body.check !== false && servers.iran && servers.foreign) {
+  if (body.check !== false && bundle.bundles.foreign && servers.iran && servers.foreign) {
     try {
       reachability = await netcheck.checkTunnel((s, c, o) => ssh.sshExec(s, c, o), servers, {
         link: listenerPort(bundle, 'foreign'),
