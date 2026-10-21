@@ -331,6 +331,180 @@ for (const tpl of templates.ALL) {
   console.log(`  ✓ ${'cdn-encryption'.padEnd(24)} AEAD inside WebSocket, off by default`);
 }
 
+// ---- CDN reverse tunnel over HTTP/1.1 split mode ---------------------------
+// The XHTTP question: can a reverse tunnel go through Cloudflare using an
+// XHTTP-style shape? Real XHTTP framing needs an Xray origin, so the panel
+// offers WaterWall's own `http1-mode: split` instead: one tunnel line travels
+// as two independent HTTP/1.1 requests (POST upload + GET download) paired by
+// a shared id. The critical property is that both peers agree on every split
+// field, because a mismatch means the two halves never meet and the tunnel
+// looks alive but carries no data.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-split-'));
+  const splitStore = new Store(dir);
+  splitStore.addServer({ id: 'ir', name: 'Iran', role: 'iran', host: '203.0.113.10' });
+  splitStore.addServer({ id: 'ex', name: 'Exit', role: 'foreign', host: '198.51.100.1' });
+
+  const tunnel = splitStore.addTunnel({
+    name: 'cdn-split',
+    template: 'cdn-reverse-split',
+    targetServers: { iran: 'ir', foreign: 'ex' },
+    options: resolveOptions('cdn-reverse-split', {}),
+  });
+  const built = buildBundle(splitStore, tunnel);
+  assert.strictEqual(built.ok, true, built.problems.join('; '));
+
+  const parseSide = (side) => {
+    const file = Object.keys(built.bundles[side]).find((f) => f.startsWith('configs/'));
+    assert.ok(file, `${side}: no config file`);
+    return JSON.parse(preprocessConfig(built.bundles[side][file]).text);
+  };
+  const iranCfg = parseSide('iran');
+  const exitCfg = parseSide('foreign');
+  const find = (cfg, name) => cfg.nodes.find((n) => n.name === name);
+
+  const httpServer = find(iranCfg, 'http_origin');
+  const httpClient = find(exitCfg, 'http_client');
+  assert.ok(httpServer && httpClient, 'both HTTP nodes must be emitted');
+
+  // Split mode is HTTP/1.1 only and cannot be combined with websocket.
+  // Getting either wrong makes the core reject the config at load time.
+  assert.strictEqual(httpServer.settings['http1-mode'], 'split');
+  assert.strictEqual(httpClient.settings['http1-mode'], 'split');
+  assert.strictEqual(httpServer.settings['http-version'], 1);
+  assert.strictEqual(httpClient.settings['http-version'], 1);
+  assert.ok(!httpServer.settings.websocket, 'split mode cannot be combined with websocket');
+  assert.ok(!httpClient.settings.websocket, 'split mode cannot be combined with websocket');
+
+  // The two halves are matched by shared metadata, so every split field has
+  // to be identical on both peers.
+  assert.deepStrictEqual(httpServer.settings.split, httpClient.settings.split);
+  const split = httpServer.settings.split;
+  assert.strictEqual(split['upload-method'], 'POST');
+  assert.strictEqual(split['download-method'], 'GET');
+  assert.strictEqual(split['id-placement'], 'query');
+  assert.strictEqual(split['id-name'], 'wwid');
+  assert.strictEqual(split['cache-bypass'], true);
+
+  // The path is the one thing a CDN routes on, so it must match exactly.
+  assert.strictEqual(httpServer.settings.path, httpClient.settings.path);
+
+  // The ALPN offer follows from HTTP/1.1: if the client offered h2 as well,
+  // a CDN could pick h2 and the two ends would disagree about the protocol.
+  const tlsClient = find(exitCfg, 'tls_client');
+  assert.deepStrictEqual(tlsClient.settings.alpns, ['http/1.1']);
+
+  // The carrier order is fixed: Mux outside, HTTP inside, encryption between
+  // the HTTP pair and the reverse pair. Reading it from the exit side
+  // outwards: tcp_to_cdn -> tls_client -> http_client -> mux_client ->
+  // encryption_client -> reverse_client.
+  assert.strictEqual(find(iranCfg, 'http_origin').next, 'mux_origin');
+  assert.strictEqual(find(iranCfg, 'mux_origin').next, 'encryption_server');
+  assert.strictEqual(find(iranCfg, 'encryption_server').next, 'reverse_server');
+  assert.strictEqual(find(exitCfg, 'http_client').next, 'tls_client');
+  assert.strictEqual(find(exitCfg, 'mux_client').next, 'http_client');
+  assert.strictEqual(find(exitCfg, 'encryption_client').next, 'mux_client');
+  assert.strictEqual(find(exitCfg, 'reverse_client').next, 'encryption_client');
+
+  // A shared token is opt-in, and it must appear on both sides with the same
+  // placement and field name.
+  const tokenTunnel = splitStore.addTunnel({
+    name: 'cdn-split-token',
+    template: 'cdn-reverse-split',
+    targetServers: { iran: 'ir', foreign: 'ex' },
+    options: resolveOptions('cdn-reverse-split', {
+      splitTokenEnabled: true,
+      splitToken: 'shared-secret',
+      splitTokenPlacement: 'header',
+      splitTokenName: 'X-Waterwall-Token',
+    }),
+  });
+  const tokenBuilt = buildBundle(splitStore, tokenTunnel);
+  assert.strictEqual(tokenBuilt.ok, true, tokenBuilt.problems.join('; '));
+  const tokenServer = JSON.parse(
+    preprocessConfig(tokenBuilt.bundles.iran['configs/cdn-reverse-split.json']).text,
+  ).nodes.find((n) => n.name === 'http_origin');
+  const tokenClient = JSON.parse(
+    preprocessConfig(tokenBuilt.bundles.foreign['configs/cdn-reverse-split.json']).text,
+  ).nodes.find((n) => n.name === 'http_client');
+  assert.strictEqual(tokenServer.settings.split.token, 'shared-secret');
+  assert.strictEqual(tokenClient.settings.split.token, 'shared-secret');
+  assert.strictEqual(tokenServer.settings.split['token-placement'], 'header');
+  assert.strictEqual(tokenClient.settings.split['token-placement'], 'header');
+  assert.strictEqual(tokenServer.settings.split['token-name'], 'X-Waterwall-Token');
+  assert.strictEqual(tokenClient.settings.split['token-name'], 'X-Waterwall-Token');
+
+  // The token is opt-in through a boolean switch, not through the presence
+  // of a value. A `when` condition compares a field's value against the
+  // string "true", so gating a password field on its own value would hide
+  // the placement controls forever. With the switch off, a token that is
+  // still sitting in the options must not reach the config.
+  const noTokenTunnel = splitStore.addTunnel({
+    name: 'cdn-split-no-token',
+    template: 'cdn-reverse-split',
+    targetServers: { iran: 'ir', foreign: 'ex' },
+    options: resolveOptions('cdn-reverse-split', {
+      splitTokenEnabled: false,
+      splitToken: 'must-not-appear',
+    }),
+  });
+  const noTokenBuilt = buildBundle(splitStore, noTokenTunnel);
+  assert.strictEqual(noTokenBuilt.ok, true, noTokenBuilt.problems.join('; '));
+  for (const side of ['iran', 'foreign']) {
+    const cfg = JSON.parse(
+      preprocessConfig(noTokenBuilt.bundles[side]['configs/cdn-reverse-split.json']).text,
+    );
+    const http = cfg.nodes.find((n) => n.name === (side === 'iran' ? 'http_origin' : 'http_client'));
+    assert.strictEqual(http.settings.split.token, undefined, `${side}: token leaked while the switch is off`);
+  }
+
+  // useVariables=false must leave concrete values behind, not @sentinels.
+  const literalTunnel = splitStore.addTunnel({
+    name: 'cdn-split-literal',
+    template: 'cdn-reverse-split',
+    targetServers: { iran: 'ir', foreign: 'ex' },
+    options: resolveOptions('cdn-reverse-split', { useVariables: false }),
+  });
+  const literalBuilt = buildBundle(splitStore, literalTunnel);
+  assert.strictEqual(literalBuilt.ok, true, literalBuilt.problems.join('; '));
+  for (const side of ['iran', 'foreign']) {
+    const text = literalBuilt.bundles[side]['configs/cdn-reverse-split.json'];
+    assert.ok(!text.includes('"@'), `${side}: useVariables=false left an @sentinel in the config`);
+    const cfg = JSON.parse(text);
+    assert.strictEqual(cfg.variables, undefined, `${side}: useVariables=false must omit variables`);
+  }
+
+  pass += 1;
+  console.log(`  ✓ ${'cdn-split'.padEnd(24)} HTTP/1.1 split mode, both peers agree`);
+}
+
+// ---- a `when` condition must not expect "true" from a non-boolean ------
+// The panel hides a field by comparing the controlling field's value against
+// the expected value as a string. A `when: { textField: true }` therefore
+// only matches when the text field literally contains the word "true", so
+// the dependent fields stay hidden forever. A `when` on a select (for
+// example `{ muxMode: 'timer' }`) is fine: the value is compared literally.
+{
+  const { catalog } = require('../lib/templates');
+  const offenders = [];
+  for (const tpl of catalog()) {
+    const booleanKeys = new Set(
+      tpl.fields.filter((f) => f.type === 'boolean').map((f) => f.key),
+    );
+    for (const f of tpl.fields) {
+      if (!f.when) continue;
+      for (const [key, expected] of Object.entries(f.when)) {
+        if (expected === true && !booleanKeys.has(key)) {
+          offenders.push(`${tpl.id}.${f.key} -> ${key}`);
+        }
+      }
+    }
+  }
+  assert.deepStrictEqual(offenders, [], `"true" on a non-boolean \`when\`: ${offenders.join(', ')}`);
+  pass += 1;
+  console.log(`  ✓ ${'when-conditions'.padEnd(24)} no "true" when on a non-boolean field`);
+}
+
 // ---- foreign entry -> Iran middle -> foreign exit -------------------------
 // This is the other three-server shape from `relay-reality`: the users connect
 // to a foreign entry box (Germany), Iran is a transparent L4 relay, and a
@@ -943,6 +1117,7 @@ function idToFile(id) {
     'router-split': 'ops.js', 'auth-users': 'ops.js', 'vless-hardened': 'ops.js',
     speedtest: 'ops.js', 'tester-chain': 'ops.js',
     'cdn-reverse-wss': 'cdn.js',
+    'cdn-reverse-split': 'cdn-split.js',
   };
   return map[id] || 'basic.js';
 }
