@@ -881,7 +881,7 @@ router.get('/api/agent/config', (req, res) => {
     const targets = resolveTargets(store.listServers(), tunnel);
     // Only the servers this tunnel actually points at get its bundle. The old
     // role-wide behaviour stays for tunnels with no explicit targets.
-    if (!isTarget(targets, tunnel, server)) continue;
+    if (!isTarget(targets, tunnel, server, templates.get(tunnel.template)?.sides)) continue;
     const built = buildBundle(store, tunnel);
     if (!built.bundles[server.role]) continue;
     bundles[tunnel.id] = built.bundles[server.role];

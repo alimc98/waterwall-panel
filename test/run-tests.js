@@ -8,6 +8,7 @@
 const assert = require('node:assert');
 const templates = require('../lib/templates');
 const { buildBundle, resolveOptions } = require('../lib/build');
+const { resolveTargets, isTarget } = require('../lib/targets');
 const { Store } = require('../lib/store');
 const { validateBundle, preprocessConfig } = require('../lib/generator');
 const { transportProblem } = require('../lib/ssh');
@@ -328,6 +329,97 @@ for (const tpl of templates.ALL) {
 
   pass += 1;
   console.log(`  ✓ ${'cdn-encryption'.padEnd(24)} AEAD inside WebSocket, off by default`);
+}
+
+// ---- foreign entry -> Iran middle -> foreign exit -------------------------
+// This is the other three-server shape from `relay-reality`: the users connect
+// to a foreign entry box (Germany), Iran is a transparent L4 relay, and a
+// second foreign box (Turkey) terminates Reality and runs the SOCKS5 server.
+// Both tunnels must agree on the link address/whitelist, and the middle bundle
+// must have no foreign side at all.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-chain-'));
+  const chain = new Store(dir);
+  chain.addServer({ id: 'de', name: 'Germany (entry)', role: 'iran', host: '203.0.113.10' });
+  chain.addServer({ id: 'ir', name: 'Iran (middle)', role: 'iran', host: '203.0.113.20' });
+  chain.addServer({ id: 'tr', name: 'Turkey (exit)', role: 'foreign', host: '198.51.100.30' });
+
+  const main = chain.addTunnel({
+    name: 'entry-exit',
+    template: 'socks5-reality-mux',
+    targetServers: { iran: 'de', foreign: 'tr' },
+    options: resolveOptions('socks5-reality-mux', {
+      listenPort: 1080,
+      publicPort: 443,
+      relayHost: '203.0.113.20',
+      publicWhitelist: ['203.0.113.20'],
+      sourceIp: '203.0.113.10',
+    }),
+  });
+  const mainBuilt = buildBundle(chain, main);
+  assert.strictEqual(mainBuilt.ok, true, mainBuilt.problems.join('; '));
+  assert.deepStrictEqual(Object.keys(mainBuilt.bundles).sort(), ['foreign', 'iran']);
+  const findNode = (cfg, name) => cfg.nodes.find((n) => n.name === name);
+  const de = JSON.parse(preprocessConfig(mainBuilt.bundles.iran['configs/socks5-reality.json']).text);
+  const tr = JSON.parse(preprocessConfig(mainBuilt.bundles.foreign['configs/socks5-reality.json']).text);
+
+  assert.strictEqual(findNode(de, 'local').settings.port, 1080);
+  assert.strictEqual(findNode(de, 'out').settings.address, '203.0.113.20');
+  assert.strictEqual(findNode(de, 'out').settings.port, 443);
+  assert.strictEqual(findNode(de, 'out').settings['source-ip'], '203.0.113.10');
+  assert.strictEqual(findNode(de, 'reality').settings.password, findNode(tr, 'reality').settings.password);
+  assert.strictEqual(findNode(de, 'reality').settings.salt, findNode(tr, 'reality').settings.salt);
+  assert.deepStrictEqual(findNode(tr, 'public').settings.whitelist, ['203.0.113.20/32']);
+  assert.strictEqual(findNode(tr, 'public').settings.port, 443);
+  assert.strictEqual(findNode(tr, 'reality').next, 'mux');
+  assert.strictEqual(findNode(tr, 'mux').next, 'socks');
+  assert.strictEqual(findNode(tr, 'socks').type, 'Socks5Server');
+  assert.strictEqual(findNode(tr, 'socks').settings['no-auth'], true);
+  assert.strictEqual(findNode(tr, 'socks').settings.udp, false);
+
+  const middle = chain.addTunnel({
+    name: 'middle-relay',
+    template: 'tcp-relay',
+    targetServers: { iran: 'ir' },
+    options: resolveOptions('tcp-relay', {
+      listenPort: 443,
+      destAddress: '198.51.100.30',
+      destPort: 443,
+      whitelist: ['203.0.113.10'],
+      sourceIp: '203.0.113.20',
+    }),
+  });
+  const midBuilt = buildBundle(chain, middle);
+  assert.strictEqual(midBuilt.ok, true, midBuilt.problems.join('; '));
+  assert.deepStrictEqual(Object.keys(midBuilt.bundles), ['iran']);
+  const mid = JSON.parse(preprocessConfig(midBuilt.bundles.iran['configs/tcp-relay.json']).text);
+  assert.deepStrictEqual(findNode(mid, 'entry').settings.whitelist, ['203.0.113.10']);
+  assert.strictEqual(findNode(mid, 'entry').settings.port, 443);
+  assert.strictEqual(findNode(mid, 'exit').settings.address, '198.51.100.30');
+  assert.strictEqual(findNode(mid, 'exit').settings.port, 443);
+  assert.strictEqual(findNode(mid, 'exit').settings['source-ip'], '203.0.113.20');
+  assert.ok(!mid.nodes.some((n) => /Reality|Socks5|Mux/.test(n.type)), 'the middle relay must stay transparent');
+
+  // Agent targeting: the main tunnel goes only to Germany + Turkey, and the
+  // single-sided middle tunnel goes only to Iran. The fallback exit address in
+  // `tcp-relay` must not make a Turkish agent claim the middle bundle.
+  const chainServers = chain.listServers();
+  const deServer = chainServers.find((s) => s.id === 'de');
+  const irServer = chainServers.find((s) => s.id === 'ir');
+  const trServer = chainServers.find((s) => s.id === 'tr');
+  const mainSides = templates.get(main.template).sides;
+  const midSides = templates.get(middle.template).sides;
+  const mainTargets = resolveTargets(chainServers, main);
+  assert.ok(isTarget(mainTargets, main, deServer, mainSides));
+  assert.ok(isTarget(mainTargets, main, trServer, mainSides));
+  assert.ok(!isTarget(mainTargets, main, irServer, mainSides));
+  const midTargets = resolveTargets(chainServers, middle);
+  assert.ok(isTarget(midTargets, middle, irServer, midSides));
+  assert.ok(!isTarget(midTargets, middle, deServer, midSides));
+  assert.ok(!isTarget(midTargets, middle, trServer, midSides), 'the exit must not receive the single-sided middle bundle');
+
+  pass += 1;
+  console.log(`  ✓ ${'entry-relay-exit'.padEnd(24)} two foreign boxes, Iran only forwards`);
 }
 
 // ---- shared secrets must be identical on both sides ----------------------

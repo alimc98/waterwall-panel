@@ -37,6 +37,7 @@ const TOKEN = 'panel-token-for-the-agent-test-0123456789abcdef';
 const AGENT_TOKEN = 'iran-agent-token-0123456789abcdef';
 const FOREIGN2_TOKEN = 'foreign2-agent-token-0123456789abcdef';
 const RELAY_TOKEN = 'relay-agent-token-0123456789abcdef';
+const ENTRY_TOKEN = 'entry-agent-token-0123456789abcdef';
 
 const store = new Store(dataDir);
 store.addServer({
@@ -49,6 +50,16 @@ store.addServer({
   agentToken: AGENT_TOKEN,
 });
 store.addServer({ id: 'srv-foreign', name: 'Foreign', role: 'foreign', host: '192.0.2.20', waterwallPath: wwDir });
+// Same role as Iran, but a different real box: the entry of the foreign ->
+// Iran -> foreign chain. It must get only the tunnel that names it.
+store.addServer({
+  id: 'srv-entry',
+  name: 'Entry (foreign)',
+  role: 'iran',
+  host: '192.0.2.40',
+  waterwallPath: wwDir,
+  agentToken: ENTRY_TOKEN,
+});
 // The middle hop of a three-server chain. It must receive only tunnels that
 // explicitly name it, never every tunnel just because it is registered.
 store.addServer({
@@ -121,6 +132,36 @@ const relayTunnel = store.addTunnel({
   targetServers: { iran: 'srv-iran', relay: 'srv-relay', foreign: 'srv-foreign' },
   options: resolveOptions('relay-reality', {}),
 });
+// The other three-server shape: users enter on a foreign box (srv-entry), Iran
+// (srv-iran) is a transparent middle hop, and a second foreign box
+// (srv-foreign-2) terminates the tunnel. These are two separate tunnels, and
+// each agent must receive only its own side of the one it belongs to.
+const chainTunnel = store.addTunnel({
+  name: 'agent-e2e-chain',
+  template: 'socks5-reality-mux',
+  enabled: true,
+  targetServers: { iran: 'srv-entry', foreign: 'srv-foreign-2' },
+  options: resolveOptions('socks5-reality-mux', {
+    listenPort: 1080,
+    publicPort: 443,
+    relayHost: '192.0.2.10',
+    publicWhitelist: ['192.0.2.10'],
+    sourceIp: '192.0.2.40',
+  }),
+});
+const middleTunnel = store.addTunnel({
+  name: 'agent-e2e-middle',
+  template: 'tcp-relay',
+  enabled: true,
+  targetServers: { iran: 'srv-iran' },
+  options: resolveOptions('tcp-relay', {
+    listenPort: 443,
+    destAddress: '192.0.2.30',
+    destPort: 443,
+    whitelist: ['192.0.2.40'],
+    sourceIp: '192.0.2.10',
+  }),
+});
 // The token comes from the environment (WW_PANEL_TOKEN), exactly as it does in
 // the systemd unit the installer writes; panel.json is not needed for this.
 
@@ -131,6 +172,12 @@ assert.strictEqual(expectedCdn.ok, true, `the panel must build the CDN tunnel: $
 const expectedRelay = buildBundle(store, store.getTunnel(relayTunnel.id));
 assert.strictEqual(expectedRelay.ok, true, `the panel must build the relay tunnel: ${expectedRelay.problems.join('; ')}`);
 assert.deepStrictEqual(Object.keys(expectedRelay.bundles), ['iran', 'relay', 'foreign']);
+const expectedChain = buildBundle(store, store.getTunnel(chainTunnel.id));
+assert.strictEqual(expectedChain.ok, true, `the panel must build the entry/exit chain: ${expectedChain.problems.join('; ')}`);
+assert.deepStrictEqual(Object.keys(expectedChain.bundles).sort(), ['foreign', 'iran']);
+const expectedMiddle = buildBundle(store, store.getTunnel(middleTunnel.id));
+assert.strictEqual(expectedMiddle.ok, true, `the panel must build the middle relay: ${expectedMiddle.problems.join('; ')}`);
+assert.deepStrictEqual(Object.keys(expectedMiddle.bundles), ['iran']);
 {
   // Keep the fixture honest: if this bundle ever stops carrying bare
   // placeholders, the test silently stops covering the preprocessing path.
@@ -257,6 +304,10 @@ async function main() {
     assert.deepStrictEqual(payload.bundles[multiTunnel.id], expectedMulti.bundles.iran));
   check('the Iran agent gets the entry side of the relay tunnel', () =>
     assert.deepStrictEqual(payload.bundles[relayTunnel.id], expectedRelay.bundles.iran));
+  check('the Iran agent gets the middle hop of the entry/exit chain', () =>
+    assert.deepStrictEqual(payload.bundles[middleTunnel.id], expectedMiddle.bundles.iran));
+  check('the Iran agent does not get the foreign entry bundle', () =>
+    assert.strictEqual(payload.bundles[chainTunnel.id], undefined));
 
   const relayRes = await fetch('http://127.0.0.1:8791/api/agent/config', {
     headers: { 'x-ww-agent-token': RELAY_TOKEN },
@@ -271,13 +322,25 @@ async function main() {
   const f2res = await fetch('http://127.0.0.1:8791/api/agent/config', { headers: { 'x-ww-agent-token': FOREIGN2_TOKEN } });
   check('a targeted exit agent is accepted', () => assert.strictEqual(f2res.status, 200));
   const f2 = await f2res.json();
-  check('a targeted exit gets the shared exit bundle', () => {
+  check('a targeted exit gets the shared exit bundle and the chain exit', () => {
     assert.deepStrictEqual(f2.bundles[multiTunnel.id], expectedMulti.bundles.foreign);
-    assert.deepStrictEqual(Object.keys(f2.bundles), [multiTunnel.id]);
+    assert.deepStrictEqual(f2.bundles[chainTunnel.id], expectedChain.bundles.foreign);
+    assert.deepStrictEqual(Object.keys(f2.bundles), [multiTunnel.id, chainTunnel.id]);
   });
   check('an exit no tunnel targets receives nothing', () => {
     assert.strictEqual(f2.bundles[tunnel.id], undefined);
     assert.strictEqual(f2.bundles[cdnTunnel.id], undefined);
+  });
+  check('the exit does not receive the single-sided middle bundle', () =>
+    assert.strictEqual(f2.bundles[middleTunnel.id], undefined));
+
+  const entryRes = await fetch('http://127.0.0.1:8791/api/agent/config', { headers: { 'x-ww-agent-token': ENTRY_TOKEN } });
+  check('the foreign entry agent is accepted', () => assert.strictEqual(entryRes.status, 200));
+  const entry = await entryRes.json();
+  check('the foreign entry gets only its entry side, never the middle bundle', () => {
+    assert.deepStrictEqual(entry.bundles[chainTunnel.id], expectedChain.bundles.iran);
+    assert.strictEqual(entry.bundles[middleTunnel.id], undefined);
+    assert.deepStrictEqual(Object.keys(entry.bundles), [chainTunnel.id]);
   });
 
   agent.kill();
