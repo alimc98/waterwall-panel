@@ -429,7 +429,8 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   }
   // Only sides the template actually produced can be deployed. Defaulting to
   // the bundle keys (rather than a hard-coded pair) is what makes a two-sided
-  // reverse tunnel and a three-sided relay tunnel both work without a flag.
+  // reverse tunnel, a single-sided middle relay and a three-sided relay tunnel
+  // all work without a flag.
   const sides = Array.isArray(body.sides) && body.sides.length ? body.sides : Object.keys(bundle.bundles);
   const targets = findTargets(tunnel);
   const servers = {
@@ -531,7 +532,7 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   // firewall never let the link port through. Measuring it here turns a silent
   // failure into an explicit, actionable message instead of a config hunt.
   let reachability = null;
-  if (body.check !== false && servers.iran && servers.foreign && !bundle.bundles.relay) {
+  if (body.check !== false && bundle.bundles.foreign && !bundle.bundles.relay && servers.iran && servers.foreign) {
     try {
       reachability = await netcheck.checkTunnel((s, c, o) => ssh.sshExec(s, c, o), servers, {
         link: listenerPort(bundle, 'foreign'),

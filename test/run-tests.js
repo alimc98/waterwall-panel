@@ -751,9 +751,10 @@ function certTests() {
 function idToFile(id) {
   const map = {
     'tcp-forward': 'basic.js', 'udp-forward': 'basic.js', 'tcp-udp-forward': 'basic.js',
-    'encrypted-tcp': 'basic.js', 'xor-obfuscated': 'basic.js',
+    'encrypted-tcp': 'basic.js', 'xor-obfuscated': 'basic.js', 'tcp-relay': 'basic.js',
     'vless-tls': 'stream.js', 'vless-mux-tls': 'stream.js', 'vless-reality': 'stream.js',
     'trojan-tls': 'stream.js', 'vless-http-ws-tls': 'stream.js', 'udp-over-tcp': 'stream.js',
+    'socks5-reality-mux': 'stream.js',
     'http-proxy': 'proxy.js', 'socks5-upstream': 'proxy.js',
     'tun-wireguard': 'layer3.js', 'rootless-socks-tcp': 'layer3.js', 'tun-tcp-tunnel': 'layer3.js',
     'reverse-tls': 'reverse.js', 'reverse-plain': 'reverse.js', 'reverse-reality': 'reverse-reality.js',

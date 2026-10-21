@@ -8,8 +8,9 @@
 
 ## ویژگی‌ها
 
-- **۴۰ سناریوی آماده**، دسته‌بندی‌شده: پایه، پروتکل، پروکسی، لایه ۳، عملیات
+- **۴۲ سناریوی آماده**، دسته‌بندی‌شده: پایه، پروتکل، پروکسی، لایه ۳، عملیات
 - **چند سرور خارجی برای یک ورودی** (تونل‌های معکوس): هر تعداد خروجی، با تقسیم بار و فیلور خودکار
+- **زنجیرهٔ سه‌سروری ورودی → میانی → خروجی**: قالب `socks5-reality-mux` برای دو سرور ورودی/خروجی و قالب تک‌سمتهٔ `tcp-relay` برای هاپ میانی؛ IP هاپ میانی هرگز در لینک کلاینت قرار نمی‌گیرد. راهنما: [`docs/THREE-HOP.md`](docs/THREE-HOP.md)
 - **زنجیرهٔ سه‌سروری ایران → رله → خارج**: خروجی بدون پورت ورودی و بدون افشای IP، با چند خروجی و فیلور روی رله
 - **رمزنگاری AEAD داخل تونل CDN** (اختیاری و خاموش به‌صورت پیش‌فرض) تا CDN محتوای پروتکل داخلی را نبیند
 - **رابط فارسی RTL** با فرم پویا: انتخاب سناریو ← پر کردن فیلدها ← پیش‌نمایش زنده هر دو سمت
@@ -830,6 +831,7 @@ sudo node server.js   # برای فعال شدن تست پروتکل
 | قالب | زنجیره |
 | --- | --- |
 | `tcp-forward` | `TcpListener → TcpConnector` |
+| `tcp-relay` | `TcpListener → TcpConnector` — فقط سمت ایران، برای هاپ میانی زنجیرهٔ سه‌سروری |
 | `udp-forward` | `UdpListener → UdpConnector` |
 | `tcp-udp-forward` | `TcpUdpListener → TcpUdpConnector` |
 | `encrypted-tcp` | `EncryptionClient / EncryptionServer` با رمز مشترک |
@@ -842,6 +844,7 @@ sudo node server.js   # برای فعال شدن تست پروتکل
 | `vless-tls` | `Socks5Server → VlessClient → TlsClient → TcpConnector` | `TlsServer → VlessServer → TcpConnector` |
 | `vless-mux-tls` | `… → MuxClient → VlessClient → TlsClient` | `TlsServer → MuxServer → VlessServer` |
 | `vless-reality` | `… → VlessClient → RealityClient` | `RealityServer` (با شاخه استتار) `→ VlessServer` |
+| `socks5-reality-mux` | `TcpListener → MuxClient → RealityClient → TcpConnector` | `TcpListener → RealityServer → MuxServer → Socks5Server → TcpConnector` |
 | `trojan-tls` | `… → TrojanClient → TlsClient` | `TlsServer → TrojanServer` |
 | `vless-http-ws-tls` | `… → VlessClient → HttpClient → TlsClient` | `TlsServer → HttpServer → VlessServer` |
 | `udp-over-tcp` | `UdpListener → UdpOverTcpClient → TlsClient` | `TlsServer → UdpOverTcpServer → UdpConnector` |
@@ -873,6 +876,17 @@ sudo node server.js   # برای فعال شدن تست پروتکل
 | `vless-hardened` | `SoftIpLimiter` + `SpeedLimit` + `LoggerTunnel` |
 | `speedtest` | `SpeedTestClient / SpeedTestServer` (TCP یا UDP) |
 | `tester-chain` | `TesterClient / TesterServer` با `KeepAlive` اختیاری |
+
+### زنجیرهٔ سه‌سروری (Entry → Middle → Exit)
+
+پنل ذاتاً دوطرفه است (ایران + خارج). برای سناریوی سه‌سروری، دو تونل بسازید:
+
+1. **`socks5-reality-mux`** — سمت «ایران» = سرور ورودی (مثلاً آلمان)، سمت «خارج» = سرور خروجی (مثلاً ترکیه). فیلد «هاپ میانی» را روی IP سرور میانی و «لیست سفید خروجی» را روی همان IP بگذارید.
+2. **`tcp-relay`** — فقط سمت «ایران» = سرور میانی. این قالب سمت خارج تولید نمی‌کند و به‌صورت شفاف TCP را به خروجی فوروارد می‌کند.
+
+سپس Xray را روی سرور ورودی با `VLESS + Reality` بالا بیاورید و outbound آن را به SOCKS5 محلی `127.0.0.1:1080` وصل کنید. لینک کاربر فقط IP سرور ورودی را دارد؛ IP هاپ میانی و سرور خروجی در لینک نمی‌آید.
+
+راهنمای کامل، ترتیب استقرار و فایروال: [`docs/THREE-HOP.md`](docs/THREE-HOP.md)
 
 ---
 
