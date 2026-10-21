@@ -356,12 +356,20 @@ for (const tpl of templates.ALL) {
       sourceIp: '203.0.113.10',
     }),
   });
-  const mainBuilt = buildBundle(chain, main);
+  // A tunnel created by the previous revision has `muxEnabled: true` stored.
+  // The field is gone now, but old records must still build the working chain
+  // instead of resurrecting the broken Mux nodes.
+  chain.updateTunnel(main.id, {
+    options: { ...main.options, muxEnabled: true, muxMode: 'timer', muxMaxChildren: 4096 },
+  });
+  const mainBuilt = buildBundle(chain, chain.getTunnel(main.id));
   assert.strictEqual(mainBuilt.ok, true, mainBuilt.problems.join('; '));
   assert.deepStrictEqual(Object.keys(mainBuilt.bundles).sort(), ['foreign', 'iran']);
   const findNode = (cfg, name) => cfg.nodes.find((n) => n.name === name);
   const de = JSON.parse(preprocessConfig(mainBuilt.bundles.iran['configs/socks5-reality.json']).text);
   const tr = JSON.parse(preprocessConfig(mainBuilt.bundles.foreign['configs/socks5-reality.json']).text);
+  assert.ok(!de.nodes.some((n) => /^Mux/.test(n.type)), 'a legacy muxEnabled option must not add a MuxClient');
+  assert.ok(!tr.nodes.some((n) => /^Mux/.test(n.type)), 'a legacy muxEnabled option must not add a MuxServer');
 
   assert.strictEqual(findNode(de, 'local').settings.port, 1080);
   assert.strictEqual(findNode(de, 'out').settings.address, '203.0.113.20');
@@ -371,8 +379,8 @@ for (const tpl of templates.ALL) {
   assert.strictEqual(findNode(de, 'reality').settings.salt, findNode(tr, 'reality').settings.salt);
   assert.deepStrictEqual(findNode(tr, 'public').settings.whitelist, ['203.0.113.20/32']);
   assert.strictEqual(findNode(tr, 'public').settings.port, 443);
-  assert.strictEqual(findNode(tr, 'reality').next, 'mux');
-  assert.strictEqual(findNode(tr, 'mux').next, 'socks');
+  assert.strictEqual(findNode(tr, 'reality').next, 'socks');
+  assert.ok(!tr.nodes.some((n) => n.type === 'MuxServer'), 'Mux before Socks5Server breaks CONNECT on 1.46.96');
   assert.strictEqual(findNode(tr, 'socks').type, 'Socks5Server');
   assert.strictEqual(findNode(tr, 'socks').settings['no-auth'], true);
   assert.strictEqual(findNode(tr, 'socks').settings.udp, false);
@@ -393,7 +401,7 @@ for (const tpl of templates.ALL) {
   assert.strictEqual(midBuilt.ok, true, midBuilt.problems.join('; '));
   assert.deepStrictEqual(Object.keys(midBuilt.bundles), ['iran']);
   const mid = JSON.parse(preprocessConfig(midBuilt.bundles.iran['configs/tcp-relay.json']).text);
-  assert.deepStrictEqual(findNode(mid, 'entry').settings.whitelist, ['203.0.113.10']);
+  assert.deepStrictEqual(findNode(mid, 'entry').settings.whitelist, ['203.0.113.10/32']);
   assert.strictEqual(findNode(mid, 'entry').settings.port, 443);
   assert.strictEqual(findNode(mid, 'exit').settings.address, '198.51.100.30');
   assert.strictEqual(findNode(mid, 'exit').settings.port, 443);
@@ -420,6 +428,56 @@ for (const tpl of templates.ALL) {
 
   pass += 1;
   console.log(`  ✓ ${'entry-relay-exit'.padEnd(24)} two foreign boxes, Iran only forwards`);
+}
+
+// ---- raw IPs in whitelist/blacklist become CIDRs --------------------------
+// WaterWall rejects a bare IP in TcpListener.settings.whitelist at startup
+// ("is not a valid CIDR"). The panel's fields say "IPs / CIDRs", so the build
+// normalizes bare IPs centrally. Variable references must not be touched.
+{
+  const raw = store.addTunnel({
+    name: 'raw-ip-list',
+    template: 'tcp-forward',
+    targetServers: { iran: 'srv-iran', foreign: 'srv-foreign' },
+    options: resolveOptions('tcp-forward', {
+      listenPort: 20001,
+      destAddress: '198.51.100.7',
+      destPort: 80,
+      whitelist: ['203.0.113.9'],
+      blacklist: ['198.51.100.0/24'],
+    }),
+  });
+  const rawBuilt = buildBundle(store, store.getTunnel(raw.id));
+  assert.strictEqual(rawBuilt.ok, true, rawBuilt.problems.join('; '));
+  const rawCfg = JSON.parse(rawBuilt.bundles.iran['configs/tcp-forward.json']);
+  const rawEntry = rawCfg.nodes.find((n) => n.name === 'entry');
+  assert.deepStrictEqual(rawEntry.settings.whitelist, ['203.0.113.9/32']);
+  assert.deepStrictEqual(rawEntry.settings.blacklist, ['198.51.100.0/24']);
+
+  const varsTunnel = store.addTunnel({
+    name: 'variable-ip-lists',
+    template: 'relay-reality',
+    targetServers: { relay: 'srv-relay' },
+    options: resolveOptions('relay-reality', {}),
+  });
+  const varsBuilt = buildBundle(store, store.getTunnel(varsTunnel.id));
+  assert.strictEqual(varsBuilt.ok, true, varsBuilt.problems.join('; '));
+  for (const [side, files] of Object.entries(varsBuilt.bundles)) {
+    for (const [file, text] of Object.entries(files)) {
+      if (!file.startsWith('configs/')) continue;
+      const cfg = JSON.parse(preprocessConfig(text).text);
+      for (const n of cfg.nodes) {
+        for (const key of ['whitelist', 'blacklist']) {
+          for (const value of n.settings?.[key] || []) {
+            assert.match(String(value), /^[0-9a-fA-F:.]+\/\d+$/, `${side}/${file}: invalid peer list after variable substitution`);
+          }
+        }
+      }
+    }
+  }
+
+  pass += 1;
+  console.log(`  ✓ ${'ip-list-normalisation'.padEnd(24)} bare IPs gain /32, variables stay intact`);
 }
 
 // ---- shared secrets must be identical on both sides ----------------------

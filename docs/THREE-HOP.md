@@ -58,14 +58,14 @@
 | `Turkey (exit)` | `foreign` | IP ترکیه |
 
 > چرا آلمان نقش `iran` دارد؟ چون در قالب `socks5-reality-mux`، سمت `iran` همان
-> زنجیرهٔ ورودی است (`TcpListener → MuxClient → RealityClient`). این فقط یک برچسب
+> زنجیرهٔ ورودی است (`TcpListener → RealityClient`). این فقط یک برچسب
 > داخلی پنل است و ربطی به موقعیت جغرافیایی ندارد.
 
 ---
 
 ## ۴) تونل اصلی: آلمان → ترکیه
 
-**تونل‌ها → تونل جدید → `SOCKS5 over Reality + Mux`**
+**تونل‌ها → تونل جدید → `SOCKS5 over Reality`**
 
 | فیلد (UI) | کلید API | مقدار برای این طراحی |
 |---|---|---|
@@ -84,11 +84,14 @@
 | KDF iterations | `realityKdf` | `12000` |
 | SNI / سایت پوشش | `realitySni` / `camouflageHost` | `www.microsoft.com` |
 | پورت پوشش | `camouflagePort` | `443` |
-| Mux | `muxEnabled` | `true` |
-| حالت Mux | `muxMode` | `timer` |
-| مدت اتصال Mux | `muxConnectionDurationMs` | `300000` |
-| حداکثر فرزند | `muxMaxChildren` | `4096` |
 | پروفایل حافظه | `_core.ramProfile` | `server` (یا `client` برای VPS کوچک) |
+
+> **Mux را روشن نکنید.** در واتروال 1.46.96 اگر `MuxServer` قبل از
+> `Socks5Server` قرار بگیرد، خط خروجی قبل از خواندن درخواست CONNECT ساخته
+> می‌شود و هر اتصال با `destination port is not initialized` شکست می‌خورد.
+> این موضوع با باینری واقعی 1.46.96 در یک آزمایش سه‌سروری (سه network namespace)
+> بازتولید و تأیید شد. قالب پنل عمداً هیچ گره Mux تولید نمی‌کند؛ اگر تونل قدیمی
+> فیلد `muxEnabled` دارد، بی‌اثر است و لازم نیست کاری کنید.
 
 ### زنجیرهٔ تولیدشده
 
@@ -96,7 +99,6 @@
 
 ```text
 TcpListener 127.0.0.1:1080
-  → MuxClient (timer, 300000 ms)
   → RealityClient (SNI=www.microsoft.com, password/salt, verify=true)
   → TcpConnector IRAN_IP:443 (source-ip = GERMANY_IP)
 ```
@@ -106,7 +108,6 @@ TcpListener 127.0.0.1:1080
 ```text
 TcpListener 0.0.0.0:443 (whitelist = [IRAN_IP])
   → RealityServer
-  → MuxServer (max-children=4096)
   → Socks5Server (no-auth=true, connect=true, udp=false)
   → TcpConnector dest_context->address / dest_context->port
 
@@ -390,7 +391,7 @@ configs/panel-generated/
 این زنجیره فقط TCP است:
 
 - `Socks5Server` ترکیه `udp: false` دارد.
-- `Mux` یک تونل stream است و UDP را حمل نمی‌کند.
+- Reality یک تونل stream است و UDP را حمل نمی‌کند.
 - Xray در آلمان بقیهٔ UDP را block می‌کند تا کلاینت سریع به TCP fallback کند.
 
 اگر به UDP واقعی (بازی، تماس صوتی، QUIC) نیاز دارید، باید زنجیره را با
@@ -411,7 +412,6 @@ configs/panel-generated/
 
 - `RealityClient`/`RealityServer` یک handshake واقعی TLS 1.3 با سایت پوشش انجام می‌دهند؛ probe بدون رمز به سایت پوشش می‌رسد.
 - `x25519mlkem768` در `RealityClient` پیش‌فرض `true` است؛ حتی اگر در کانفیگ پنل نوشته نشده باشد فعال است.
-- `MuxClient` به‌صورت پیش‌فرض `keepalive=true`، `ping-interval=15000` و `tolerance-ms=45000` دارد؛ کانفیگ دستی این‌ها را صریح نوشته و کانفیگ پنل به default تکیه می‌کند.
 - IP ایران در لینک کاربر نیست؛ لینک فقط `GERMANY_IP:443` را دارد.
 
 ### امنیت سرور (حداقل)
@@ -437,7 +437,6 @@ RTT_total ≈ RTT(user→Germany) + RTT(Germany→Iran) + RTT(Iran→Turkey)
 برای کاربر ایرانی، مسیر آلمان→ایران در hairpin دو بار طی می‌شود؛ این هزینهٔ اصلی است، نه رمزنگاری. با `mtr` هر سه مسیر را اندازه بگیرید. اگر یک مسیر loss/jitter دارد، ارائه‌دهنده/لوکیشن را عوض کنید.
 
 - BBR + `fq`: فایل `configs/sysctl/99-waterwall.conf` در ریشهٔ پروژه.
-- `Mux` duration را روی `300000ms` نگه دارید؛ کمتر از ۶۰ ثانیه نکنید.
 - `chacha20-poly1305` پیش‌فرض است؛ روی CPU با AES-NI می‌توانید `aes-256-gcm` را تست کنید.
 - Mux داخل Xray را روشن نکنید؛ `xtls-rprx-vision` کافی است.
 - Reality کل زنجیره را از splice محروم می‌کند (`kNodeFlagBlocksSplice`)؛ این هزینهٔ CPU/throughput است، نه RTT. روی VPS با AES-NI و ۲ worker معمولاً مشکلی نیست.

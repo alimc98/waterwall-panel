@@ -844,7 +844,7 @@ sudo node server.js   # برای فعال شدن تست پروتکل
 | `vless-tls` | `Socks5Server → VlessClient → TlsClient → TcpConnector` | `TlsServer → VlessServer → TcpConnector` |
 | `vless-mux-tls` | `… → MuxClient → VlessClient → TlsClient` | `TlsServer → MuxServer → VlessServer` |
 | `vless-reality` | `… → VlessClient → RealityClient` | `RealityServer` (با شاخه استتار) `→ VlessServer` |
-| `socks5-reality-mux` | `TcpListener → MuxClient → RealityClient → TcpConnector` | `TcpListener → RealityServer → MuxServer → Socks5Server → TcpConnector` |
+| `socks5-reality-mux` | `TcpListener → RealityClient → TcpConnector` | `TcpListener → RealityServer → Socks5Server → TcpConnector` (Mux عمداً خاموش است) |
 | `trojan-tls` | `… → TrojanClient → TlsClient` | `TlsServer → TrojanServer` |
 | `vless-http-ws-tls` | `… → VlessClient → HttpClient → TlsClient` | `TlsServer → HttpServer → VlessServer` |
 | `udp-over-tcp` | `UdpListener → UdpOverTcpClient → TlsClient` | `TlsServer → UdpOverTcpServer → UdpConnector` |
@@ -888,6 +888,11 @@ sudo node server.js   # برای فعال شدن تست پروتکل
 
 1. **`socks5-reality-mux`** — سمت «ایران» = سرور ورودی (مثلاً آلمان)، سمت «خارج» = سرور خروجی (مثلاً ترکیه). فیلد «هاپ میانی» را روی IP سرور میانی و «لیست سفید خروجی» را روی همان IP بگذارید.
 2. **`tcp-relay`** — فقط سمت «ایران» = سرور میانی. این قالب سمت خارج تولید نمی‌کند و به‌صورت شفاف TCP را به خروجی فوروارد می‌کند.
+
+> Mux در قالب `socks5-reality-mux` عمداً خاموش است. در واتروال 1.46.96 اگر
+> `MuxServer` قبل از `Socks5Server` قرار بگیرد، خط خروجی قبل از خواندن CONNECT
+> ساخته می‌شود و همهٔ اتصال‌ها با `destination port is not initialized` شکست
+> می‌خورند. این مورد با باینری واقعی 1.46.96 در آزمایش سه‌سروری تأیید شد.
 
 سپس Xray را روی سرور ورودی با `VLESS + Reality` بالا بیاورید و outbound آن را به SOCKS5 محلی `127.0.0.1:1080` وصل کنید. لینک کاربر فقط IP سرور ورودی را دارد؛ IP هاپ میانی و سرور خروجی در لینک نمی‌آید.
 
