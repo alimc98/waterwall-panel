@@ -454,6 +454,32 @@ for (const tpl of templates.ALL) {
   assert.deepStrictEqual(rawEntry.settings.whitelist, ['203.0.113.9/32']);
   assert.deepStrictEqual(rawEntry.settings.blacklist, ['198.51.100.0/24']);
 
+  // CDN configs contain unquoted `$variable$` placeholders, so they are not
+  // valid JSON before preprocessing. The normalizer must still reach their
+  // whitelist, otherwise a raw IP here kills the core at startup.
+  const cdnRaw = store.addTunnel({
+    name: 'raw-ip-list-cdn',
+    template: 'cdn-reverse-wss',
+    targetServers: { iran: 'srv-iran', foreign: 'srv-foreign' },
+    options: resolveOptions('cdn-reverse-wss', { whitelist: ['203.0.113.11'] }),
+  });
+  const cdnRawBuilt = buildBundle(store, store.getTunnel(cdnRaw.id));
+  assert.strictEqual(cdnRawBuilt.ok, true, cdnRawBuilt.problems.join('; '));
+  let sawCdnWhitelist = false;
+  for (const [side, files] of Object.entries(cdnRawBuilt.bundles)) {
+    for (const [file, text] of Object.entries(files)) {
+      if (!file.startsWith('configs/')) continue;
+      if (text.includes('203.0.113.11/32')) sawCdnWhitelist = true;
+      const cfg = JSON.parse(preprocessConfig(text).text);
+      for (const n of cfg.nodes) {
+        for (const value of n.settings?.whitelist || []) {
+          assert.match(String(value), /^[0-9a-fA-F:.]+\/\d+$/, `${side}/${file}: invalid whitelist entry after normalization`);
+        }
+      }
+    }
+  }
+  assert.ok(sawCdnWhitelist, 'the raw CDN whitelist IP must gain /32 even with unquoted variables present');
+
   const varsTunnel = store.addTunnel({
     name: 'variable-ip-lists',
     template: 'relay-reality',
