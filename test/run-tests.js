@@ -1569,8 +1569,137 @@ function agentTests() {
   }
 }
 
+/**
+ * Panel state: exit ordering, backup/restore, and the outbound settings.
+ *
+ * Each of these is easy to get subtly wrong and impossible to see from a
+ * generated config: priority ties that reorder the list on the next load, a
+ * backup that silently drops the token into the file, a restore that keeps a
+ * role the deployer does not know about, or an outbound config that is written
+ * before it is validated.
+ */
+function panelStateTests() {
+  // The later suites assert on the three servers built at the top of the file,
+  // so whatever the restore cases leave behind is put back before returning.
+  const original = store.exportState();
+  const ob = new (require('../lib/outbound').Outbound)(path.join(tmp, 'outbound'));
+  const cases = [
+    [
+      'new servers are numbered after the existing ones',
+      () => {
+        const first = store.listServers()[0];
+        assert.strictEqual(first.priority, 1);
+        const added = store.addServer({ name: 'Fourth', host: '10.0.0.4' });
+        assert.strictEqual(added.priority, 4);
+        store.deleteServer(added.id);
+      },
+    ],
+    [
+      'moving a server up swaps it with its neighbour',
+      () => {
+        const before = store.listServers().map((s) => s.name);
+        const moved = store.moveServer('srv-foreign', 'up');
+        const after = moved.map((s) => s.name);
+        assert.deepStrictEqual(after.slice(-2), [before[before.length - 2], before[before.length - 1]].reverse());
+        assert.deepStrictEqual(moved.map((s) => s.priority), [1, 2, 3]);
+      },
+    ],
+    [
+      'moving past the top is a no-op, not a lost server',
+      () => {
+        const first = store.listServers()[0];
+        const same = store.moveServer(first.id, 'up').map((s) => s.name);
+        assert.deepStrictEqual(same, store.listServers().map((s) => s.name));
+      },
+    ],
+    [
+      'resolveTargets follows the server order, not the tunnel array',
+      () => {
+        const servers = store.listServers();
+        const ids = [servers[2].id, servers[0].id, servers[1].id];
+        const targets = resolveTargets(servers, { targetServers: { foreign: ids } });
+        assert.deepStrictEqual(
+          targets.foreign.map((s) => s.id),
+          [servers[0].id, servers[1].id, servers[2].id],
+        );
+      },
+    ],
+    [
+      'a backup carries servers and tunnels but not the API token',
+      () => {
+        const backup = store.exportState();
+        assert.strictEqual(backup.format, 'waterwall-panel-backup');
+        assert.strictEqual(backup.servers.length, 3);
+        assert.ok(!JSON.stringify(backup).includes(store.getPanel().token));
+      },
+    ],
+    [
+      'restore rebuilds the lists and rejects an unknown format',
+      () => {
+        const backup = store.exportState();
+        store.addServer({ name: 'Temporary', host: '10.9.9.9' });
+        assert.strictEqual(store.listServers().length, 4);
+        const counts = store.importState(backup);
+        assert.strictEqual(counts.servers, 3);
+        assert.deepStrictEqual(store.listServers().map((s) => s.name), backup.servers.map((s) => s.name));
+        assert.throws(() => store.importState({ format: 'nope', servers: [] }), /فرمت/);
+      },
+    ],
+    [
+      'a restored server with an unknown role becomes foreign',
+      () => {
+        const backup = store.exportState();
+        backup.servers = [{ name: 'Odd', host: '10.0.0.8', role: 'mars' }];
+        store.importState(backup);
+        assert.strictEqual(store.listServers()[0].role, 'foreign');
+        store.importState(backup);
+      },
+    ],
+    [
+      'saving an outbound config injects the local socks inbound',
+      () => {
+        const status = ob.save({ config: JSON.stringify({ outbounds: [{ protocol: 'freedom' }] }), port: 11081, binary: '' });
+        assert.match(status.config, /"protocol": "socks"/);
+        assert.strictEqual(status.port, 11081);
+      },
+    ],
+    [
+      'an outbound config that is not JSON is refused before it is saved',
+      () => {
+        assert.throws(() => ob.save({ config: '{oops' }), /JSON/);
+        assert.throws(() => ob.importSettings({ port: 11082, config: '{oops' }), /Xray/);
+      },
+    ],
+    [
+      'exporting outbound settings keeps the config, importing keeps it stopped',
+      () => {
+        const saved = ob.exportSettings();
+        assert.ok(saved.config.includes('socks'));
+        const restored = ob.importSettings({ ...saved, port: 11083 });
+        assert.strictEqual(restored.port, 11083);
+        assert.strictEqual(restored.running, false);
+        assert.strictEqual(restored.enabled, false);
+      },
+    ],
+  ];
+
+  for (const [label, fn] of cases) {
+    try {
+      fn();
+      pass += 1;
+      console.log(`  ✓ ${label}`);
+    } catch (err) {
+      fail += 1;
+      failures.push(`${label}: ${err.message}`);
+      console.log(`  ✗ ${label}: ${err.message}`);
+    }
+  }
+  store.importState(original);
+}
+
 const securityTestsPending = securityTests();
 
+panelStateTests();
 certTests();
 httpTransportTests();
 bridgeRuleTests();

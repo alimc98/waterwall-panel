@@ -13,6 +13,7 @@ const protoscan = require('./lib/protoscan');
 const versions = require('./lib/versions');
 const netcheck = require('./lib/netcheck');
 const certs = require('./lib/certs');
+const { Outbound } = require('./lib/outbound');
 const { resolveTargets, targetsForSide, isTarget } = require('./lib/targets');
 const { Router, sendJson, sendError, sendText, parseJsonBody, serveStatic, parseUrl } = require('./lib/http');
 const { timingSafeEqual, readBody } = require('./lib/util');
@@ -40,6 +41,16 @@ fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
 const store = new Store(DATA_DIR);
 const certStore = new certs.CertStore(DATA_DIR);
+/**
+ * The panel's own way out.
+ *
+ * When the Iran box loses its international route, SSH to the foreign servers
+ * dies with it. A local Xray client with a SOCKS inbound gives the panel a
+ * different path (through a CDN, a relay, ...), and every ssh/scp the panel
+ * spawns is routed through it while it runs.
+ */
+const outbound = new Outbound(DATA_DIR);
+ssh.setProxyPortProvider(() => outbound.proxyPort());
 const panelToken = process.env.WW_PANEL_TOKEN || store.getPanel().token;
 
 // ---------------------------------------------------------------- helpers
@@ -120,6 +131,9 @@ router.get('/api/bootstrap', (req, res) => {
     token: panelToken,
     servers: store.listServers().map((s) => ({ ...s, sshPassword: s.sshPassword ? '***' : '' })),
     tunnels: store.listTunnels(),
+    // Shipped with bootstrap so the outbound page renders its real state on the
+    // first paint instead of flashing "off" while a second request is in flight.
+    outbound: outbound.status(),
     templates: templates.catalog(),
     // Shipped with the catalog so the UI can show the target release and the
     // removed-settings list without a second request.
@@ -222,6 +236,64 @@ router.delete('/api/servers/:id', (req, res, ctx) => {
   sendJson(res, 200, { ok: true });
 });
 
+/**
+ * Move a server one place up or down.
+ *
+ * A dedicated verb rather than a `priority` PATCH keeps the list contiguous:
+ * the client never has to invent a number between two neighbours, and two
+ * clients moving at once cannot end up with duplicate priorities.
+ */
+router.post('/api/servers/:id/move', async (req, res, ctx) => {
+  if (guard(req, res)) return;
+  const body = await parseJsonBody(req);
+  const direction = body.direction === 'up' ? 'up' : body.direction === 'down' ? 'down' : null;
+  if (!direction) return sendError(res, 400, 'direction must be up or down');
+  const servers = store.moveServer(ctx.params.id, direction);
+  if (!servers) return sendError(res, 404, 'server not found');
+  broadcast('servers', servers.map(redact));
+  sendJson(res, 200, { ok: true, servers: servers.map(redact) });
+});
+
+// ---- backup / restore ----------------------------------------------------
+/**
+ * Download the panel's own state.
+ *
+ * Driven through the browser rather than printed on screen: the file holds SSH
+ * host lists and agent tokens, and `attachment` keeps it out of the page body.
+ */
+router.get('/api/backup', (req, res) => {
+  if (guard(req, res)) return;
+  const payload = { ...store.exportState(), outbound: outbound.exportSettings() };
+  const body = JSON.stringify(payload, null, 2);
+  const stamp = new Date().toISOString().slice(0, 10);
+  res.writeHead(200, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'content-disposition': `attachment; filename="waterwall-backup-${stamp}.json"`,
+    'cache-control': 'no-store',
+  });
+  res.end(body);
+});
+
+/** Replace the panel's servers, tunnels and outbound settings from a backup. */
+router.post('/api/restore', async (req, res) => {
+  if (guard(req, res)) return;
+  const body = await parseJsonBody(req);
+  try {
+    // Validate and apply the outbound block first: importSettings parses the
+    // Xray config and throws before writing anything, so a corrupt backup
+    // cannot leave the server/tunnel lists already replaced.
+    const restoredOutbound =
+      body.outbound && typeof body.outbound === 'object' ? outbound.importSettings(body.outbound) : null;
+    const counts = store.importState(body);
+    broadcast('servers', store.listServers().map(redact));
+    broadcast('tunnels', store.listTunnels());
+    sendJson(res, 200, { ok: true, ...counts, outbound: restoredOutbound });
+  } catch (err) {
+    sendError(res, 400, err.message);
+  }
+});
+
 router.get('/api/servers/:id/probe', async (req, res, ctx) => {
   if (guard(req, res)) return;
   const server = store.getServer(ctx.params.id);
@@ -264,6 +336,135 @@ router.post('/api/servers/:id/service', async (req, res, ctx) => {
   const result = action === 'status' ? await ssh.serviceStatus(server) : await ssh.serviceAction(server, action);
   store.log({ type: 'service', serverId: server.id, action, result });
   sendJson(res, 200, { ok: true, result });
+});
+
+/**
+ * Serve one server's service log, for the log viewer.
+ *
+ * The service name is constrained to systemd's own character set before it is
+ * interpolated: this command runs as root on the target, so a name like
+ * `foo; rm -rf /` must never reach the shell.
+ */
+router.get('/api/servers/:id/logs', async (req, res, ctx) => {
+  if (guard(req, res)) return;
+  const server = store.getServer(ctx.params.id);
+  if (!server) return sendError(res, 404, 'server not found');
+  const lines = Math.max(20, Math.min(1000, Number(ctx.url.searchParams.get('lines')) || 200));
+  const requested = String(ctx.url.searchParams.get('service') || server.serviceName || 'waterwall');
+  const service = requested.replace(/[^A-Za-z0-9_.@:-]/g, '') || 'waterwall';
+  // `systemctl status` is what the operator asked for: the unit description,
+  // Loaded/Active lines, Main PID, Tasks, Memory and the cgroup tree, exactly
+  // as the command prints them. The journal tail is fetched separately so the
+  // status block keeps its own blank lines instead of being mixed into it.
+  // Every command is `|| true` because `status` exits 3 for an inactive unit,
+  // which sshExec would otherwise report as a failed read.
+  const result = await ssh.sshExec(
+    server,
+    [
+      `systemctl is-active ${service} 2>/dev/null || true`,
+      `echo '__WW_ENABLED__'`,
+      `systemctl is-enabled ${service} 2>/dev/null || true`,
+      `echo '__WW_STATUS__'`,
+      `systemctl status ${service} --no-pager --full -l -n 0 2>&1 || true`,
+      `echo '__WW_LOG__'`,
+      `journalctl -u ${service} -n ${lines} --no-pager 2>/dev/null | tail -n ${lines}`,
+    ].join('; '),
+    { timeout: 30000 },
+  );
+  const raw = result.stdout || '';
+  // The three markers split stdout into exactly four chunks: is-active,
+  // is-enabled, the status block, and the journal tail. Splitting in one go is
+  // less error-prone than walking the string and tracking an offset.
+  const segments = raw.split(/__WW_(?:ENABLED|STATUS|LOG)__/);
+  const chunk = (i) => (segments[i] || '').replace(/^\r?\n/, '');
+  const active = (segments[0] || '').trim().split(/\r?\n/)[0] || 'unknown';
+  const enabledState = (segments[1] || '').trim().split(/\r?\n/)[0] || 'unknown';
+  const statusText = chunk(2).replace(/\s+$/, '');
+  const content = chunk(3);
+  sendJson(res, 200, {
+    ok: !result.failed,
+    service,
+    status: active,
+    active,
+    enabled: enabledState,
+    statusText,
+    content,
+    error: result.failed ? (result.stderr || 'log command failed') : null,
+  });
+});
+
+// ---- outbound (the panel's own internet path) ----------------------------
+router.get('/api/outbound', (req, res) => {
+  if (guard(req, res)) return;
+  sendJson(res, 200, { ok: true, outbound: outbound.status() });
+});
+
+router.put('/api/outbound', async (req, res) => {
+  if (guard(req, res)) return;
+  const body = await parseJsonBody(req);
+  try {
+    const status = outbound.save(body);
+    sendJson(res, 200, { ok: true, outbound: status });
+  } catch (err) {
+    sendError(res, 400, err.message);
+  }
+});
+
+router.post('/api/outbound/start', async (req, res) => {
+  if (guard(req, res)) return;
+  try {
+    const status = await outbound.start();
+    store.log({ type: 'outbound.start', port: status.port });
+    broadcast('outbound', status);
+    sendJson(res, 200, { ok: true, outbound: status });
+  } catch (err) {
+    sendError(res, 400, err.message, { outbound: outbound.status() });
+  }
+});
+
+router.post('/api/outbound/stop', async (req, res) => {
+  if (guard(req, res)) return;
+  const status = await outbound.stop();
+  store.log({ type: 'outbound.stop' });
+  broadcast('outbound', status);
+  sendJson(res, 200, { ok: true, outbound: status });
+});
+
+router.get('/api/outbound/logs', (req, res, ctx) => {
+  if (guard(req, res)) return;
+  const lines = Math.max(20, Math.min(1000, Number(ctx.url.searchParams.get('lines')) || 150));
+  sendJson(res, 200, { ok: true, content: outbound.tailLog(lines) });
+});
+
+/** Prove the new path: fetch an IP through the SOCKS port, then SSH a foreign box. */
+router.post('/api/outbound/test', async (req, res) => {
+  if (guard(req, res)) return;
+  const status = outbound.status();
+  if (!status.running) return sendError(res, 400, 'outbound is not running');
+  const curl = await ssh.run('curl', [
+    '-sS',
+    '-m',
+    '12',
+    '--socks5-hostname',
+    `127.0.0.1:${status.port}`,
+    'https://api.ipify.org',
+  ]);
+  const foreign = store.listServers().find((s) => s.role === 'foreign');
+  let sshCheck = null;
+  if (foreign) {
+    const probe = await ssh.sshExec(foreign, 'echo tunnel-ok', { timeout: 20000 });
+    sshCheck = {
+      server: foreign.name,
+      host: foreign.host,
+      ok: !probe.failed,
+      output: `${probe.stdout || ''}${probe.stderr || ''}`.trim().slice(0, 300),
+    };
+  }
+  sendJson(res, 200, {
+    ok: !curl.failed,
+    internet: { ok: !curl.failed, ip: (curl.stdout || '').trim(), error: curl.failed ? curl.stderr.trim() : null },
+    ssh: sshCheck,
+  });
 });
 
 // ---- tunnels -------------------------------------------------------------
@@ -1033,4 +1234,16 @@ server.listen(PORT, HOST, () => {
   }
   console.log('  Open the URL in a browser and sign in with the API token.');
   console.log('');
+  // Saved outbound stays enabled across restarts, so reconnect it once the
+  // panel is listening (and after the SSH proxy provider is wired above).
+  outbound.autostart().catch(() => {});
 });
+
+// systemd sends SIGTERM on restart. Kill the Xray child instead of leaving it
+// parented to init, but keep `enabled` so the next boot brings it back.
+for (const signal of ['SIGTERM', 'SIGINT']) {
+  process.on(signal, async () => {
+    outbound.kill();
+    process.exit(0);
+  });
+}
