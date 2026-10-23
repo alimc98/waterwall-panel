@@ -1,0 +1,280 @@
+From 89ca6c5484be31f4b8699015e69d4688e4052441 Mon Sep 17 00:00:00 2001
+From: alimc98 <alimc98@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:14:43 +0000
+Subject: [PATCH] Remove a deleted tunnel from the servers it was deployed to
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Deleting a tunnel only dropped the row: the generated config, the core.json
+that lists it and the systemd unit all stayed behind, so the tunnel kept
+serving users after it vanished from the panel and came back after a reboot.
+The configs also accumulate a `.bak.<epoch>` per edit that nothing ever
+removes.
+
+Deletion now takes the tunnel off every server it actually ran on: the node
+config and its backups go, core.json keeps only the configs still on disk
+(so another tunnel sharing the path is restarted into it, not stopped), and
+when nothing is left to load the unit is stopped and disabled. A server the
+tunnel never reached is left untouched — stopping it would drop whatever it
+is serving. Since cleanup disables a unit it empties, deploy enables it again
+so a redeployed tunnel survives a reboot.
+
+🤖 Generated with Codebuff
+Co-Authored-By: Codebuff <noreply@codebuff.com>
+---
+ lib/ssh.js    |  55 +++++++++++++++++++++
+ public/app.js |  11 +++--
+ server.js     | 129 ++++++++++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 189 insertions(+), 6 deletions(-)
+
+diff --git a/lib/ssh.js b/lib/ssh.js
+index ea1be11..def7177 100644
+--- a/lib/ssh.js
++++ b/lib/ssh.js
+@@ -338,6 +338,60 @@ async function hostInfo(server) {
+   return { ok: true, kernel, cores: Number(cores) || null, uptime, ip };
+ }
+ 
++/**
++ * Delete one tunnel's node config and the `.bak.*` copies next to it.
++ *
++ * Both writers keep a timestamped backup whenever they overwrite a file —
++ * `uploadFiles` on a deploy, the agent on every config change — so a tunnel
++ * that has been edited a few times leaves a pile behind. Removing the tunnel
++ * has to take the whole set, not just the file `core.json` currently loads.
++ *
++ * `deleted` names the configs that were actually present, so the caller can
++ * tell a tunnel that really ran here from one that was only *pointed* at this
++ * server — and leave the latter's service alone instead of restarting a box
++ * that is serving other tunnels.
++ */
++async function removeTunnelConfigs(server, remoteBase, relPaths) {
++  const problem = transportProblem(server);
++  if (problem) return { ok: false, error: problem };
++  const configs = relPaths.filter((rel) => rel.startsWith('configs/'));
++  if (!configs.length) {
++    return { ok: false, error: 'this tunnel produced no config file on this server' };
++  }
++  const listConfigs = () =>
++    `ls -1 ${shellQuote(`${remoteBase}/configs`)}/*.json 2>/dev/null | sed 's|.*/||' || true`;
++  const script = [
++    'set -u',
++    "echo '=== before ==='",
++    listConfigs(),
++    ...configs.map(
++      (rel) =>
++        `if [ -f ${shellQuote(`${remoteBase}/${rel}`)} ]; then echo "had:${rel}"; fi`,
++    ),
++    ...configs.map(
++      (rel) => `rm -f ${shellQuote(`${remoteBase}/${rel}`)} ${shellQuote(`${remoteBase}/${rel}`)}.bak.*`,
++    ),
++    "echo '=== after ==='",
++    listConfigs(),
++  ].join('\n');
++  const res = await sshExec(server, script, { timeout: 60000 });
++  if (res.failed) return { ok: false, error: res.stderr || 'remote delete failed' };
++  const [before, after] = res.stdout.split('=== after ===');
++  const parse = (text) =>
++    text
++      .replace('=== before ===', '')
++      .split(/\r?\n/)
++      .map((line) => line.trim())
++      .filter(Boolean);
++  const lines = parse(before);
++  return {
++    ok: true,
++    before: lines.filter((line) => !line.startsWith('had:')),
++    deleted: lines.filter((line) => line.startsWith('had:')).map((line) => line.slice(4)),
++    after: parse(after || ''),
++  };
++}
++
+ module.exports = {
+   run,
+   setProxyPortProvider,
+@@ -349,6 +403,7 @@ module.exports = {
+   serviceAction,
+   serviceStatus,
+   hostInfo,
++  removeTunnelConfigs,
+   shellQuote,
+   hasSshpass,
+   transportProblem,
+diff --git a/public/app.js b/public/app.js
+index d47621f..b805216 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -2356,10 +2356,15 @@ function afterRender() {
+   });
+   $$('[data-tn-del]').forEach((b) => {
+     b.onclick = async () => {
+-      if (!confirm('این تونل حذف شود؟')) return;
+-      await api(`/api/tunnels/${b.dataset.tnDel}`, { method: 'DELETE' });
++      if (!confirm('این تونل حذف شود؟ فایل کانفیگ و سرویسش روی سرورها هم پاک/متوقف می‌شود.')) return;
++      const r = await api(`/api/tunnels/${b.dataset.tnDel}`, { method: 'DELETE' });
+       state.tunnels = state.tunnels.filter((x) => x.id !== b.dataset.tnDel);
+-      toast('حذف شد', 'ok');
++      const failed = (r.cleanup || []).filter((row) => !row.ok);
++      if (failed.length) {
++        toast(`حذف شد، ولی پاک‌سازی روی ${failed.map((f) => f.server).join('، ')} انجام نشد`, 'err');
++      } else {
++        toast('حذف شد و فایل/سرویس روی سرورها پاک شد', 'ok');
++      }
+       render();
+     };
+   });
+diff --git a/server.js b/server.js
+index 5d1a8c7..02e332c 100644
+--- a/server.js
++++ b/server.js
+@@ -625,12 +625,128 @@ router.post('/api/tunnels/:id/regenerate', async (req, res, ctx) => {
+   sendJson(res, 200, { ok: true, tunnel: updated });
+ });
+ 
+-router.delete('/api/tunnels/:id', (req, res, ctx) => {
++/**
++ * Take a deleted tunnel off the servers it was deployed to.
++ *
++ * Deleting the row used to leave everything else behind: the generated
++ * config, the core.json that lists it and a running systemd unit. The tunnel
++ * kept serving users after it vanished from the panel, and came back after a
++ * reboot. Cleanup removes this tunnel's config plus its backups, then rewrites
++ * core.json to name only the configs that still exist on that server:
++ *
++ *  - another tunnel sharing the same install path keeps its config and the
++ *    unit is restarted into the pruned core.json,
++ *  - when nothing is left to load, core.json is removed and the unit is
++ *    stopped and disabled, so nothing can bring the deleted tunnel back.
++ *
++ * A server this tunnel never actually ran on is left untouched. Stopping or
++ * restarting it would drop the connections of whatever it *is* serving — a
++ * tunnel that names several exits only ever deployed to some of them.
++ *
++ * A server that cannot be reached is reported per server and the row is still
++ * deleted: refusing to delete would strand a tunnel whose server is gone, and
++ * the panel would keep listing something the operator already removed.
++ */
++async function removeTunnelFromServer(server, files) {
++  const base = server.waterwallPath || '/opt/waterwall';
++  const removed = await ssh.removeTunnelConfigs(server, base, files);
++  if (!removed.ok) return { ok: false, error: removed.error };
++
++  const corePath = path.posix.join(base, 'core.json');
++  const read = await ssh.readRemoteFile(server, corePath);
++  let core = null;
++  if (read.ok && read.content && read.content.trim()) {
++    try {
++      core = JSON.parse(read.content);
++    } catch {
++      core = null;
++    }
++  }
++
++  const result = { ok: true, deleted: removed.deleted };
++  const stopService = async () => {
++    const stop = await ssh.serviceAction(server, 'stop');
++    await ssh.sshExec(server, `systemctl disable ${ssh.shellQuote(server.serviceName || 'waterwall')} 2>&1`);
++    result.service = `stopped (${(stop.output || '').split(/\r?\n/)[0] || 'inactive'})`;
++  };
++
++  if (!core || !Array.isArray(core.configs)) {
++    // Nothing loads these files without a core.json. Only touch the unit when
++    // this server really held the tunnel.
++    if (removed.deleted.length) await stopService();
++    else result.service = 'not deployed here';
++    return result;
++  }
++
++  // A config that is no longer on disk must not stay in the boot list. This
++  // also drops entries left by earlier deletions, which is the only place the
++  // panel ever notices them.
++  const kept = core.configs.filter((entry) => {
++    const rel = String(entry).replace(/^\.?\//, '');
++    return removed.after.includes(path.posix.basename(rel));
++  });
++
++  if (kept.length === core.configs.length) {
++    // core.json never named this tunnel, so the running service is fine: the
++    // files (if any) are gone and there is nothing left to reload.
++    result.core = 'unchanged';
++    if (!removed.deleted.length) result.service = 'not deployed here';
++    return result;
++  }
++  if (!kept.length) {
++    await ssh.sshExec(server, `rm -f ${ssh.shellQuote(corePath)} ${ssh.shellQuote(corePath)}.bak.*`);
++    await stopService();
++    result.core = 'removed';
++    return result;
++  }
++  const written = await ssh.uploadFiles(
++    server,
++    { 'core.json': `${JSON.stringify({ ...core, configs: kept }, null, 2)}\n` },
++    base,
++  );
++  if (!written.ok) return { ok: false, error: written.error, deleted: result.deleted };
++  const restart = await ssh.serviceAction(server, 'restart');
++  result.core = 'pruned';
++  result.kept = kept;
++  result.service = restart.ok ? 'restarted' : restart.output;
++  return result;
++}
++
++async function removeTunnelFromServers(tunnel) {
++  const bundle = buildBundle(store, tunnel);
++  const targets = findTargets(tunnel);
++  const rows = [];
++  for (const side of Object.keys(bundle.bundles || {})) {
++    const files = Object.keys(bundle.bundles[side] || {});
++    if (!files.length) continue;
++    for (const server of targetsForSide(targets, side)) {
++      // Sequential on purpose: a deletion is a handful of servers and each
++      // one runs a few ssh commands; firing them in parallel buys nothing and
++      // makes a failure harder to attribute.
++      rows.push({
++        side,
++        server: server.name,
++        host: server.host,
++        ...(await removeTunnelFromServer(server, files)),
++      });
++    }
++  }
++  return rows;
++}
++
++router.delete('/api/tunnels/:id', async (req, res, ctx) => {
+   if (guard(req, res)) return;
++  const tunnel = store.getTunnel(ctx.params.id);
++  if (!tunnel) return sendError(res, 404, 'tunnel not found');
++  const cleanup = await removeTunnelFromServers(tunnel);
+   const ok = store.deleteTunnel(ctx.params.id);
+   if (!ok) return sendError(res, 404, 'tunnel not found');
++  const failed = cleanup.filter((row) => !row.ok);
++  // A failed cleanup is the interesting case: it means a file and a service
++  // are still on a box. Keep it in the audit log so it can be repeated by hand.
++  if (failed.length) store.log({ type: 'tunnel.cleanup.failed', tunnelId: tunnel.id, cleanup });
+   broadcast('tunnels', store.listTunnels());
+-  sendJson(res, 200, { ok: true });
++  sendJson(res, 200, { ok: true, cleanup, failed });
+ });
+ 
+ /** Generate + validate the WaterWall files without touching any server. */
+@@ -743,7 +859,14 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
+         per.push({ ok: false, server: server.name, error: uploaded.error });
+         continue;
+       }
+-      const svc = body.restart === false ? { ok: true, output: 'restart skipped' } : await ssh.serviceAction(server, 'restart');
++      let svc = { ok: true, output: 'restart skipped' };
++      if (body.restart !== false) {
++        // Cleanup disables a unit it empties, so make sure a redeploy turns it
++        // back on: a tunnel that only restarts would vanish on the next reboot.
++        const svcName = server.serviceName || 'waterwall';
++        await ssh.sshExec(server, `systemctl enable ${ssh.shellQuote(svcName)} 2>&1`);
++        svc = await ssh.serviceAction(server, 'restart');
++      }
+       per.push({ ok: true, server: server.name, uploaded: Object.keys(files), service: svc });
+     }
+     results[side] =
+-- 
+2.43.0
+
