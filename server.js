@@ -13,6 +13,7 @@ const protoscan = require('./lib/protoscan');
 const versions = require('./lib/versions');
 const netcheck = require('./lib/netcheck');
 const certs = require('./lib/certs');
+const linkHealth = require('./lib/links');
 const { Outbound } = require('./lib/outbound');
 const { resolveTargets, targetsForSide, isTarget } = require('./lib/targets');
 const { Router, sendJson, sendError, sendText, parseJsonBody, serveStatic, parseUrl } = require('./lib/http');
@@ -291,6 +292,29 @@ router.post('/api/restore', async (req, res) => {
     sendJson(res, 200, { ok: true, ...counts, outbound: restoredOutbound });
   } catch (err) {
     sendError(res, 400, err.message);
+  }
+});
+
+/**
+ * Health of every tunnel that faces a CDN.
+ *
+ * The probe runs from the panel — the Iran box — so it measures the half that
+ * fails silently: CDN edge to origin. A tunnel whose configs uploaded cleanly
+ * still shows up as "قطع" here when the CDN cannot reach the origin port, which
+ * is exactly the moment the operator needs to know.
+ *
+ * `?fresh=1` is the "check again" button; otherwise the short cache in
+ * lib/links keeps a dashboard that re-renders on every event from turning into
+ * a request loop against the CDN.
+ */
+router.get('/api/links', async (req, res) => {
+  if (guard(req, res)) return;
+  const fresh = parseUrl(req).searchParams.get('fresh') === '1';
+  try {
+    const rows = await linkHealth.checkTunnels(store.listTunnels(), { fresh });
+    sendJson(res, 200, { ok: true, links: rows, outbound: outbound.status(), checkedAt: new Date().toISOString() });
+  } catch (err) {
+    sendError(res, 500, err.message);
   }
 });
 

@@ -11,6 +11,7 @@ const { buildBundle, resolveOptions } = require('../lib/build');
 const { resolveTargets, isTarget } = require('../lib/targets');
 const { Store } = require('../lib/store');
 const { validateBundle, preprocessConfig } = require('../lib/generator');
+const linkHealth = require('../lib/links');
 const { transportProblem } = require('../lib/ssh');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -1697,6 +1698,125 @@ function panelStateTests() {
   store.importState(original);
 }
 
+// ---- CDN link health (dashboard) -----------------------------------------
+function linkTests() {
+  const cases = [
+    [
+      'only tunnels that face a CDN are treated as links',
+      () => {
+        assert.strictEqual(linkHealth.isCdnTunnel({ template: 'cdn-reverse-wss' }), true);
+        assert.strictEqual(linkHealth.isCdnTunnel({ template: 'cdn-reverse-split' }), true);
+        assert.strictEqual(linkHealth.isCdnTunnel({ template: 'tcp-forward' }), false);
+        assert.strictEqual(linkHealth.isCdnTunnel({ template: 'tcp-forward', options: { cdnHost: 'a.example' } }), true);
+        assert.strictEqual(linkHealth.isCdnTunnel({ template: 'cdn-reverse-wss', options: { cdnHost: '  ' } }), true);
+      },
+    ],
+    [
+      'a pinned edge address changes the connection target, not Host/SNI',
+      () => {
+        const link = linkHealth.describe({
+          id: 't1',
+          name: 'Arvan',
+          template: 'cdn-reverse-wss',
+          options: { cdnHost: 'cdn.example.com', cdnPort: 8443, wsPath: '/api/v1/stream', edgeAddress: '203.0.113.9' },
+        });
+        assert.strictEqual(link.host, 'cdn.example.com');
+        assert.strictEqual(link.connectHost, '203.0.113.9');
+        assert.strictEqual(link.port, 8443);
+        assert.strictEqual(link.path, '/api/v1/stream');
+        assert.strictEqual(link.kind, 'ws');
+      },
+    ],
+    [
+      'split-mode placeholders become concrete values',
+      () => {
+        const materialised = linkHealth.materialisePath('/api/{direction}/{id}');
+        assert.ok(materialised.startsWith('/api/up/'), materialised);
+        assert.ok(!materialised.includes('{'), materialised);
+        assert.ok(!linkHealth.materialisePath('/x/{id}').includes('{'));
+        assert.strictEqual(linkHealth.materialisePath('/api/v1/sync'), '/api/v1/sync');
+      },
+    ],
+    [
+      'a WebSocket link is healthy only on 101',
+      () => {
+        assert.strictEqual(linkHealth.classify('ws', 101).status, 'up');
+        // The 502/520 family is what an edge returns when it cannot reach the
+        // origin; a plain GET on a healthy WebSocket tunnel produces it too, so
+        // the probe must never treat it as healthy.
+        assert.strictEqual(linkHealth.classify('ws', 502).status, 'down');
+        assert.strictEqual(linkHealth.classify('ws', 520).status, 'down');
+        assert.strictEqual(linkHealth.classify('ws', 404).status, 'warn');
+        assert.strictEqual(linkHealth.classify('ws', 200).status, 'warn');
+      },
+    ],
+    [
+      'a split link is healthy on any non-5xx answer',
+      () => {
+        assert.strictEqual(linkHealth.classify('split', 200).status, 'up');
+        assert.strictEqual(linkHealth.classify('split', 404).status, 'warn');
+        assert.strictEqual(linkHealth.classify('split', 522).status, 'down');
+        assert.strictEqual(linkHealth.classify('split', 0).status, 'error');
+      },
+    ],
+    [
+      'a disabled tunnel is reported as off without a probe',
+      async () => {
+        const rows = await linkHealth.checkTunnels([
+          { id: 'off', name: 'off', template: 'cdn-reverse-wss', enabled: false, options: { cdnHost: 'x.example' } },
+        ]);
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0].status, 'off');
+        assert.strictEqual(rows[0].label, 'خاموش');
+      },
+    ],
+    [
+      'a link with no CDN domain is not probed',
+      async () => {
+        const rows = await linkHealth.checkTunnels([
+          { id: 'empty', name: 'empty', template: 'cdn-reverse-wss', enabled: true, options: {} },
+        ]);
+        assert.strictEqual(rows[0].status, 'empty');
+      },
+    ],
+  ];
+
+  let done = 0;
+  const pending = [];
+  for (const [label, fn] of cases) {
+    try {
+      const r = fn();
+      if (r && typeof r.then === 'function') {
+        pending.push(
+          r.then(
+            () => {
+              pass += 1;
+              console.log(`  ✓ ${label}`);
+            },
+            (err) => {
+              fail += 1;
+              failures.push(`${label}: ${err.message}`);
+              console.log(`  ✗ ${label}: ${err.message}`);
+            },
+          ),
+        );
+      } else {
+        pass += 1;
+        console.log(`  ✓ ${label}`);
+      }
+      done += 1;
+    } catch (err) {
+      fail += 1;
+      failures.push(`${label}: ${err.message}`);
+      console.log(`  ✗ ${label}: ${err.message}`);
+    }
+  }
+  assert.strictEqual(done, cases.length, 'every link case ran');
+  return Promise.all(pending);
+}
+
+const linkPending = linkTests();
+
 const securityTestsPending = securityTests();
 
 panelStateTests();
@@ -1716,7 +1836,7 @@ fs.rmSync(tmp, { recursive: true, force: true });
 // Both pending suites are awaited before the summary. Reporting failures (and
 // exiting) while they are still running would kill them and print a count that
 // does not include their results.
-Promise.all([netcheckPending, securityTestsPending])
+Promise.all([netcheckPending, securityTestsPending, linkPending])
   .then(() => {
     console.log('');
     console.log(`  ${pass} passed, ${fail} failed (${usedVariables} config variables resolved)`);

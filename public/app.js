@@ -11,6 +11,11 @@ const state = {
   certs: null,
   outbound: null,
   outboundLog: '',
+  links: null,        // CDN link checks, null until the first probe returns
+  linksBusy: false,
+  linksError: null,
+  linksCheckedAt: null,
+  linksProbed: false,
   certsPageToken: 0,
   lastCertPage: -1,
   lastRenderedPage: null,
@@ -262,6 +267,10 @@ function render() {
   if (state.lastRenderedPage !== state.page) {
     state.lastRenderedPage = state.page;
     state.certsPageToken += 1;
+    // A CDN link is only worth probing when its card is on screen. Leaving the
+    // dashboard clears the flag so coming back re-checks instead of showing a
+    // stale verdict from an hour ago.
+    if (state.page !== 'dashboard') state.linksProbed = false;
   }
   const fns = {
     dashboard: pageDashboard,
@@ -280,6 +289,97 @@ function render() {
 }
 
 // =============================================================== dashboard
+/**
+ * The panel's own way out, at a glance.
+ *
+ * This is the first thing to look at when "nothing deploys": if the panel is
+ * going direct and the Iran box has lost its international route, every SSH and
+ * SCP behind it fails, and the tunnel list looks fine while nothing moves.
+ */
+function dashOutboundCard() {
+  const o = state.outbound || {};
+  const running = Boolean(o.running);
+  const binary = o.binary || '';
+  const port = Number(o.port) || 1081;
+  return `
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <h3 style="margin:0">🌐 مسیر خروجی پنل</h3>
+        <span class="badge ${running ? 'ok' : 'mute'}">${running ? 'از پروکسی' : 'مستقیم'}</span>
+      </div>
+      <div class="chain mt">
+        ${
+          running
+            ? `SSH/SCP پنل <span class="muted">→</span> <span class="mono ltr">127.0.0.1:${port}</span> <span class="muted">→</span> Xray`
+            : `SSH/SCP پنل <span class="muted">→</span> اینترنت مستقیم سرور ایران`
+        }
+      </div>
+      <p class="small muted" style="line-height:2;margin-top:12px">
+        ${
+          running
+            ? 'همهٔ اتصال‌های پنل به سرورها از این پروکسی می‌گذرد؛ اگر اینترنت بین‌الملل سرور ایران قطع شود، اعمال کانفیگ از همین مسیر انجام می‌شود.'
+            : 'پنل مستقیم به سرورها وصل می‌شود. اگر اینترنت سرور ایران قطع شد، از این‌جا یک کانفیگ Xray بدهید تا SSHها از آن مسیر بروند.'
+        }
+      </p>
+      <div class="small" style="line-height:2">
+        <div>باینری Xray: ${binary ? `<span class="mono ltr">${esc(binary)}</span> <span class="badge ${o.binaryPresent ? 'ok' : 'err'}">${o.binaryPresent ? 'هست' : 'پیدا نشد'}</span>` : '<span class="muted">تنظیم نشده</span>'}</div>
+        ${running && o.since ? `<div class="muted">فعال از ${esc(fmtDate(o.since))}</div>` : ''}
+      </div>
+      ${o.lastError ? `<div class="err-box mt">${esc(o.lastError)}</div>` : ''}
+      <div class="row mt"><button id="dashOutbound">مدیریت مسیر</button></div>
+    </div>`;
+}
+
+/**
+ * The CDN links, each with a real verdict from a request through the CDN.
+ *
+ * "Uploaded" is not "working": the exit dials the CDN and the CDN dials the
+ * origin, and that second hop is the one that quietly breaks. The badge here is
+ * the answer from that hop, not a guess from the stored config.
+ */
+function dashCdnCard() {
+  const rows = state.links;
+  let body;
+  if (state.linksError) {
+    body = `<div class="err-box">${esc(state.linksError)}</div>`;
+  } else if (state.linksBusy && !rows) {
+    body = '<div class="small muted" style="padding:14px 0">در حال بررسی لینک‌ها…</div>';
+  } else if (!rows || !rows.length) {
+    body = `<div class="empty" style="padding:14px">
+      <span class="small muted">تونلی پشت CDN ثبت نشده است.</span>
+    </div>`;
+  } else {
+    body = `<table class="mt"><thead><tr><th>لینک</th><th>آدرس</th><th>وضعیت</th></tr></thead><tbody>
+      ${rows
+        .map(
+          (l) => `<tr>
+            <td><strong>${esc(l.name)}</strong><div class="small muted ltr">${l.kind === 'ws' ? 'WebSocket' : 'split'}</div></td>
+            <td class="ltr small">${esc(l.host || '—')}${l.host ? `:${l.port}` : ''}<div class="small muted">${esc(l.path)}</div></td>
+            <td>
+              <span class="badge ${esc(l.cls || 'mute')}">${esc(l.label || '?')}</span>
+              ${l.httpStatus ? `<div class="small muted ltr">HTTP ${l.httpStatus}${l.ms != null ? ` · ${l.ms}ms` : ''}</div>` : ''}
+              <div class="small muted">${esc(l.detail || '')}</div>
+            </td>
+          </tr>`,
+        )
+        .join('')}
+    </tbody></table>`;
+  }
+  return `
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <h3 style="margin:0">☁️ لینک‌های CDN</h3>
+        <button class="sm" id="dashLinksCheck" ${state.linksBusy ? 'disabled' : ''}>🔄 بررسی</button>
+      </div>
+      ${body}
+      <p class="small muted" style="line-height:2;margin-top:12px">
+        بررسی از خود سرور ایران انجام می‌شود: پنل <span class="muted">→</span> لبهٔ CDN <span class="muted">→</span> origin.
+        برای تونل WebSocket فقط <span class="mono">101</span> سالم است؛ پاسخ <span class="mono">502/520</span> یعنی CDN به origin نمی‌رسد.
+        ${state.linksCheckedAt && !state.linksBusy ? `<br>آخرین بررسی: ${esc(fmtDate(state.linksCheckedAt))}` : ''}
+      </p>
+    </div>`;
+}
+
 function pageDashboard() {
   const online = state.servers.filter((s) => s.lastStatus && Date.now() - new Date(s.lastSeen).getTime() < 90000);
   const iran = state.servers.find((s) => s.role === 'iran');
@@ -300,6 +400,11 @@ function pageDashboard() {
     <div class="stat"><div class="k">سرویس واتروال</div><div class="v" style="font-size:16px">${
       online.length ? '🟢 فعال' : state.servers.length ? '⚪️ نامشخص' : '—'
     }</div><div class="s">گزارش ایجنت</div></div>
+  </div>
+
+  <div class="grid c2 mb">
+    ${dashOutboundCard()}
+    ${dashCdnCard()}
   </div>
 
   <div class="grid c2">
@@ -2177,7 +2282,15 @@ function afterRender() {
   $('#quickNew')?.addEventListener('click', () => go('new'));
   $('#dashServers')?.addEventListener('click', () => go('servers'));
   $('#dashTunnels')?.addEventListener('click', () => go('tunnels'));
+  $('#dashOutbound')?.addEventListener('click', () => go('outbound'));
+  $('#dashLinksCheck')?.addEventListener('click', () => loadLinks(true));
   if ($('#dashLog')) loadEvents();
+  // Probing costs a round trip through the CDN, so it runs once per visit to
+  // the dashboard rather than on every render the event stream triggers.
+  if (state.page === 'dashboard' && !state.linksProbed) {
+    state.linksProbed = true;
+    loadLinks(false);
+  }
 
   // servers
   $('#addServer')?.addEventListener('click', () => {
@@ -2546,6 +2659,31 @@ function applyWhenConditions(tpl) {
 }
 
 // -------------------------------------------------------------- event log
+/**
+ * Fetch the CDN link verdicts.
+ *
+ * `fresh` is the "check again" path: it re-probes even when the server still has
+ * a recent cached answer. The busy flag is what the disabled button and the
+ * "checking…" row read, so a double click cannot start two rounds.
+ */
+async function loadLinks(fresh = false) {
+  if (state.linksBusy) return;
+  state.linksBusy = true;
+  state.linksError = null;
+  if (state.page === 'dashboard') render();
+  try {
+    const r = await api(`/api/links${fresh ? '?fresh=1' : ''}`);
+    state.links = r.links || [];
+    state.linksCheckedAt = r.checkedAt || new Date().toISOString();
+    if (r.outbound) state.outbound = r.outbound;
+  } catch (err) {
+    state.linksError = err.message;
+  } finally {
+    state.linksBusy = false;
+    if (state.page === 'dashboard') render();
+  }
+}
+
 async function loadEvents() {
   const host = $('#dashLog');
   if (!host) return;
