@@ -655,6 +655,21 @@ for (const tpl of templates.ALL) {
   }
   assert.ok(sawCdnWhitelist, 'the raw CDN whitelist IP must gain /32 even with unquoted variables present');
 
+  // The reverse templates put their peer list in `$variables$`, and the literal
+  // normaliser skips variable references. So the value has to be a CIDR before
+  // it becomes a variable, or the core refuses to start with "invalid whitelist".
+  const revRaw = store.addTunnel({
+    name: 'raw-ip-reverse',
+    template: 'reverse-tls',
+    targetServers: { iran: 'srv-iran', foreign: 'srv-foreign' },
+    options: resolveOptions('reverse-tls', { whitelist: ['203.0.113.21'] }),
+  });
+  const revBuilt = buildBundle(store, store.getTunnel(revRaw.id));
+  assert.strictEqual(revBuilt.ok, true, revBuilt.problems.join('; '));
+  const revCfg = JSON.parse(preprocessConfig(revBuilt.bundles.iran['configs/reverse-tls.json']).text);
+  const revListener = revCfg.nodes.find((n) => n.name === 'germany_reverse_tls_inbound');
+  assert.deepStrictEqual(revListener.settings.whitelist, ['203.0.113.21/32']);
+
   const varsTunnel = store.addTunnel({
     name: 'variable-ip-lists',
     template: 'relay-reality',
@@ -1097,6 +1112,49 @@ function certTests() {
     if (source.includes('/root/fullchain.pem') || source.includes('/root/privkey.pem')) offenders.push(file);
   }
   assert.deepStrictEqual(offenders, [], 'these template files bypass the managed certificate path: ' + offenders.join(', '));
+
+  // A template's own certificate paths are what its generated config reads, so
+  // the panel has to issue the certificate there. Writing it to the global
+  // default instead leaves the service unable to open its cert file.
+  const calls = [];
+  const fakeExec = async (server, script) => {
+    calls.push(script);
+    if (script.includes('openssl x509 -in')) {
+      return { stdout: 'MISSING', stderr: '', failed: false };
+    }
+    return {
+      stdout: 'subject=CN = uk.example.com\nnotAfter=Dec  1 00:00:00 2029 GMT\nFingerprint=AA:BB',
+      stderr: '',
+      failed: false,
+    };
+  };
+
+  return certs
+    .ensure(fakeExec, { id: 'x', host: '10.0.0.1' }, {
+      domain: 'uk.example.com',
+      mode: 'self-signed',
+      certPath: '/opt/waterwall-london/certs/fullchain.pem',
+      keyPath: '/opt/waterwall-london/certs/key.pem',
+    })
+    .then((r) => {
+      assert.strictEqual(r.ok, true);
+      assert.strictEqual(r.certPath, '/opt/waterwall-london/certs/fullchain.pem');
+      const issued = calls.find((c) => c.includes('openssl req -x509'));
+      assert.ok(issued, 'the self-signed issuance command ran');
+      assert.ok(issued.includes('/opt/waterwall-london/certs/fullchain.pem'), 'cert written to the tunnel path');
+      assert.ok(issued.includes('/opt/waterwall-london/certs/key.pem'), 'key written to the tunnel path');
+      assert.ok(
+        issued.includes("install -d -m 0755 '/opt/waterwall-london/certs'"),
+        'the parent directory is created, not the global one',
+      );
+      pass += 1;
+      console.log('  ✓ a certificate is issued to the path the tunnel config reads');
+    })
+    .catch((err) => {
+      fail += 1;
+      failures.push(`certificate paths: ${err.message}`);
+      console.log(`  ✗ a certificate is issued to the path the tunnel config reads: ${err.message}`);
+    });
 }
 /** Template id -> file, following the mapping in lib/templates/index.js. */
 function idToFile(id) {
@@ -1820,7 +1878,7 @@ const linkPending = linkTests();
 const securityTestsPending = securityTests();
 
 panelStateTests();
-certTests();
+const certPending = certTests();
 httpTransportTests();
 bridgeRuleTests();
 transportTests();
@@ -1836,7 +1894,7 @@ fs.rmSync(tmp, { recursive: true, force: true });
 // Both pending suites are awaited before the summary. Reporting failures (and
 // exiting) while they are still running would kill them and print a count that
 // does not include their results.
-Promise.all([netcheckPending, securityTestsPending, linkPending])
+Promise.all([netcheckPending, securityTestsPending, linkPending, certPending])
   .then(() => {
     console.log('');
     console.log(`  ${pass} passed, ${fail} failed (${usedVariables} config variables resolved)`);

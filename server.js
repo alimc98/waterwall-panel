@@ -678,11 +678,17 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
     if (target && domain && certs.validateDomain(domain).ok) {
       const mode = tunnel.options?.certMode || 'auto';
       if (mode !== 'none') {
+        // The tunnel's own cert paths are what its generated config reads, so
+        // the certificate has to land exactly there. Issuing to the global
+        // default while the config points at a per-tunnel path is a service
+        // that refuses to start with "No such file or directory".
         const result = await certs.ensure((sv, c, o) => ssh.sshExec(sv, c, o), target, {
           domain,
           mode,
           email: tunnel.options?.certEmail || '',
           serverIp: target.host,
+          certPath: tunnel.options?.certPath || undefined,
+          keyPath: tunnel.options?.keyPath || undefined,
         });
         if (result.ok) {
           certificate = certStore.put({
