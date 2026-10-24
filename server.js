@@ -14,6 +14,8 @@ const versions = require('./lib/versions');
 const netcheck = require('./lib/netcheck');
 const certs = require('./lib/certs');
 const linkHealth = require('./lib/links');
+const isolate = require('./lib/isolate');
+const portfix = require('./lib/portfix');
 const { Outbound } = require('./lib/outbound');
 const { resolveTargets, targetsForSide, isTarget } = require('./lib/targets');
 const { Router, sendJson, sendError, sendText, parseJsonBody, serveStatic, parseUrl } = require('./lib/http');
@@ -625,12 +627,142 @@ router.post('/api/tunnels/:id/regenerate', async (req, res, ctx) => {
   sendJson(res, 200, { ok: true, tunnel: updated });
 });
 
-router.delete('/api/tunnels/:id', (req, res, ctx) => {
+/**
+ * Take a deleted tunnel off the servers it was deployed to.
+ *
+ * Deleting the row used to leave everything else behind: the generated
+ * config, the core.json that lists it and a running systemd unit. The tunnel
+ * kept serving users after it vanished from the panel, and came back after a
+ * reboot. Cleanup removes this tunnel's config plus its backups, then rewrites
+ * core.json to name only the configs that still exist on that server:
+ *
+ *  - another tunnel sharing the same install path keeps its config and the
+ *    unit is restarted into the pruned core.json,
+ *  - when nothing is left to load, core.json is removed and the unit is
+ *    stopped and disabled, so nothing can bring the deleted tunnel back.
+ *
+ * A server this tunnel never actually ran on is left untouched. Stopping or
+ * restarting it would drop the connections of whatever it *is* serving — a
+ * tunnel that names several exits only ever deployed to some of them.
+ *
+ * A server that cannot be reached is reported per server and the row is still
+ * deleted: refusing to delete would strand a tunnel whose server is gone, and
+ * the panel would keep listing something the operator already removed.
+ */
+async function removeTunnelFromServer(server, files) {
+  const base = server.waterwallPath || '/opt/waterwall';
+  const removed = await ssh.removeTunnelConfigs(server, base, files);
+  if (!removed.ok) return { ok: false, error: removed.error };
+
+  const corePath = path.posix.join(base, 'core.json');
+  const read = await ssh.readRemoteFile(server, corePath);
+  let core = null;
+  if (read.ok && read.content && read.content.trim()) {
+    try {
+      core = JSON.parse(read.content);
+    } catch {
+      core = null;
+    }
+  }
+
+  const result = { ok: true, deleted: removed.deleted };
+  const stopService = async () => {
+    const stop = await ssh.serviceAction(server, 'stop');
+    await ssh.sshExec(server, `systemctl disable ${ssh.shellQuote(server.serviceName || 'waterwall')} 2>&1`);
+    result.service = `stopped (${(stop.output || '').split(/\r?\n/)[0] || 'inactive'})`;
+  };
+
+  if (!core || !Array.isArray(core.configs)) {
+    // Nothing loads these files without a core.json. Only touch the unit when
+    // this server really held the tunnel.
+    if (removed.deleted.length) await stopService();
+    else result.service = 'not deployed here';
+    return result;
+  }
+
+  // A config that is no longer on disk must not stay in the boot list. This
+  // also drops entries left by earlier deletions, which is the only place the
+  // panel ever notices them.
+  const kept = core.configs.filter((entry) => {
+    const rel = String(entry).replace(/^\.?\//, '');
+    return removed.after.includes(path.posix.basename(rel));
+  });
+
+  if (kept.length === core.configs.length) {
+    // core.json never named this tunnel, so the running service is fine: the
+    // files (if any) are gone and there is nothing left to reload.
+    result.core = 'unchanged';
+    if (!removed.deleted.length) result.service = 'not deployed here';
+    return result;
+  }
+  if (!kept.length) {
+    await ssh.sshExec(server, `rm -f ${ssh.shellQuote(corePath)} ${ssh.shellQuote(corePath)}.bak.*`);
+    await stopService();
+    result.core = 'removed';
+    return result;
+  }
+  const written = await ssh.uploadFiles(
+    server,
+    { 'core.json': `${JSON.stringify({ ...core, configs: kept }, null, 2)}\n` },
+    base,
+  );
+  if (!written.ok) return { ok: false, error: written.error, deleted: result.deleted };
+  const restart = await ssh.serviceAction(server, 'restart');
+  result.core = 'pruned';
+  result.kept = kept;
+  result.service = restart.ok ? 'restarted' : restart.output;
+  return result;
+}
+
+async function removeTunnelFromServers(tunnel) {
+  const bundle = buildBundle(store, tunnel);
+  const targets = findTargets(tunnel);
+  const rows = [];
+  for (const side of Object.keys(bundle.bundles || {})) {
+    const files = Object.keys(bundle.bundles[side] || {});
+    if (!files.length) continue;
+    for (const server of targetsForSide(targets, side)) {
+      // Sequential on purpose: a deletion is a handful of servers and each
+      // one runs a few ssh commands; firing them in parallel buys nothing and
+      // makes a failure harder to attribute.
+      rows.push({
+        side,
+        server: server.name,
+        host: server.host,
+        ...(await removeTunnelFromServer(server, files)),
+      });
+    }
+  }
+  return rows;
+}
+
+router.delete('/api/tunnels/:id', async (req, res, ctx) => {
   if (guard(req, res)) return;
+  const tunnel = store.getTunnel(ctx.params.id);
+  if (!tunnel) return sendError(res, 404, 'tunnel not found');
+  const cleanup = await removeTunnelFromServers(tunnel);
   const ok = store.deleteTunnel(ctx.params.id);
   if (!ok) return sendError(res, 404, 'tunnel not found');
+  // Isolated service records exist only for this tunnel. Removing the tunnel's
+  // configs above already stopped their units; drop the now-unreferenced
+  // records so they do not linger as fake "servers" in the panel.
+  const remaining = store.listTunnels();
+  const referenced = new Set();
+  for (const other of remaining) {
+    const t = other?.targetServers || {};
+    for (const id of [t.iran, t.relay, ...(Array.isArray(t.foreign) ? t.foreign : [t.foreign])]) {
+      if (id) referenced.add(id);
+    }
+  }
+  for (const record of store.listServers()) {
+    if (record.clonedFor === tunnel.id && !referenced.has(record.id)) store.deleteServer(record.id);
+  }
+  const failed = cleanup.filter((row) => !row.ok);
+  // A failed cleanup is the interesting case: it means a file and a service
+  // are still on a box. Keep it in the audit log so it can be repeated by hand.
+  if (failed.length) store.log({ type: 'tunnel.cleanup.failed', tunnelId: tunnel.id, cleanup });
   broadcast('tunnels', store.listTunnels());
-  sendJson(res, 200, { ok: true });
+  sendJson(res, 200, { ok: true, cleanup, failed });
 });
 
 /** Generate + validate the WaterWall files without touching any server. */
@@ -645,10 +777,10 @@ router.post('/api/tunnels/:id/preview', async (req, res, ctx) => {
 /** Deploy the generated bundle over SSH to the selected servers. */
 router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   if (guard(req, res)) return;
-  const tunnel = store.getTunnel(ctx.params.id);
+  let tunnel = store.getTunnel(ctx.params.id);
   if (!tunnel) return sendError(res, 404, 'tunnel not found');
   const body = await parseJsonBody(req);
-  const bundle = buildBundle(store, tunnel);
+  let bundle = buildBundle(store, tunnel);
   if (bundle.problems.length) {
     return sendError(res, 400, 'generated configuration is invalid', { problems: bundle.problems });
   }
@@ -657,12 +789,62 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   // reverse tunnel, a single-sided middle relay and a three-sided relay tunnel
   // all work without a flag.
   const sides = Array.isArray(body.sides) && body.sides.length ? body.sides : Object.keys(bundle.bundles);
+  const deploySides = sides.filter((side) => bundle.bundles[side]);
+  /**
+   * Another enabled tunnel already using one of these server records means the
+   * two would share a unit and a core.json: whichever applies last wins, and
+   * the other disappears on the next restart. Give this tunnel its own service
+   * on the same host before writing anything.
+   */
+  const isolation = body.dryRun
+    ? {
+        ok: true,
+        plan: isolate.isolationPlan(store, tunnel, deploySides),
+        clones: [],
+        skipped: [],
+        changed: false,
+      }
+    : await isolate.isolateTargets(store, tunnel, deploySides, ssh);
+  if (!body.dryRun && isolation.changed) {
+    tunnel = store.updateTunnel(tunnel.id, { targetServers: isolation.targets });
+    broadcast('servers', store.listServers().map(redact));
+    broadcast('tunnels', store.listTunnels());
+    const rebuilt = buildBundle(store, tunnel);
+    if (rebuilt.problems.length) {
+      return sendError(res, 400, 'generated configuration is invalid after service isolation', {
+        problems: rebuilt.problems,
+        isolation,
+      });
+    }
+    bundle = rebuilt;
+  }
+  /**
+   * A separate unit solves the core.json overwrite, but not the bind: two
+   * WaterWall processes on one box cannot share port 443, and the second one
+   * silently fails to come up. Move the newcomer to a free port before it is
+   * written, so the tunnel works instead of replacing the first one.
+   */
+  const portFix = await resolvePorts(store, tunnel, deploySides, bundle, ssh);
+  if (portFix.changed && !body.dryRun) {
+    tunnel = store.updateTunnel(tunnel.id, { options: { ...(tunnel.options || {}), ...portFix.options } });
+    broadcast('tunnels', store.listTunnels());
+    const rebuilt = buildBundle(store, tunnel);
+    if (rebuilt.problems.length) {
+      return sendError(res, 400, 'generated configuration is invalid after port allocation', {
+        problems: rebuilt.problems,
+        isolation,
+        portFix,
+      });
+    }
+    bundle = rebuilt;
+  }
   const targets = findTargets(tunnel);
   const servers = {
     iran: targets.iran,
     relay: targets.relay,
     foreign: targets.foreign[0] || null,
   };
+  const blocked = new Map(isolation.skipped.map((row) => [`${row.side}:${row.server.id}`, row.reason]));
 
   // A tunnel with a domain gets its certificate handled before anything is
   // written, so the service never starts against a missing or expired file.
@@ -738,12 +920,24 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
     }
     const per = [];
     for (const server of fleet) {
+      const why = blocked.get(`${side}:${server.id}`);
+      if (why) {
+        per.push({ ok: false, server: server.name, error: why });
+        continue;
+      }
       const uploaded = await ssh.uploadFiles(server, files, server.waterwallPath);
       if (!uploaded.ok) {
         per.push({ ok: false, server: server.name, error: uploaded.error });
         continue;
       }
-      const svc = body.restart === false ? { ok: true, output: 'restart skipped' } : await ssh.serviceAction(server, 'restart');
+      let svc = { ok: true, output: 'restart skipped' };
+      if (body.restart !== false) {
+        // Cleanup disables a unit it empties, so make sure a redeploy turns it
+        // back on: a tunnel that only restarts would vanish on the next reboot.
+        const svcName = server.serviceName || 'waterwall';
+        await ssh.sshExec(server, `systemctl enable ${ssh.shellQuote(svcName)} 2>&1`);
+        svc = await ssh.serviceAction(server, 'restart');
+      }
       per.push({ ok: true, server: server.name, uploaded: Object.keys(files), service: svc });
     }
     results[side] =
@@ -774,14 +968,59 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
     }
   }
 
-  sendJson(res, 200, { ok: Object.values(results).every((r) => r.ok), results, reachability, certificate });
+  sendJson(res, 200, {
+    ok: Object.values(results).every((r) => r.ok),
+    results,
+    reachability,
+    certificate,
+    isolation,
+    portFix,
+  });
 });
+
+/**
+ * Move the listening ports of a tunnel out of the way of its neighbours.
+ *
+ * Two tunnels can share a box and still have to share the numbers their
+ * clients dial. The check is per side and per server: a side may point at a
+ * fleet of exits, and the port has to be free on every one of them.
+ *
+ * The result is reported back so the UI can say what moved and why. A dry
+ * run reports the same thing without touching the store or the servers.
+ *
+ * @returns {Promise<{changed: boolean, options: Object, moved: Array, problems: Array}>}
+ */
+async function resolvePorts(store, tunnel, sides, bundle, ssh) {
+  const result = { changed: false, options: { ...(tunnel.options || {}) }, moved: [], problems: [] };
+  const targets = findTargets(tunnel);
+  for (const side of sides) {
+    const fleet = targetsForSide(targets, side);
+    if (!fleet.length) continue;
+    for (const server of fleet) {
+      const fix = await portfix.resolvePortConflicts(store, tunnel, server, side, bundle, ssh);
+      if (fix.moved.length) {
+        Object.assign(result.options, fix.options);
+        result.moved.push(...fix.moved.map((m) => ({ ...m, server: server.name })));
+        result.changed = true;
+      }
+    }
+  }
+  // Only the keys that actually moved are reported, so the caller can merge
+  // them into the stored options without touching anything else.
+  if (result.changed) {
+    const movedKeys = new Set(result.moved.map((m) => m.key));
+    for (const key of Object.keys(result.options)) {
+      if (!movedKeys.has(key)) delete result.options[key];
+    }
+  }
+  return result;
+}
 
 /**
  * Which side of a built bundle holds the TlsServer node.
  *
- * The certificate goes there. Most templates put it on the foreign box, but the
- * reverse templates put the server side on the Iran box instead, so the side is
+ * The certificate goes there. Most templates put it on the foreign box, but
+ * the reverse templates put the server side on the Iran box instead, so the side is
  * decided by reading the node types rather than assuming.
  */
 function tlsServerSide(bundle) {

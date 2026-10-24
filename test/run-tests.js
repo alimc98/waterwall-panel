@@ -20,6 +20,19 @@ const path = require('node:path');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wwpanel-test-'));
 const store = new Store(tmp);
 
+/**
+ * Config filenames carry a per-tunnel id suffix, so tests cannot hard-code the
+ * scenario name. This finds the file a template emitted for one side.
+ */
+function configText(built, side, base) {
+  const files = built.bundles[side] || {};
+  const key = Object.keys(files).find(
+    (file) => file === `configs/${base}.json` || file.startsWith(`configs/${base}-`),
+  );
+  assert.ok(key, `no config "${base}" in ${side}: ${Object.keys(files).join(', ')}`);
+  return files[key];
+}
+
 store.addServer({ id: 'srv-iran', name: 'Iran', role: 'iran', host: '10.0.0.1' });
 store.addServer({ id: 'srv-relay', name: 'Relay', role: 'relay', host: '10.0.0.2' });
 store.addServer({ id: 'srv-foreign', name: 'Foreign', role: 'foreign', host: '198.51.100.7' });
@@ -100,7 +113,7 @@ for (const tpl of templates.ALL) {
   assert.strictEqual(built.ok, true);
   assert.deepStrictEqual(built.options.foreignHosts, ['198.51.100.1', '198.51.100.2', '198.51.100.3']);
 
-  const iranCfg = built.bundles.iran['configs/reverse-reality.json'];
+  const iranCfg = configText(built, 'iran', 'reverse-reality');
   const resolved = preprocessConfig(iranCfg);
   assert.deepStrictEqual(resolved.problems, []);
   for (const host of built.options.foreignHosts) {
@@ -126,7 +139,7 @@ for (const tpl of templates.ALL) {
   });
   const one = buildBundle(multiStore, single);
   assert.deepStrictEqual(one.options.foreignHosts, ['198.51.100.2']);
-  assert.ok(preprocessConfig(one.bundles.iran['configs/reverse-reality.json']).text.includes('198.51.100.2/32'));
+  assert.ok(preprocessConfig(configText(one, 'iran', 'reverse-reality')).text.includes('198.51.100.2/32'));
 
   pass += 1;
   console.log(`  ✓ ${'multi-exit'.padEnd(24)} 3 exits whitelisted, one bundle for all`);
@@ -423,10 +436,10 @@ for (const tpl of templates.ALL) {
   const tokenBuilt = buildBundle(splitStore, tokenTunnel);
   assert.strictEqual(tokenBuilt.ok, true, tokenBuilt.problems.join('; '));
   const tokenServer = JSON.parse(
-    preprocessConfig(tokenBuilt.bundles.iran['configs/cdn-reverse-split.json']).text,
+    preprocessConfig(configText(tokenBuilt, 'iran', 'cdn-reverse-split')).text,
   ).nodes.find((n) => n.name === 'http_origin');
   const tokenClient = JSON.parse(
-    preprocessConfig(tokenBuilt.bundles.foreign['configs/cdn-reverse-split.json']).text,
+    preprocessConfig(configText(tokenBuilt, 'foreign', 'cdn-reverse-split')).text,
   ).nodes.find((n) => n.name === 'http_client');
   assert.strictEqual(tokenServer.settings.split.token, 'shared-secret');
   assert.strictEqual(tokenClient.settings.split.token, 'shared-secret');
@@ -453,7 +466,7 @@ for (const tpl of templates.ALL) {
   assert.strictEqual(noTokenBuilt.ok, true, noTokenBuilt.problems.join('; '));
   for (const side of ['iran', 'foreign']) {
     const cfg = JSON.parse(
-      preprocessConfig(noTokenBuilt.bundles[side]['configs/cdn-reverse-split.json']).text,
+      preprocessConfig(configText(noTokenBuilt, side, 'cdn-reverse-split')).text,
     );
     const http = cfg.nodes.find((n) => n.name === (side === 'iran' ? 'http_origin' : 'http_client'));
     assert.strictEqual(http.settings.split.token, undefined, `${side}: token leaked while the switch is off`);
@@ -469,7 +482,7 @@ for (const tpl of templates.ALL) {
   const literalBuilt = buildBundle(splitStore, literalTunnel);
   assert.strictEqual(literalBuilt.ok, true, literalBuilt.problems.join('; '));
   for (const side of ['iran', 'foreign']) {
-    const text = literalBuilt.bundles[side]['configs/cdn-reverse-split.json'];
+    const text = configText(literalBuilt, side, 'cdn-reverse-split');
     assert.ok(!text.includes('"@'), `${side}: useVariables=false left an @sentinel in the config`);
     const cfg = JSON.parse(text);
     assert.strictEqual(cfg.variables, undefined, `${side}: useVariables=false must omit variables`);
@@ -541,8 +554,8 @@ for (const tpl of templates.ALL) {
   assert.strictEqual(mainBuilt.ok, true, mainBuilt.problems.join('; '));
   assert.deepStrictEqual(Object.keys(mainBuilt.bundles).sort(), ['foreign', 'iran']);
   const findNode = (cfg, name) => cfg.nodes.find((n) => n.name === name);
-  const de = JSON.parse(preprocessConfig(mainBuilt.bundles.iran['configs/socks5-reality.json']).text);
-  const tr = JSON.parse(preprocessConfig(mainBuilt.bundles.foreign['configs/socks5-reality.json']).text);
+  const de = JSON.parse(preprocessConfig(configText(mainBuilt, 'iran', 'socks5-reality')).text);
+  const tr = JSON.parse(preprocessConfig(configText(mainBuilt, 'foreign', 'socks5-reality')).text);
   assert.ok(!de.nodes.some((n) => /^Mux/.test(n.type)), 'a legacy muxEnabled option must not add a MuxClient');
   assert.ok(!tr.nodes.some((n) => /^Mux/.test(n.type)), 'a legacy muxEnabled option must not add a MuxServer');
 
@@ -575,7 +588,7 @@ for (const tpl of templates.ALL) {
   const midBuilt = buildBundle(chain, middle);
   assert.strictEqual(midBuilt.ok, true, midBuilt.problems.join('; '));
   assert.deepStrictEqual(Object.keys(midBuilt.bundles), ['iran']);
-  const mid = JSON.parse(preprocessConfig(midBuilt.bundles.iran['configs/tcp-relay.json']).text);
+  const mid = JSON.parse(preprocessConfig(configText(midBuilt, 'iran', 'tcp-relay')).text);
   assert.deepStrictEqual(findNode(mid, 'entry').settings.whitelist, ['203.0.113.10/32']);
   assert.strictEqual(findNode(mid, 'entry').settings.port, 443);
   assert.strictEqual(findNode(mid, 'exit').settings.address, '198.51.100.30');
@@ -624,7 +637,7 @@ for (const tpl of templates.ALL) {
   });
   const rawBuilt = buildBundle(store, store.getTunnel(raw.id));
   assert.strictEqual(rawBuilt.ok, true, rawBuilt.problems.join('; '));
-  const rawCfg = JSON.parse(rawBuilt.bundles.iran['configs/tcp-forward.json']);
+  const rawCfg = JSON.parse(configText(rawBuilt, 'iran', 'tcp-forward'));
   const rawEntry = rawCfg.nodes.find((n) => n.name === 'entry');
   assert.deepStrictEqual(rawEntry.settings.whitelist, ['203.0.113.9/32']);
   assert.deepStrictEqual(rawEntry.settings.blacklist, ['198.51.100.0/24']);
@@ -666,7 +679,7 @@ for (const tpl of templates.ALL) {
   });
   const revBuilt = buildBundle(store, store.getTunnel(revRaw.id));
   assert.strictEqual(revBuilt.ok, true, revBuilt.problems.join('; '));
-  const revCfg = JSON.parse(preprocessConfig(revBuilt.bundles.iran['configs/reverse-tls.json']).text);
+  const revCfg = JSON.parse(preprocessConfig(configText(revBuilt, 'iran', 'reverse-tls')).text);
   const revListener = revCfg.nodes.find((n) => n.name === 'germany_reverse_tls_inbound');
   assert.deepStrictEqual(revListener.settings.whitelist, ['203.0.113.21/32']);
 
@@ -1672,14 +1685,15 @@ function panelStateTests() {
       },
     ],
     [
-      'resolveTargets follows the server order, not the tunnel array',
+      'resolveTargets keeps the tunnel order, not the global server order',
       () => {
         const servers = store.listServers();
         const ids = [servers[2].id, servers[0].id, servers[1].id];
         const targets = resolveTargets(servers, { targetServers: { foreign: ids } });
         assert.deepStrictEqual(
           targets.foreign.map((s) => s.id),
-          [servers[0].id, servers[1].id, servers[2].id],
+          ids,
+          'two tunnels may deliberately use the same exits in opposite orders',
         );
       },
     ],
@@ -1884,6 +1898,15 @@ bridgeRuleTests();
 transportTests();
 agentTests();
 
+// ---- the isolation, port-allocation and ordering features ------------------
+const featurePending = (async () => {
+  const ok = (label) => {
+    pass += 1;
+    console.log(`  ✓ ${label}`);
+  };
+  await require('./features.test').tests(ok, fail, failures);
+})();
+
 // ---- store round trip -----------------------------------------------------
 assert.strictEqual(store.listServers().length, 3, 'server store');
 assert.ok(store.addTunnel({ name: 'x', template: 'tcp-forward' }).id, 'tunnel store');
@@ -1894,7 +1917,7 @@ fs.rmSync(tmp, { recursive: true, force: true });
 // Both pending suites are awaited before the summary. Reporting failures (and
 // exiting) while they are still running would kill them and print a count that
 // does not include their results.
-Promise.all([netcheckPending, securityTestsPending, linkPending, certPending])
+Promise.all([netcheckPending, securityTestsPending, linkPending, certPending, featurePending])
   .then(() => {
     console.log('');
     console.log(`  ${pass} passed, ${fail} failed (${usedVariables} config variables resolved)`);

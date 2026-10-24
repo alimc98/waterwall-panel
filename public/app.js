@@ -1640,6 +1640,70 @@ async function doFirewallFix(btn) {
   }
 }
 
+/** Report the automatic service split (or, on dry-run, the plan for it). */
+function isolationHtml(iso, dryRun) {
+  if (!iso) return '';
+  const clones = iso.clones || [];
+  const plan = iso.plan || [];
+  const skipped = iso.skipped || [];
+  if (!clones.length && !plan.length && !skipped.length) return '';
+  const rows = [];
+  if (dryRun && plan.length) {
+    rows.push(
+      `<div class="warn-box"><b>سرویس جداگانه لازم است</b><br>${plan
+        .map(
+          (row) =>
+            `• ${sideLabel(row.side)}: «${esc(row.server.name)}» همین حالا در تونل ${row.sharedWith
+              .map((t) => `«${esc(t.name)}»`)
+              .join('، ')} استفاده می‌شود؛ هنگام اعمال، یک سرویس جدا (${esc(row.server.serviceName || 'waterwall')}-2) برای این تونل ساخته می‌شود.`,
+        )
+        .join('<br>')}</div>`,
+    );
+  }
+  if (clones.length) {
+    rows.push(
+      `<div class="ok-box"><b>سرویس مستقل ساخته شد</b><br>${clones
+        .map(
+          (row) =>
+            `• ${sideLabel(row.side)}: ${esc(row.from.name)} → <span class="mono">${esc(row.server.serviceName)}</span> در <span class="mono">${esc(row.server.waterwallPath)}</span>`,
+        )
+        .join('<br>')}</div>`,
+    );
+  }
+  if (skipped.length) {
+    rows.push(
+      `<div class="err-box"><b>سرویس مستقل ساخته نشد</b><br>${skipped
+        .map((row) => `• ${sideLabel(row.side)} «${esc(row.server.name)}»: ${esc(row.reason)}`)
+        .join('<br>')}</div>`,
+    );
+  }
+  return rows.join('');
+}
+
+/**
+ * Report the ports the panel moved on its own.
+ *
+ * A second tunnel on a box that already runs one cannot have the same
+ * listening port: the second WaterWall process would fail to bind and the
+ * tunnel would never come up. The panel moves the newcomer to a free port,
+ * and this is where the operator finds out which number it ended up with.
+ */
+function portFixHtml(fix) {
+  if (!fix) return '';
+  const moved = fix.moved || [];
+  if (!moved.length) return '';
+  const rows = moved.map(
+    (m) =>
+      `• ${sideLabel(m.side)} روی «${esc(m.server || '—')}»: <span class="mono">${esc(
+        m.key,
+      )}</span> از <span class="mono">${m.from}</span> به <span class="mono">${m.to}</span> تغییر کرد ` +
+      `<span class="small muted">(پورت قبلی را تونل دیگری روی همین سرور گرفته بود)</span>`,
+  );
+  return `<div class="warn-box"><b>پورت به‌صورت خودکار جابه‌جا شد</b><br>${rows.join(
+    '<br>',
+  )}<br><span class="small">پورت جدید را در لینک‌های کلاینت و در فایروال سرور ایران در نظر بگیرید.</span></div>`;
+}
+
 async function doApply(dryRun = false) {
   const t = state.draft;
   if (!t) return;
@@ -1667,9 +1731,25 @@ async function doApply(dryRun = false) {
       .join('');
     openModal(
       dryRun ? 'اعمال آزمایشی' : 'نتیجه اعمال',
-      (lines || '<p class="muted">چیزی برای نمایش نیست.</p>') + reachabilityHtml(r.reachability, t.id),
+      (lines || '<p class="muted">چیزی برای نمایش نیست.</p>') +
+        isolationHtml(r.isolation, dryRun) +
+        portFixHtml(r.portFix) +
+        reachabilityHtml(r.reachability, t.id),
       [{ text: 'بستن', class: 'primary', onClick: closeModal }],
     );
+    if (r.isolation?.changed || r.portFix?.changed) {
+      // The apply switched this tunnel to freshly created server records and
+      // may have moved a port. Pull the new state so the next save/edit does
+      // not write the old values back.
+      const fresh = await api('/api/bootstrap');
+      state.servers = fresh.servers;
+      state.tunnels = fresh.tunnels;
+      const updated = fresh.tunnels.find((x) => x.id === t.id);
+      if (updated) {
+        state.draft = { ...updated, options: { ...updated.options } };
+        state.currentTunnel = updated;
+      }
+    }
     if (r.ok && !r.reachability?.problems?.length) toast('روی سرورها اعمال شد', 'ok');
     else if (r.ok) toast('اعمال شد، ولی ارتباط دو سرور برقرار نیست', 'err');
   } catch (err) {
@@ -1761,21 +1841,113 @@ function sideLabel(side) {
   return '🌍 خارج';
 }
 
-/** Checkbox list of every exit server (templates marked `multiExit`). */
+/**
+ * Ordered exit-server picker (templates marked `multiExit`).
+ *
+ * The order is stored in the tunnel's `targetServers.foreign` array. Two
+ * tunnels may intentionally contain the same servers in opposite orders, so
+ * this list is never re-sorted by the global server order — the operator moves
+ * rows with ↑/↓ and that exact order is what the builder receives.
+ */
 function foreignPickerHtml(prefix, servers, selected) {
   if (!servers.length) {
     return '<div class="empty" style="padding:14px"><span class="small muted">سرور خارجی ثبت نشده است — از صفحهٔ «سرورها» اضافه کنید.</span></div>';
   }
-  const chosen = foreignList(selected);
-  return `<div class="pick-list" id="${prefix}_foreign_list">
-    ${servers
-      .map(
-        (s) => `<label class="pick"><input type="checkbox" value="${s.id}" ${chosen.includes(s.id) ? 'checked' : ''}>
-          <span>${esc(s.name)}</span><span class="mono small muted">${esc(s.host)}</span></label>`,
-      )
-      .join('')}
+  const byId = new Map(servers.map((s) => [s.id, s]));
+  const chosen = foreignList(selected).filter((id) => byId.has(id));
+  // A stored id that is no longer registered is dropped rather than rendered
+  // as an empty row the operator cannot remove.
+  const remaining = servers.filter((s) => !chosen.includes(s.id));
+  return `<div class="pick-order" id="${prefix}_foreign_list" data-foreign-order>
+    <div class="pick-chosen" data-chosen>
+      ${
+        chosen.length
+          ? chosen.map((id, i) => pickRowHtml(byId.get(id), i)).join('')
+          : '<div class="empty" style="padding:10px"><span class="small muted">هنوز سروری اضافه نشده — از منوی پایین اضافه کنید.</span></div>'
+      }
+    </div>
+    <div class="pick-add">
+      <select data-add-select ${remaining.length ? '' : 'disabled'}>
+        ${
+          remaining.length
+            ? remaining.map((s) => `<option value="${s.id}">${esc(s.name)} — ${esc(s.host)}</option>`).join('')
+            : '<option value="">— همه اضافه شده‌اند —</option>'
+        }
+      </select>
+      <button type="button" class="sm" data-add ${remaining.length ? '' : 'disabled'}>افزودن</button>
+    </div>
   </div>
-  <span class="hint">هر تعداد سرور خارج می‌توانید انتخاب کنید: بار بینشان تقسیم می‌شود و اگر یکی قطع شود بقیه در مدار می‌مانند.</span>`;
+  <span class="hint">ترتیب از بالا به پایین ذخیره می‌شود؛ سرور اول مسیر اصلی است. با ↑ و ↓ هر تونل را مستقل مرتب کنید.</span>`;
+}
+
+function pickRowHtml(server, index) {
+  if (!server) return '';
+  return `<div class="pick-row" data-id="${server.id}">
+    <span class="ord">${index + 1}</span>
+    <span class="pick-name">${esc(server.name)}</span>
+    <span class="mono small muted">${esc(server.host)}</span>
+    <span class="spacer"></span>
+    <button type="button" class="sm" data-move="up" title="بالا">↑</button>
+    <button type="button" class="sm" data-move="down" title="پایین">↓</button>
+    <button type="button" class="sm danger" data-remove title="حذف">✕</button>
+  </div>`;
+}
+
+/** Renumber rows and rebuild the "add" menu after any change. */
+function refreshForeignPicker(box) {
+  const rows = $$('.pick-row', box);
+  rows.forEach((row, i) => {
+    const ord = $('.ord', row);
+    if (ord) ord.textContent = String(i + 1);
+  });
+  const chosenBox = $('[data-chosen]', box);
+  if (chosenBox && !rows.length && !$('.empty', chosenBox)) {
+    chosenBox.innerHTML =
+      '<div class="empty" style="padding:10px"><span class="small muted">هنوز سروری اضافه نشده — از منوی پایین اضافه کنید.</span></div>';
+  }
+  const chosen = new Set(rows.map((row) => row.dataset.id));
+  const remaining = state.servers.filter((s) => s.role === 'foreign' && !chosen.has(s.id));
+  const select = $('[data-add-select]', box);
+  if (select) {
+    select.innerHTML = remaining.length
+      ? remaining.map((s) => `<option value="${s.id}">${esc(s.name)} — ${esc(s.host)}</option>`).join('')
+      : '<option value="">— همه اضافه شده‌اند —</option>';
+    select.disabled = !remaining.length;
+  }
+  const add = $('[data-add]', box);
+  if (add) add.disabled = !remaining.length;
+}
+
+function wireForeignPickers() {
+  $$('[data-foreign-order]').forEach((box) => {
+    box.onclick = (ev) => {
+      const chosen = $('[data-chosen]', box);
+      const button = ev.target.closest('button');
+      if (!button || !chosen) return;
+      const row = button.closest('.pick-row');
+      if (button.matches('[data-add]')) {
+        const select = $('[data-add-select]', box);
+        const id = select?.value;
+        const server = state.servers.find((s) => s.id === id);
+        if (!server) return;
+        $('.empty', chosen)?.remove();
+        chosen.insertAdjacentHTML('beforeend', pickRowHtml(server, $$('.pick-row', box).length));
+        refreshForeignPicker(box);
+        return;
+      }
+      if (!row) return;
+      if (button.matches('[data-remove]')) {
+        row.remove();
+      } else if (button.dataset.move === 'up') {
+        const prev = row.previousElementSibling;
+        if (prev?.classList.contains('pick-row')) chosen.insertBefore(row, prev);
+      } else if (button.dataset.move === 'down') {
+        const next = row.nextElementSibling;
+        if (next?.classList.contains('pick-row')) chosen.insertBefore(next, row);
+      }
+      refreshForeignPicker(box);
+    };
+  });
 }
 
 /** Target selection currently visible in the create (`nt`) or edit (`et`) form. */
@@ -1785,7 +1957,7 @@ function readTargets(prefix) {
   const list = $(`#${prefix}_foreign_list`);
   const targets = { iran };
   if (relay) targets.relay = relay;
-  if (list) targets.foreign = $$('input[type="checkbox"]:checked', list).map((i) => i.value);
+  if (list) targets.foreign = $$('.pick-row[data-id]', list).map((row) => row.dataset.id);
   else targets.foreign = $(`#${prefix}_foreign`)?.value || null;
   return targets;
 }
@@ -2272,6 +2444,7 @@ function afterRender() {
   wireCertActions();
   wireOutbound();
   wireBackup();
+  wireForeignPickers();
   // Reload certificate state only when the page is *opened*, never on every
   // render: re-rendering from here would recurse forever.
   if (state.page === 'certs' && state.lastCertPage !== state.certsPageToken) {
@@ -2356,10 +2529,15 @@ function afterRender() {
   });
   $$('[data-tn-del]').forEach((b) => {
     b.onclick = async () => {
-      if (!confirm('این تونل حذف شود؟')) return;
-      await api(`/api/tunnels/${b.dataset.tnDel}`, { method: 'DELETE' });
+      if (!confirm('این تونل حذف شود؟ فایل کانفیگ و سرویسش روی سرورها هم پاک/متوقف می‌شود.')) return;
+      const r = await api(`/api/tunnels/${b.dataset.tnDel}`, { method: 'DELETE' });
       state.tunnels = state.tunnels.filter((x) => x.id !== b.dataset.tnDel);
-      toast('حذف شد', 'ok');
+      const failed = (r.cleanup || []).filter((row) => !row.ok);
+      if (failed.length) {
+        toast(`حذف شد، ولی پاک‌سازی روی ${failed.map((f) => f.server).join('، ')} انجام نشد`, 'err');
+      } else {
+        toast('حذف شد و فایل/سرویس روی سرورها پاک شد', 'ok');
+      }
       render();
     };
   });

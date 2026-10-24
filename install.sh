@@ -21,7 +21,7 @@
 #
 set -euo pipefail
 
-WW_VERSION="${WW_VERSION:-1.46.96}"
+WW_VERSION="${WW_VERSION:-1.5.0}"
 WW_BASE="${WW_BASE:-/opt/waterwall}"
 WW_SERVICE="${WW_SERVICE:-waterwall}"
 WW_AGENT_DIR="${WW_AGENT_DIR:-/opt/ww-agent}"
@@ -59,7 +59,7 @@ WaterWall Panel installer
 
   --panel-url URL       Panel base URL the agent polls      (WW_PANEL_URL)
   --agent-token TOKEN   Per-server agent token              (WW_AGENT_TOKEN)
-  --version VER         WaterWall release to install        (default 1.46.96)
+  --version VER         WaterWall release to install        (default 1.5.0)
   --base DIR            Install prefix                      (default /opt/waterwall)
   --arch ARCH           Force asset: x64 | x64-old | arm64 | arm64-old
   --waterwall-zip FILE  Install from this zip; implies --offline for the binary

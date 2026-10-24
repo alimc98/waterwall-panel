@@ -174,7 +174,26 @@ select { cursor: pointer; }
 .switch input:checked + .track::after { right: 20px; background: #fff; }
 .list-input { display: flex; gap: 8px; }
 .list-input input { flex: 1; }
-/* Checkbox list of exit servers: reverse tunnels can have any number. */
+/* Ordered list of exit servers: reverse tunnels can have any number, and the
+   order is per tunnel (two tunnels may use the same exits in opposite order). */
+.pick-order {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 9px; padding: 7px;
+}
+.pick-chosen { display: grid; gap: 4px; }
+.pick-row {
+  display: flex; align-items: center; gap: 9px; padding: 6px 8px;
+  border-radius: 7px; font-size: 13px; background: rgba(91,140,255,.06);
+}
+.pick-row .ord {
+  width: 22px; height: 22px; border-radius: 50%; display: inline-flex;
+  align-items: center; justify-content: center; font-size: 11px; font-weight: 700;
+  background: var(--accent); color: #fff; flex: none;
+}
+.pick-row .pick-name { font-weight: 600; }
+.pick-row .mono { direction: ltr; }
+.pick-row button.sm { padding: 3px 8px; min-width: 28px; justify-content: center; }
+.pick-add { display: flex; gap: 8px; margin-top: 8px; }
+.pick-add select { flex: 1; }
 .pick-list {
   display: grid; gap: 4px;
   background: var(--bg-2); border: 1px solid var(--border); border-radius: 9px; padding: 7px;
