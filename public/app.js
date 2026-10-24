@@ -983,6 +983,7 @@ function pageServers() {
           <button class="sm" data-srv-probe="${s.id}">بررسی</button>
           <button class="sm" data-srv-logs="${s.id}">لاگ</button>
           <button class="sm" data-srv-conn="${s.id}">اتصال کلاینت</button>
+          <button class="sm" data-srv-install="${s.id}" title="نصب واتروال روی این سرور">نصب واتروال</button>
           <button class="sm danger" data-srv-del="${s.id}">حذف</button>
         </td>
       </tr>`;
@@ -2703,13 +2704,103 @@ function afterRender() {
   $$('[data-srv-conn]').forEach((b) => {
     b.onclick = () => showAgentSetup(state.servers.find((x) => x.id === b.dataset.srvConn));
   });
+  $$('[data-srv-install]').forEach((b) => {
+    b.onclick = async () => {
+      const s = state.servers.find((x) => x.id === b.dataset.srvInstall);
+      if (!s) return;
+      const force = confirm(
+        `واتروال روی «${s.name}» نصب شود؟\n\n` +
+          `«بله» = اگر چیزی نصب باشد، جایگزین می‌شود.\n` +
+          `«خیر» = اگر نصب باشد، دست‌نخورده می‌ماند و نصب تازه انجام نمی‌شود.`,
+      );
+      b.disabled = true;
+      b.textContent = 'در حال نصب…';
+      try {
+        const r = await api(`/api/servers/${s.id}/install`, {
+          method: 'POST',
+          body: { force: force === true },
+        });
+        if (r.alreadyInstalled) {
+          toast(`واتروال از قبل روی «${s.name}» نصب بود`, 'ok');
+        } else if (r.ok) {
+          toast(`واتروال ${r.version} روی «${s.name}» نصب شد (${r.asset})`, 'ok');
+        } else {
+          toast(r.error || 'نصب واتروال ناموفق بود', 'err');
+        }
+      } catch (e) {
+        toast(e.message || 'نصب واتروال ناموفق بود', 'err');
+      } finally {
+        b.disabled = false;
+        b.textContent = 'نصب واتروال';
+        render();
+      }
+    };
+  });
   $$('[data-srv-del]').forEach((b) => {
     b.onclick = async () => {
       const s = state.servers.find((x) => x.id === b.dataset.srvDel);
-      if (!confirm(`سرور «${s.name}» حذف شود؟`)) return;
-      await api(`/api/servers/${s.id}`, { method: 'DELETE' });
+      if (!s) return;
+      // The box can be cleaned as well: the unit, the enable symlink, the
+      // install directory and the agent all belong to this server. Leaving
+      // them behind is what fills /opt with dead services.
+      // Tunnels that name this server have to be told about, and pointed at a
+      // replacement if there is one. Without that they would silently fall
+      // back to another box.
+      const used = (state.tunnels || []).filter((t) => {
+        const ts = t.targetServers || {};
+        const foreign = Array.isArray(ts.foreign) ? ts.foreign : [ts.foreign];
+        return ts.iran === s.id || ts.relay === s.id || foreign.includes(s.id);
+      });
+      const others = (state.servers || []).filter((x) => x.id !== s.id);
+      const replacement = {};
+      for (const t of used) {
+        if (!others.length) break;
+        const pick = prompt(
+          `تونل «${t.name}» از سرور «${s.name}» استفاده می‌کند.\n\n` +
+            `شمارهٔ سرور جایگزین را بنویسید (۰ = بدون جایگزین):\n` +
+            others.map((x, i) => `  ${i + 1}. ${x.name} — ${x.host}`).join('\n'),
+          '0',
+        );
+        const n = Number(pick);
+        if (n >= 1 && n <= others.length) replacement[t.id] = others[n - 1].id;
+      }
+
+      const clean = confirm(
+        `سرور «${s.name}» حذف شود؟\n\n` +
+          `«بله» = رکورد از پنل پاک شود و سرویس‌ها و فایل‌ها هم از سرور پاک شوند.\n` +
+          `«خیر» = فقط رکورد از پنل پاک شود؛ سرور دست‌نخورده بماند.`,
+      );
+      if (!clean) {
+        if (!confirm('فقط رکورد از پنل پاک شود؟ سرور دست‌نخورده می‌ماند.')) return;
+      }
+      const r = await api(`/api/servers/${s.id}`, {
+        method: 'DELETE',
+        body: { cleanup: clean ? 'remove' : 'keep', replacement },
+      });
       state.servers = state.servers.filter((x) => x.id !== s.id);
-      toast('حذف شد', 'ok');
+      const c = r.cleanup || {};
+      if (c.mode === 'keep') {
+        toast('رکورد سرور از پنل پاک شد (فایل‌های سرور دست‌نخورده ماند)', 'ok');
+      } else if (c.ok) {
+        const bits = [];
+        if (c.unitRemoved) bits.push('سرویس');
+        if (c.dirRemoved) bits.push('پوشهٔ نصب');
+        else if (c.dirKept) bits.push('پوشهٔ مشترک نگه داشته شد');
+        if (c.agentUnitRemoved) bits.push('ایجنت');
+        if (c.sweptUnits && c.sweptUnits.length) {
+          bits.push(`${c.sweptUnits.length} سرویس باقی‌مانده: ${c.sweptUnits.join('، ')}`);
+        }
+        toast(`سرور پاک شد${bits.length ? ': ' + bits.join('، ') : ''}`, 'ok');
+      } else if (c.error) {
+        toast(`رکورد سرور از پنل پاک شد، ولی پاک‌سازی سرور کامل نشد: ${c.error}`, 'err');
+      }
+      if (r.orphans && r.orphans.length) {
+        toast(
+          `${r.orphans.length} تونل هنوز به سرور حذف‌شده اشاره دارد: ` +
+            r.orphans.map((o) => o.name).join('، '),
+          'err',
+        );
+      }
       render();
     };
   });

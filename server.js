@@ -13,6 +13,7 @@ const tests = require('./lib/tests');
 const protoscan = require('./lib/protoscan');
 const versions = require('./lib/versions');
 const upgrade = require('./lib/upgrade');
+const installer = require('./lib/install');
 const netcheck = require('./lib/netcheck');
 const certs = require('./lib/certs');
 const linkHealth = require('./lib/links');
@@ -122,6 +123,51 @@ function findServers(tunnel) {
   };
 }
 
+/**
+ * The tunnels a server is part of.
+ *
+ * Deleting a server used to leave its tunnels pointing at an id the panel no
+ * longer knows. `resolveTargets` then fell back to the first server of that
+ * role, so the tunnel silently moved to a different box instead of failing.
+ *
+ * The tunnels are found here so the delete can say what is about to break
+ * and so a replacement can be put in their place.
+ */
+function tunnelsUsingServer(serverId) {
+  const out = [];
+  for (const tunnel of store.listTunnels()) {
+    const t = tunnel?.targetServers || {};
+    const foreign = Array.isArray(t.foreign) ? t.foreign : [t.foreign];
+    const sides = [];
+    if (t.iran === serverId) sides.push('iran');
+    if (t.relay === serverId) sides.push('relay');
+    if (foreign.includes(serverId)) sides.push('foreign');
+    if (sides.length) out.push({ tunnel, sides });
+  }
+  return out;
+}
+
+/**
+ * Put a replacement server in place of a deleted one.
+ *
+ * @param {string} tunnelId
+ * @param {string} oldId
+ * @param {string} newId
+ */
+function repointTunnel(tunnelId, oldId, newId) {
+  const tunnel = store.getTunnel(tunnelId);
+  if (!tunnel) return null;
+  const t = { ...(tunnel.targetServers || {}) };
+  if (t.iran === oldId) t.iran = newId;
+  if (t.relay === oldId) t.relay = newId;
+  if (Array.isArray(t.foreign)) {
+    t.foreign = t.foreign.map((id) => (id === oldId ? newId : id));
+  } else if (t.foreign === oldId) {
+    t.foreign = newId;
+  }
+  return store.updateTunnel(tunnelId, { targetServers: t });
+}
+
 // ---------------------------------------------------------------- routes
 const router = new Router();
 
@@ -226,6 +272,72 @@ async function upstreamReleases(force = false) {
   releaseCache = { at: Date.now(), releases };
   return releases;
 }
+
+/**
+ * Install WaterWall on a server, from the panel.
+ *
+ * A new server needed a person to SSH in and run the install script before
+ * the panel could do anything with it. This does that step over SSH: the
+ * right build for the host's CPU is downloaded, the systemd unit is written,
+ * and the unit is enabled.
+ *
+ * The service is not started here: it needs a core.json, and that file is
+ * the tunnel's business. Applying the tunnel starts it.
+ */
+router.post('/api/servers/:id/install', async (req, res, ctx) => {
+  if (guard(req, res)) return;
+  const server = store.getServer(ctx.params.id);
+  if (!server) return sendError(res, 404, 'server not found');
+  const body = await parseJsonBody(req).catch(() => ({}));
+
+  const host = await installer.inspectHost(ssh, server);
+  if (!host.ok) return sendJson(res, 502, { ok: false, error: host.error });
+
+  let releases = [];
+  try {
+    releases = await upgrade.fetchReleases({ limit: 10 });
+  } catch (err) {
+    return sendJson(res, 502, {
+      ok: false,
+      error: `the release list could not be read from GitHub: ${err.message}`,
+    });
+  }
+  const target = versions.normalise(body.version) || versions.CURRENT;
+  const release = releases.find((r) => r.version === target);
+  if (!release) {
+    return sendJson(res, 404, { ok: false, error: `release ${target} was not found upstream` });
+  }
+  const picked = installer.pickAsset(release.assets || [], host);
+  if (!picked.asset) {
+    return sendJson(res, 409, { ok: false, error: picked.reason });
+  }
+
+  const result = await installer.installWaterwall(ssh, server, {
+    assetUrl: picked.asset.url,
+    version: target,
+    baseDir: server.waterwallPath || '/opt/waterwall',
+    serviceName: server.serviceName || 'waterwall',
+    force: body.force === true,
+    dryRun: body.dryRun === true,
+  });
+  store.log({
+    type: 'server.install',
+    serverId: server.id,
+    name: server.name,
+    version: target,
+    asset: picked.asset.name,
+    ok: result.ok,
+  });
+  if (!result.ok) return sendJson(res, 500, { ok: false, error: result.error, detail: result.detail });
+  sendJson(res, 200, {
+    ok: true,
+    server: server.name,
+    version: target,
+    asset: picked.asset.name,
+    assetReason: picked.reason,
+    ...result,
+  });
+});
 
 router.get('/api/upgrade/releases', async (req, res, ctx) => {
   if (guard(req, res)) return;
@@ -444,12 +556,101 @@ router.patch('/api/servers/:id', async (req, res, ctx) => {
   sendJson(res, 200, { ok: true, server: redact(server) });
 });
 
-router.delete('/api/servers/:id', (req, res, ctx) => {
+/**
+ * Delete a server and take everything it owns off its box.
+ *
+ * Dropping the record alone left the machine running: the systemd unit, the
+ * enable symlink, the install directory and the panel agent all stayed. The
+ * server was gone from the panel while the box kept serving a tunnel nobody
+ * could reach any more.
+ *
+ * The cleanup is best-effort in one direction only: a box that cannot be
+ * reached is reported and the record still goes. Refusing to delete would
+ * strand every tunnel that points at a server that is already gone from the
+ * network.
+ *
+ * The install directory is only removed when the server owns it alone. A
+ * directory that other records share - the base install on a box several
+ * tunnels use - is kept, and only the unit goes.
+ *
+ * `cleanup` in the body chooses what happens on the box:
+ *   'remove'  (default) take the unit, the symlink, the directory and the agent
+ *   'keep'    delete the record only, leave the box untouched
+ */
+router.delete('/api/servers/:id', async (req, res, ctx) => {
   if (guard(req, res)) return;
+  const server = store.getServer(ctx.params.id);
+  if (!server) return sendError(res, 404, 'server not found');
+  const body = await parseJsonBody(req).catch(() => ({}));
+  const mode = body.cleanup === 'keep' ? 'keep' : 'remove';
+
+  let cleanup = { ok: true, skipped: true, mode: 'keep' };
+  if (mode === 'remove') {
+    // The directory belongs to this record alone when no other record points
+    // at the same path on the same host. A shared base install keeps its
+    // files so the next tunnel can reuse the binary.
+    const twins = store
+      .listServers()
+      .filter(
+        (s) =>
+          s.id !== server.id &&
+          s.host === server.host &&
+          (s.waterwallPath || '/opt/waterwall') === (server.waterwallPath || '/opt/waterwall'),
+      );
+    const ownsDir = twins.length === 0;
+    // Every waterwall unit on the box goes with the record. A unit left
+    // behind belongs to a tunnel the panel no longer knows, and the operator
+    // has no way to reach it from here any more.
+    const removed = await ssh.removeServerFromHost(server, {
+      removeDir: ownsDir,
+      removeAgent: body.keepAgent !== true,
+      removeAllUnits: body.keepUnits !== true,
+    });
+    cleanup = {
+      ok: removed.ok,
+      mode: 'remove',
+      ownsDir,
+      unitRemoved: removed.unitRemoved,
+      dirRemoved: removed.dirRemoved,
+      dirKept: !ownsDir && removed.dirExists,
+      agentUnitRemoved: removed.agentUnitRemoved,
+      agentDirRemoved: removed.agentDirRemoved,
+      agentStateRemoved: removed.agentStateRemoved,
+      sweptUnits: removed.sweptUnits || [],
+      error: removed.error,
+    };
+  }
+
+  // Tunnels that named this server are found before the record goes, so the
+  // operator is told what breaks and can point them at a replacement box.
+  const affected = tunnelsUsingServer(server.id);
+  const repointed = [];
+  const orphans = [];
+  for (const { tunnel, sides } of affected) {
+    const replacement = body.replacement && body.replacement[tunnel.id];
+    if (replacement && store.getServer(replacement)) {
+      const updated = repointTunnel(tunnel.id, server.id, replacement);
+      if (updated) {
+        repointed.push({ tunnelId: tunnel.id, name: tunnel.name, sides, replacement });
+        continue;
+      }
+    }
+    orphans.push({ tunnelId: tunnel.id, name: tunnel.name, sides });
+  }
+
   const ok = store.deleteServer(ctx.params.id);
   if (!ok) return sendError(res, 404, 'server not found');
   broadcast('servers', store.listServers().map(redact));
-  sendJson(res, 200, { ok: true });
+  if (repointed.length) broadcast('tunnels', store.listTunnels());
+  sendJson(res, 200, {
+    ok: true,
+    cleanup,
+    repointed,
+    orphans,
+    note: orphans.length
+      ? 'some tunnels still point at a server the panel does not know; point them at a replacement before applying them'
+      : undefined,
+  });
 });
 
 /**

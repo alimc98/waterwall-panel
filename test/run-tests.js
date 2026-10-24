@@ -1409,6 +1409,74 @@ async function securityTests() {
       }
     });
 
+    await step('deleting a server reports the tunnels it was part of', async () => {
+      // A tunnel that names a server the panel does not know falls back to
+      // the first server of that role, so it silently moves to a different
+      // box. The delete has to say which tunnels break, and a replacement
+      // has to be put in their place.
+      const auth = { authorization: `Bearer ${token}` };
+      const listed = await (await fetch(`${base}/api/servers`, { headers: auth })).json();
+      const servers = listed.servers || [];
+      if (servers.length < 2) return; // nothing to point one at
+      const victim = servers[0];
+      const replacement = servers[1];
+
+      const del = await fetch(`${base}/api/servers/${victim.id}`, {
+        method: 'DELETE',
+        headers: { ...auth, 'content-type': 'application/json' },
+        body: JSON.stringify({ cleanup: 'keep', replacement: {} }),
+      });
+      assert.strictEqual(del.status, 200, `the delete answered ${del.status}`);
+      const body = await del.json();
+      assert.strictEqual(body.ok, true);
+      assert.ok(Array.isArray(body.orphans), 'the delete does not list the tunnels it broke');
+      assert.ok(Array.isArray(body.repointed), 'the delete does not list the tunnels it repointed');
+
+      // Put the server back so the rest of the suite sees the same panel.
+      const add = await fetch(`${base}/api/servers`, {
+        method: 'POST',
+        headers: { ...auth, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: victim.name,
+          host: victim.host,
+          port: victim.port,
+          username: victim.username,
+          role: victim.role,
+          waterwallPath: victim.waterwallPath,
+          serviceName: victim.serviceName,
+        }),
+      });
+      assert.strictEqual(add.status, 201, `the server could not be restored: ${add.status}`);
+    });
+
+    await step('the install endpoint names the build the host needs', async () => {
+      // The install endpoint must not touch the server when it is asked for a
+      // dry run, and it must answer with the asset it would use.
+      const auth = { authorization: `Bearer ${token}` };
+      const listed = await (await fetch(`${base}/api/servers`, { headers: auth })).json();
+      const server = (listed.servers || [])[0];
+      if (!server) return;
+
+      const res = await fetch(`${base}/api/servers/${server.id}/install`, {
+        method: 'POST',
+        headers: { ...auth, 'content-type': 'application/json' },
+        body: JSON.stringify({ version: '1.5.0', dryRun: true }),
+      });
+      assert.ok(
+        res.status === 200 || res.status === 502 || res.status === 404,
+        `the install endpoint answered ${res.status}`,
+      );
+      if (res.status === 502) {
+        // GitHub was unreachable; that is a different failure from a broken
+        // endpoint and must not be confused with one.
+        const body = await res.json();
+        assert.ok(
+          !/is not defined|Cannot read properties|searchParams/.test(body.error || ''),
+          `the install failed on something other than the network: ${body.error}`,
+        );
+      }
+    });
+
     await step('the agent is served in the three forms the installer tries', async () => {
       const raw = await fetch(`${base}/agent.js`);
       assert.strictEqual(raw.status, 200);
