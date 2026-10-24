@@ -1155,7 +1155,7 @@ function showAgentSetup(server) {
     <label class="f"><span class="lbl">توکن Agent</span>
       <input type="text" id="agentTokenOut" class="mono" value="${esc(server.agentToken || '')}" readonly></label>
     <label class="f"><span class="lbl">دستور نصب (کپی کنید)</span>
-      <textarea id="agentCmd" readonly style="min-height:150px">curl -fsSL ${location.origin}/install-agent.sh | sudo WW_PANEL_URL="${location.origin}" WW_AGENT_TOKEN="${server.agentToken || ''}" bash</textarea></label>
+      <textarea id="agentCmd" readonly style="min-height:150px">curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 ${location.origin}/install-agent.sh -o /tmp/ww-install-agent.sh && sudo WW_PANEL_URL="${location.origin}" WW_AGENT_TOKEN="${server.agentToken || ''}" bash /tmp/ww-install-agent.sh</textarea></label>
     <p class="small muted">اگر پنل را روی HTTP ساده اجرا می‌کنید، از یک reverse proxy با HTTPS استفاده کنید تا توکن در مسیر رمزنشده نباشد.</p>`,
     [{ text: 'کپی توکن', class: '', onClick: () => copy(server.agentToken, 'توکن') }, { text: 'بستن', class: 'primary', onClick: closeModal }],
   );
