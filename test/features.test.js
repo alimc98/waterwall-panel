@@ -30,16 +30,40 @@ const { resolveTargets, targetsForSide, foreignIds } = require('../lib/targets')
  * the isolation and port code issue, so the stub records them and answers the
  * two shapes that matter: "is this path free?" and "which ports are open?".
  */
-function fakeSsh({ openPorts = [], free = true } = {}) {
+function fakeSsh({ openPorts = [], free = true, ownPorts = [], ownPid = 4242, otherPid = 9999 } = {}) {
   const calls = [];
   return {
     calls,
     shellQuote: (s) => `'${String(s).replace(/'/g, "'\\''")}'`,
     async sshExec(server, command) {
       calls.push({ server: server.id, command });
-      if (command.includes('ss -H -lnt')) {
-        return { ok: true, failed: false, stdout: openPorts.map((p) => `LISTEN 0 4096 0.0.0.0:${p} 0.0.0.0:*`).join('\n') };
+      // The probe runs several commands in one shell call, so the output can
+      // contain both the socket list and the unit pids. Every part is
+      // answered, and the parts are stitched together the way the shell
+      // would.
+      const parts = [];
+      if (command.includes('systemctl show')) {
+        const units = command.match(/'([A-Za-z0-9_.@-]+)'/g) || [];
+        for (const raw of units) {
+          const name = raw.slice(1, -1);
+          parts.push(`Id=${name}.service`);
+          parts.push(`MainPID=${ownPid}`);
+        }
       }
+      if (command.includes('ss -H -lntp')) {
+        // The pid-aware pass: a port held by the tunnel's own process, and a
+        // port held by somebody else.
+        for (const p of openPorts) {
+          const pid = ownPorts.includes(p) ? ownPid : otherPid;
+          parts.push(`LISTEN 0 4096 0.0.0.0:${p} 0.0.0.0:* users:(("memfd:waterwall",pid=${pid},fd=10))`);
+        }
+      }
+      if (command.includes('ss -H -lnt') && !command.includes('ss -H -lntp')) {
+        for (const p of openPorts) {
+          parts.push(`LISTEN 0 4096 0.0.0.0:${p} 0.0.0.0:*`);
+        }
+      }
+      if (parts.length) return { ok: true, failed: false, stdout: parts.join('\n') };
       if (command.includes('FREE') || command.includes('TAKEN')) {
         return { ok: true, failed: false, stdout: free ? 'FREE' : 'TAKEN' };
       }
@@ -102,12 +126,16 @@ function provision(store, tunnel) {
 }
 
 async function tests(ok, fail, failures) {
+  // `fail` is a counter, not a reference: incrementing a local copy would
+  // leave the runner reporting a green suite with failures on screen. The
+  // runner passes a callback so both sides see the same number.
+  const recordFailure = typeof fail === 'function' ? fail : () => { fail += 1; };
   const check = (label, fn) => {
     try {
       fn();
       ok(label);
     } catch (err) {
-      fail += 1;
+      recordFailure(label, err);
       failures.push(`${label}: ${err.message}`);
       console.log(`  ✗ ${label}: ${err.message}`);
     }
@@ -118,7 +146,7 @@ async function tests(ok, fail, failures) {
       await fn();
       ok(label);
     } catch (err) {
-      fail += 1;
+      recordFailure(label, err);
       failures.push(`${label}: ${err.message}`);
       console.log(`  ✗ ${label}: ${err.message}`);
     }
@@ -412,6 +440,57 @@ async function tests(ok, fail, failures) {
       const moved = fix.moved.find((m) => m.key === 'userPort');
       assert.ok(moved, 'the open port was moved');
       assert.notStrictEqual(moved.to, userPort, 'the open port was not reused');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('the tunnel keeps the port its own service already holds', async () => {
+    // Re-applying a tunnel restarts its own service. The port that service
+    // holds is not a collision — counting it would push the tunnel one port
+    // further up on every apply and break the links its users already have.
+    const { store, dir } = freshStore();
+    try {
+      const tunnel = addReality(store, 'again', 'iran', ['london']);
+      const built = provision(store, tunnel);
+      const userPort = Number(built.options?.userPort ?? 443);
+      const ssh = fakeSsh({ openPorts: [userPort], ownPorts: [userPort] });
+      const fix = await portfix.resolvePortConflicts(
+        store,
+        store.getTunnel(tunnel.id),
+        store.getServer('iran'),
+        'iran',
+        built,
+        ssh,
+      );
+      const moved = fix.moved.find((m) => m.key === 'userPort');
+      assert.ok(!moved, 'the port was left alone');
+      assert.strictEqual(fix.options.userPort, userPort, 'the stored port is unchanged');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('a port held by another process is still respected', async () => {
+    // The own-service exemption must not cover sockets held by somebody else
+    // on the same box.
+    const { store, dir } = freshStore();
+    try {
+      const tunnel = addReality(store, 'other', 'iran', ['london']);
+      const built = provision(store, tunnel);
+      const userPort = Number(built.options?.userPort ?? 443);
+      const ssh = fakeSsh({ openPorts: [userPort], ownPorts: [] });
+      const fix = await portfix.resolvePortConflicts(
+        store,
+        store.getTunnel(tunnel.id),
+        store.getServer('iran'),
+        'iran',
+        built,
+        ssh,
+      );
+      const moved = fix.moved.find((m) => m.key === 'userPort');
+      assert.ok(moved, 'the port was moved out of the way');
+      assert.notStrictEqual(moved.to, userPort, 'the busy port was not reused');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

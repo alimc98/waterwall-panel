@@ -1904,7 +1904,16 @@ const featurePending = (async () => {
     pass += 1;
     console.log(`  ✓ ${label}`);
   };
-  await require('./features.test').tests(ok, fail, failures);
+  // The feature suite counts its own failures, so it gets a callback rather
+  // than the runner's counter: a number passed by value would leave the
+  // summary green while the suite printed failures.
+  await require('./features.test').tests(
+    ok,
+    () => {
+      fail += 1;
+    },
+    failures,
+  );
 })();
 
 // ---- store round trip -----------------------------------------------------
