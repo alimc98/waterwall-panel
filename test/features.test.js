@@ -43,12 +43,8 @@ function fakeSsh({ openPorts = [], free = true, ownPorts = [], ownPid = 4242, ot
       // would.
       const parts = [];
       if (command.includes('systemctl show')) {
-        const units = command.match(/'([A-Za-z0-9_.@-]+)'/g) || [];
-        for (const raw of units) {
-          const name = raw.slice(1, -1);
-          parts.push(`Id=${name}.service`);
-          parts.push(`MainPID=${ownPid}`);
-        }
+        // `--value` prints the pid and nothing else.
+        return { ok: true, failed: false, stdout: `${ownPid}\n` };
       }
       if (command.includes('ss -H -lntp')) {
         // The pid-aware pass: a port held by the tunnel's own process, and a
