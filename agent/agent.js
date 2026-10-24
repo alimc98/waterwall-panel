@@ -113,24 +113,37 @@ async function serviceStatus(service) {
  * The release archive names the binary "Waterwall" while many guides and
  * hand-made installs use "WaterWall". Linux paths are case sensitive, so try
  * both rather than assuming.
+ *
+ * A binary built for a newer CPU prints a complaint instead of its version
+ * and exits. Reporting that as "no version" would hide the real reason, so
+ * it is passed back as `problem`.
  */
 async function waterwallVersion(basePath) {
   const candidates = ['Waterwall', 'WaterWall'].map((n) => `${basePath}/${n}`);
   const attempts = [['--version'], ['-v'], ['version'], ['--help']];
+  let problem = null;
   for (const binary of candidates) {
     for (const args of attempts) {
       const res = await run(binary, args);
       const text = `${res.stdout || ''} ${res.stderr || ''}`;
       const m = text.match(/(\d+\.\d+\.\d+)/);
-      if (m) return m[1];
+      if (m) return { version: m[1], problem };
+      if (/newer .*CPU/i.test(text)) {
+        problem = {
+          kind: 'cpu-too-old',
+          message:
+            'این باینری واتروال برای CPU جدیدتری ساخته شده و روی این سرور اجرا نمی‌شود. ' +
+            'نسخهٔ old-cpu را نصب کنید.',
+        };
+      }
     }
   }
-  return null;
+  return { version: null, problem };
 }
 
 async function localFacts() {
   const serviceName = process.env.WW_SERVICE || 'waterwall';
-  const [service, enabled, listeners, bootId, waterwallVersionText] = await Promise.all([
+  const [service, enabled, listeners, bootId, core] = await Promise.all([
     serviceStatus(serviceName),
     run('systemctl', ['is-enabled', serviceName]),
     run('ss', ['-lntup']),
@@ -166,7 +179,8 @@ async function localFacts() {
     bootId: bootId.stdout,
     listeners: parseListeners(listeners.stdout).slice(0, 200),
     loadAvg: os.loadavg().map((n) => Number(n.toFixed(2))),
-    waterwallVersion: waterwallVersionText,
+    waterwallVersion: core.version,
+    waterwallProblem: core.problem,
     agentVersion: '1.1.0',
   };
 }

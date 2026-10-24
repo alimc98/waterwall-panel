@@ -880,6 +880,23 @@ for (const tpl of templates.ALL) {
   assert.strictEqual(tooOld.problems.length, 1, 'old server version must warn');
   assert.strictEqual(v.checkServer({ minVersion: '1.46.96' }, { lastStatus: { waterwallVersion: '1.46.96' } }).problems.length, 0);
   assert.strictEqual(v.checkServer({}, null).known, false);
+
+  // A binary built for a newer CPU never reports a version — the core
+  // prints a complaint and exits. The agent passes that complaint along,
+  // and the panel has to show it instead of the vague "version not
+  // reported" message.
+  const cpuTooOld = v.checkServer({}, {
+    lastStatus: {
+      waterwallVersion: null,
+      waterwallProblem: {
+        kind: 'cpu-too-old',
+        message: 'این باینری واتروال برای CPU جدیدتری ساخته شده و روی این سرور اجرا نمی‌شود.',
+      },
+    },
+  });
+  assert.strictEqual(cpuTooOld.problems.length, 1, 'the CPU problem must be reported');
+  assert.strictEqual(cpuTooOld.problems[0].kind, 'cpu-too-old');
+  assert.ok(/CPU/.test(cpuTooOld.message), 'the message names the cause');
 }
 
 // ---- new WaterWall 1.46.96 surfaces --------------------------------------
