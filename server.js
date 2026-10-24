@@ -230,7 +230,7 @@ async function upstreamReleases(force = false) {
 router.get('/api/upgrade/releases', async (req, res) => {
   if (guard(req, res)) return;
   try {
-    const releases = await upstreamReleases(req.url.searchParams.get('refresh') === '1');
+    const releases = await upstreamReleases(url.searchParams.get('refresh') === '1');
     sendJson(res, 200, {
       ok: true,
       current: versions.CURRENT,
@@ -257,7 +257,7 @@ router.get('/api/upgrade/releases', async (req, res) => {
  */
 router.get('/api/upgrade/plan', async (req, res) => {
   if (guard(req, res)) return;
-  const target = req.url.searchParams.get('version') || versions.CURRENT;
+  const target = url.searchParams.get('version') || versions.CURRENT;
   let releases = [];
   try {
     releases = await upstreamReleases();

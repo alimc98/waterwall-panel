@@ -1373,6 +1373,51 @@ async function securityTests() {
       ac.abort();
       clearTimeout(timer);
     });
+
+    await step('the upgrade endpoints read their query parameters', async () => {
+      // The router hands the handler a parsed URL, not the raw string on
+      // req.url. Reading `req.url.searchParams` throws, and the endpoint
+      // answers 500 instead of the release list.
+      const auth = { authorization: `Bearer ${token}` };
+      const releases = await fetch(`${base}/api/upgrade/releases?refresh=1`, { headers: auth });
+      assert.ok(
+        releases.status === 200 || releases.status === 502,
+        `the release list answered ${releases.status}`,
+      );
+      if (releases.status === 502) {
+        // GitHub was unreachable; that is a different failure and must not be
+        // confused with a broken query parameter.
+        const body = await releases.json();
+        assert.ok(
+          !/searchParams|Cannot read properties/.test(body.error || ''),
+          `the release list failed on its query parameter: ${body.error}`,
+        );
+      }
+    });
+
+    await step('the agent is served in the three forms the installer tries', async () => {
+      const raw = await fetch(`${base}/agent.js`);
+      assert.strictEqual(raw.status, 200);
+      const rawBody = Buffer.from(await raw.arrayBuffer());
+      assert.ok(rawBody.length > 5000, 'the raw agent is too small to be the agent');
+
+      const gz = await fetch(`${base}/agent.js.gz`);
+      assert.strictEqual(gz.status, 200);
+      const gzBody = Buffer.from(await gz.arrayBuffer());
+      assert.ok(gzBody.length > 500, 'the gzip form is too small');
+      // The gzip form has to decode to exactly the same bytes as the raw one,
+      // otherwise the installer would install something else.
+      const { gunzipSync } = require('node:zlib');
+      assert.ok(gunzipSync(gzBody).equals(rawBody), 'the gzip form is not the agent');
+
+      const b64 = await fetch(`${base}/agent.js.b64`);
+      assert.strictEqual(b64.status, 200);
+      const b64Body = Buffer.from(await b64.arrayBuffer());
+      assert.ok(
+        Buffer.from(b64Body.toString('utf8'), 'base64').equals(rawBody),
+        'the base64 form is not the agent',
+      );
+    });
   } finally {
     child.kill();
   }
