@@ -485,6 +485,24 @@ async function tests(ok, fail, failures) {
         secondRun.clones.some((c) => !c.reused),
         'a fresh clone was made',
       );
+      // The record the tunnel already refers to has to be repointed, not
+      // replaced: a new record would leave the old id dangling and the
+      // tunnel would point at a server that no longer exists.
+      const stillThere = store
+        .listServers()
+        .filter((s) => s.clonedFor === second.id)
+        .map((s) => s.id);
+      assert.strictEqual(
+        stillThere.length,
+        staleCount,
+        'the clone records were repointed, not duplicated',
+      );
+      for (const id of stillThere) {
+        assert.ok(
+          store.getServer(id),
+          `the record ${id} still exists`,
+        );
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
