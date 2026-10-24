@@ -162,6 +162,93 @@ asset_name() {
   echo "Waterwall-${1}.zip"
 }
 
+# Download a URL to a file, surviving the two ways a transfer to an Iranian
+# or otherwise distant host usually breaks.
+#
+# 1. The connection can stall for minutes and then be reset by the path. A
+#    stalled transfer is not a slow one: --speed-limit/--speed-time abort it
+#    after 30 seconds below 1 KiB/s, so the retry starts a fresh connection
+#    instead of waiting for a packet that will never arrive.
+# 2. A reset mid-transfer leaves a *partial* file behind. curl exits non-zero
+#    on the reset, but the bytes it did receive are already on disk, so the
+#    caller must not trust the file it finds. The download therefore goes to a
+#    temporary name and is only moved into place once it is complete.
+#
+# $1 url, $2 destination, $3 minimum size in bytes (0 = no minimum).
+# Decode a base64 file. `base64 -d` is not on every minimal image, so
+# openssl and python3 are tried as well.
+decode_base64() {
+  local file="$1"
+  if command -v base64 >/dev/null 2>&1; then
+    base64 -d "$file" && return 0
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl base64 -d -in "$file" && return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(open(sys.argv[1],"rb").read()))' "$file" && return 0
+  fi
+  if command -v busybox >/dev/null 2>&1; then
+    busybox base64 -d "$file" && return 0
+  fi
+  return 1
+}
+
+fetch_file() {
+  local url="$1" dest="$2" min="${3:-0}" tmp attempts=5
+  tmp="${dest}.part.$$"
+
+  if command -v curl >/dev/null 2>&1; then
+    local attempt=1
+    while [ "$attempt" -le "$attempts" ]; do
+      rm -f "$tmp"
+      info "downloading ${url} (attempt ${attempt}/${attempts})"
+      if curl -fL --retry 2 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 20 --max-time 600 \
+              --speed-limit 1024 --speed-time 30 \
+              -o "$tmp" "$url"; then
+        local size
+        size="$(wc -c < "$tmp" 2>/dev/null || echo 0)"
+        if [ "$size" -ge "$min" ] && [ "$size" -gt 0 ]; then
+          mv -f "$tmp" "$dest"
+          return 0
+        fi
+        warn "download finished but the file is only ${size} bytes; retrying."
+      else
+        warn "download failed or was interrupted; retrying."
+      fi
+      attempt=$((attempt + 1))
+      [ "$attempt" -le "$attempts" ] && sleep $((attempt * 2))
+    done
+    rm -f "$tmp"
+    return 1
+  fi
+
+  if command -v wget >/dev/null 2>&1; then
+    local attempt=1
+    while [ "$attempt" -le "$attempts" ]; do
+      rm -f "$tmp"
+      if wget -q --tries=3 --timeout=30 -O "$tmp" "$url"; then
+        local size
+        size="$(wc -c < "$tmp" 2>/dev/null || echo 0)"
+        if [ "$size" -ge "$min" ] && [ "$size" -gt 0 ]; then
+          mv -f "$tmp" "$dest"
+          return 0
+        fi
+        warn "download finished but the file is only ${size} bytes; retrying."
+      else
+        warn "download failed or was interrupted; retrying."
+      fi
+      attempt=$((attempt + 1))
+      [ "$attempt" -le "$attempts" ] && sleep $((attempt * 2))
+    done
+    rm -f "$tmp"
+    return 1
+  fi
+
+  return 2
+}
+
 download_waterwall() {
   local arch asset url tmp
   arch="$(detect_arch)"
@@ -182,17 +269,10 @@ download_waterwall() {
     cp "$WATERWALL_ZIP" "$tmp/$asset"
   else
     info "downloading …"
-    if command -v curl >/dev/null 2>&1; then
-      curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$tmp/$asset" "$url" \
-        || die "download failed. If this server cannot reach GitHub, download the
+    fetch_file "$url" "$tmp/$asset" 1000000 \
+      || die "download failed. If this server cannot reach GitHub, download the
 zip elsewhere and re-run with:
   --waterwall-zip /path/to/$asset --offline"
-    elif command -v wget >/dev/null 2>&1; then
-      wget -q --tries=3 --timeout=20 -O "$tmp/$asset" "$url" \
-        || die "download failed; use --waterwall-zip with a local file instead."
-    else
-      die "neither curl nor wget is available."
-    fi
   fi
 
   local size
@@ -266,15 +346,54 @@ install_agent() {
     major="$(node -p 'process.versions.node.split(".")[0]')"
     [ "$major" -ge 18 ] || die "Node.js 18+ required (found $(node -v))."
 
-    local url="${PANEL_URL%/}/agent.js"
-    info "agent       : downloading $url"
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsSL --connect-timeout 20 -o "$target" "$url" \
-        || die "could not download the agent from ${url}.
+    # The panel sits behind the same long-haul path as the server. The raw
+    # agent.js does not always survive that path: the transfer stops a few
+    # hundred bytes in and is reset, which used to leave a truncated
+    # agent.js on disk that then failed to parse. The same bytes gzip- or
+    # base64-encoded come through whole, so all three forms are tried in
+    # turn and only a complete file is moved into place.
+    local base="${PANEL_URL%/}"
+    local tmp="${target}.download"
+    local ok=0
+
+    # 1. the raw file
+    info "agent       : downloading $base/agent.js"
+    if fetch_file "$base/agent.js" "$tmp" 5000; then
+      ok=1
+    else
+      # 2. gzip
+      info "agent       : retrying with gzip ($base/agent.js.gz)"
+      if fetch_file "$base/agent.js.gz" "$tmp.gz" 500 \
+         && gunzip -c "$tmp.gz" > "$tmp" 2>/dev/null \
+         && [ "$(wc -c < "$tmp" 2>/dev/null || echo 0)" -ge 5000 ]; then
+        ok=1
+      else
+        rm -f "$tmp"
+      fi
+      rm -f "$tmp.gz"
+
+      # 3. base64: plain text, which the path has never refused
+      if [ "$ok" -eq 0 ]; then
+        info "agent       : retrying with base64 ($base/agent.js.b64)"
+        if fetch_file "$base/agent.js.b64" "$tmp.b64" 500 \
+           && decode_base64 "$tmp.b64" > "$tmp" 2>/dev/null \
+           && [ "$(wc -c < "$tmp" 2>/dev/null || echo 0)" -ge 5000 ]; then
+          ok=1
+        else
+          rm -f "$tmp"
+        fi
+        rm -f "$tmp.b64"
+      fi
+    fi
+
+    if [ "$ok" -eq 1 ]; then
+      install -m 0755 "$tmp" "$target"
+      rm -f "$tmp"
+    else
+      rm -f "$tmp"
+      die "could not download the agent from ${base}/agent.js.
 If the panel is unreachable, save agent.js on any machine that can reach it
 and re-run with:  --agent-file /path/to/agent.js"
-    else
-      wget -q -O "$target" "$url" || die "could not download the agent; use --agent-file."
     fi
   fi
   chmod 0755 "$target"

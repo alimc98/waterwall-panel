@@ -26,6 +26,9 @@ const state = {
   currentTunnel: null,
   currentServer: null,
   activePreviewTab: 'iran',
+  upgrade: null,      // upstream releases + the per-server upgrade plan
+  upgradeBusy: false,
+  upgradeMsg: null,   // the outcome of the last upgrade run
 };
 
 // ------------------------------------------------------------------ utils
@@ -188,6 +191,23 @@ async function loadAll() {
   state.outbound = data.outbound || null;
 }
 
+/**
+ * The upstream releases, for the upgrade card.
+ *
+ * Fetched on its own rather than as part of bootstrap: the release list comes
+ * from GitHub and must not delay the panel itself from opening.
+ */
+async function loadUpgradeReleases() {
+  try {
+    const r = await api('/api/upgrade/releases');
+    state.upgrade = { ...(state.upgrade || {}), releases: r.releases || [] };
+  } catch (err) {
+    // A GitHub outage must not break the servers page; the upgrade card
+    // shows the error and the operator can retry.
+    state.upgrade = { ...(state.upgrade || {}), releases: [], error: err.message };
+  }
+}
+
 /** Certificate state is fetched separately; it is not part of bootstrap. */
 async function loadCerts() {
   try {
@@ -271,6 +291,14 @@ function render() {
     // dashboard clears the flag so coming back re-checks instead of showing a
     // stale verdict from an hour ago.
     if (state.page !== 'dashboard') state.linksProbed = false;
+    // The upgrade card needs the upstream release list, which comes from
+    // GitHub. It is fetched when the servers page opens, not before, so a
+    // slow or unreachable GitHub does not hold up the panel.
+    if (state.page === 'servers' && !state.upgrade?.releases?.length) {
+      loadUpgradeReleases().then(() => {
+        if (state.page === 'servers') render();
+      });
+    }
   }
   const fns = {
     dashboard: pageDashboard,
@@ -481,6 +509,102 @@ function versionCardHtml() {
             <table style="margin-top:8px"><thead><tr><th>تنظیم</th><th>نود</th><th>از نسخه</th></tr></thead><tbody>
               ${v.breaking.map((b) => `<tr><td class="ltr"><b>${esc(b.key)}</b></td><td class="ltr small">${esc((b.nodes || []).join(', '))}</td><td class="ltr small">${esc(b.since)}</td></tr>`).join('')}
             </tbody></table>
+          </details>`
+        : ''
+    }
+  </div>`;
+}
+
+/**
+ * The core-upgrade card.
+ *
+ * The panel knows which WaterWall release it is written against, and every
+ * server reports the release it runs. This card is where the two are
+ * compared: it lists the upstream releases, shows what each server is on,
+ * and lets the operator upgrade the whole fleet in one go.
+ *
+ * The upgrade is deliberately two-step. The plan is shown first — which
+ * build each host needs, which services would restart — because an upgrade
+ * that restarts a service is not something to do blind, and because a host
+ * with an old CPU needs a different build than the rest of the fleet.
+ */
+function upgradeCardHtml() {
+  const u = state.upgrade;
+  const busy = state.upgradeBusy;
+  const releases = u?.releases || [];
+  const rows = u?.plan?.servers || [];
+
+  return `
+  <div class="card" id="upgradeCard">
+    <h3>⬆️ به‌روزرسانی هستهٔ واتروال
+      <span class="badge ${u?.plan?.target === state.versions?.current ? 'ok' : ''}">${esc(u?.plan?.target || state.versions?.current || '—')}</span>
+    </h3>
+    <p class="small muted" style="line-height:2">
+      پنل می‌تواند هستهٔ واتروال را روی سرور اصلی و روی سرورهای خارجی به‌روز کند.
+      بیلد متناسب با CPU هر سرور خودکار انتخاب می‌شود (سرور بدون <span class="mono">avx2</span> بیلد <span class="mono">old-cpu</span> می‌گیرد)،
+      نسخهٔ قبلی کنار باینری جدید نگه داشته می‌شود و همهٔ سرویس‌های آن سرور با هم ری‌استارت می‌شوند.
+      <br>
+      <b>دو سر یک تونل باید با هم ارتقا بروند</b>؛ پنل اگر ارتقا باعث شود یک تونل نصفه‌به‌نیمه بماند، اجازهٔ اجرا نمی‌دهد.
+    </p>
+
+    <div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap">
+      <select id="upgradeVersion" class="input" style="max-width:220px">
+        ${releases.length
+          ? releases
+              .map(
+                (r) =>
+                  `<option value="${esc(r.version)}" ${r.version === (u?.plan?.target || state.versions?.current) ? 'selected' : ''}>${esc(r.version)}${r.version === state.versions?.current ? ' (نسخهٔ پنل)' : ''}</option>`,
+              )
+              .join('')
+          : '<option>در حال خواندن…</option>'}
+      </select>
+      <button class="btn" id="upgradePlanBtn" ${busy ? 'disabled' : ''}>🔍 بررسی برنامهٔ ارتقا</button>
+      <button class="primary" id="upgradeApplyBtn" ${busy || !rows.length ? 'disabled' : ''}>
+        ${busy ? 'در حال انجام…' : '⬆️ ارتقای همهٔ سرورها'}
+      </button>
+      ${u?.plan?.split?.length ? '<button class="btn danger" id="upgradePartialBtn">فقط سرورهای انتخابی</button>' : ''}
+    </div>
+
+    ${state.upgradeMsg ? `<div class="${state.upgradeMsg.ok ? 'ok-box' : 'err-box'}" style="margin-top:12px">${state.upgradeMsg.text}</div>` : ''}
+
+    ${
+      rows.length
+        ? `<table style="margin-top:12px"><thead><tr>
+            <th>سرور</th><th>نسخهٔ فعلی</th><th>معماری</th><th>بیلد لازم</th><th>سرویس‌ها</th><th></th>
+          </tr></thead><tbody>
+          ${rows
+            .map((r) => {
+              if (!r.ok) {
+                return `<tr><td><strong>${esc(r.name)}</strong></td><td colspan="5" class="small" style="color:var(--err)">${esc(r.error || 'در دسترس نیست')}</td><td></td></tr>`;
+              }
+              const stale = r.outdated ? 'err' : 'ok';
+              return `<tr>
+                <td><strong>${esc(r.name)}</strong><br><span class="small muted ltr">${esc(r.host || '')}</span></td>
+                <td><span class="badge ${r.reported ? stale : 'mute'}">${r.reported ? esc(r.reported) : 'نامشخص'}</span></td>
+                <td class="ltr small">${esc(r.arch || '—')}${r.hasAvx2 === false ? ' <span class="badge mute">بدون avx2</span>' : ''}</td>
+                <td class="ltr small">${esc(r.asset || '—')}<br><span class="small muted">${esc(r.assetReason || '')}</span></td>
+                <td class="ltr small">${(r.units || []).map((u) => esc(u)).join('<br>') || '—'}</td>
+                <td style="white-space:nowrap">
+                  ${
+                    r.nothingToDo
+                      ? '<span class="small muted">نصبی ندارد</span>'
+                      : `<button class="sm" data-upgrade-one="${esc(r.id)}">ارتقای این سرور</button>`
+                  }
+                </td>
+              </tr>`;
+            })
+            .join('')}
+          </tbody></table>`
+        : ''
+    }
+
+    ${
+      releases.length
+        ? `<details style="margin-top:12px">
+            <summary class="small" style="cursor:pointer">یادداشت انتشار ${esc(u?.plan?.target || '')}</summary>
+            <pre class="code" style="direction:ltr;text-align:left;margin-top:8px;max-height:320px;overflow:auto">${esc(
+              releases.find((r) => r.version === (u?.plan?.target || state.versions?.current))?.notes || '',
+            )}</pre>
           </details>`
         : ''
     }
@@ -881,10 +1005,16 @@ function pageServers() {
     </p>
 
     <h4 style="margin:14px 0 8px;font-size:12px;color:var(--accent)">نصب خودکار</h4>
-    <pre class="code" style="direction:ltr;text-align:left">curl -fsSL ${esc(location.origin)}/install.sh | sudo bash -s -- \\
+    <pre class="code" style="direction:ltr;text-align:left">curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \\
+  ${esc(location.origin)}/install.sh -o /tmp/ww-install.sh && \\
+sudo bash /tmp/ww-install.sh \\
   --panel-url ${esc(location.origin)} \\
   --agent-token AGENT_TOKEN</pre>
     <div class="small muted">توکن هر سرور جداست: در جدول بالا دکمه «ویرایش» را بزنید.</div>
+    <div class="small muted" style="margin-top:6px">
+      فایل اول دانلود می‌شود و بعد اجرا — اگر دانلود وسط کار قطع شود، نصبِ نیمه‌کاره جا نمی‌ماند.
+      اگر <span class="mono">sudo</span> رمز می‌خواهد، اول <span class="mono">sudo -v</span> را اجرا کنید.
+    </div>
 
     <h4 style="margin:18px 0 8px;font-size:12px;color:var(--accent)">نصب آفلاین</h4>
     <pre class="code" style="direction:ltr;text-align:left"># 1) روی کامپیوتر خودتان:
@@ -915,6 +1045,8 @@ sudo ./install.sh --offline \\
   </div>
 
 ${versionCardHtml()}
+
+${upgradeCardHtml()}
 
   <div class="card">
     ${
@@ -2483,6 +2615,72 @@ function afterRender() {
   });
   $$('[data-srv-probe]').forEach((b) => {
     b.onclick = () => probeServer(b.dataset.srvProbe);
+  });
+  // ---- core upgrade --------------------------------------------------------
+  const upgradeVersion = () => $('#upgradeVersion')?.value || state.versions?.current;
+
+  const loadUpgradePlan = async () => {
+    state.upgradeBusy = true;
+    state.upgradeMsg = null;
+    render();
+    try {
+      const [releases, plan] = await Promise.all([
+        api('/api/upgrade/releases'),
+        api(`/api/upgrade/plan?version=${encodeURIComponent(upgradeVersion())}`),
+      ]);
+      state.upgrade = { releases: releases.releases || [], plan };
+      state.upgradeBusy = false;
+      render();
+    } catch (err) {
+      state.upgradeBusy = false;
+      state.upgradeMsg = { ok: false, text: err.message };
+      render();
+    }
+  };
+
+  const runUpgrade = async (serverIds, allowPartial) => {
+    state.upgradeBusy = true;
+    state.upgradeMsg = null;
+    render();
+    try {
+      const res = await api('/api/upgrade/apply', {
+        method: 'POST',
+        body: { version: upgradeVersion(), serverIds, allowPartial, dryRun: false, restart: true },
+      });
+      const done = (res.results || []).filter((r) => r.ok);
+      const failed = (res.failed || []).length;
+      const lines = (res.results || [])
+        .map((r) =>
+          r.skipped
+            ? `⊘ ${r.name}: ${r.reason}`
+            : r.ok
+              ? `✓ ${r.name}${r.installed ? ` — ${r.installed.length} نصب به‌روز شد` : ''}`
+              : `✗ ${r.name}: ${r.error || 'ناموفق'}`,
+        )
+        .join('<br>');
+      state.upgradeMsg = {
+        ok: !failed,
+        text: `ارتقا به ${res.target}: ${done.length} سرور موفق، ${failed} ناموفق.<br>${lines}`,
+      };
+      state.upgradeBusy = false;
+      // The servers report their new version through the agent, so the table
+      // is re-read rather than patched in the browser.
+      await loadUpgradePlan();
+    } catch (err) {
+      state.upgradeBusy = false;
+      state.upgradeMsg = { ok: false, text: err.message };
+      render();
+    }
+  };
+
+  $('#upgradePlanBtn')?.addEventListener('click', loadUpgradePlan);
+  $('#upgradeApplyBtn')?.addEventListener('click', () => runUpgrade(null, false));
+  $('#upgradePartialBtn')?.addEventListener('click', () => {
+    const ids = state.upgrade?.plan?.servers?.filter((r) => r.ok && !r.nothingToDo).map((r) => r.id) || [];
+    runUpgrade(ids, true);
+  });
+  $$('[data-upgrade-one]').forEach((b) => {
+    b.onclick = () => runUpgrade([b.dataset.upgradeOne], true);
   });
   $$('[data-srv-logs]').forEach((b) => {
     b.onclick = () => showServerLogs(b.dataset.srvLogs);

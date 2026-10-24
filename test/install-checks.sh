@@ -64,7 +64,7 @@ probe() {
 
 echo "  (parser checked via the real script's --help path)"
 out="$(bash "$S" --help 2>&1)"
-check_contains "default version documented" "1.46.96" "$out"
+check_contains "default version documented" "1.5.0" "$out"
 check_contains "default base documented" "/opt/waterwall" "$out"
 
 echo ""
@@ -112,6 +112,58 @@ ExecStart=${WW_BASE}/Waterwall
 UNIT
 ')"
 check "unit points at the real binary name" "ExecStart=/opt/waterwall/Waterwall" "$unit"
+
+echo ""
+echo "== a stalled download is retried, not accepted as a partial file =="
+
+# The panel is reached over a long path and a transfer that stops moving is
+# reset rather than completed. The installer therefore retries and refuses a
+# file that is too small to be the real agent.
+check "the agent download retries" "yes" "$([ "$(grep -c 'retry-all-errors' "$S")" -gt 0 ] && echo yes || echo no)"
+
+# The download has to land in a temporary file and only be moved into place
+# once it is complete, and its size has to be checked.
+check "the download lands in a temporary file first" "yes" "$([ "$(grep -c 'part\.\$\$' "$S")" -gt 0 ] && echo yes || echo no)"
+check "the size of the agent download is checked" "yes" "$([ "$(grep -c 'fetch_file "$base/agent.js" "$tmp" 5000' "$S")" -gt 0 ] && echo yes || echo no)"
+
+# The raw agent does not always survive the long path from the panel to an
+# exit server, so the installer falls back to the gzip and base64 forms.
+check "the installer falls back to gzip" "yes" "$([ "$(grep -c 'agent\.js\.gz' "$S")" -gt 0 ] && echo yes || echo no)"
+check "the installer falls back to base64" "yes" "$([ "$(grep -c 'agent\.js\.b64' "$S")" -gt 0 ] && echo yes || echo no)"
+check "the base64 decoder has alternatives" "yes" "$([ "$(grep -c 'openssl base64 -d' "$S")" -gt 0 ] && echo yes || echo no)"
+
+# fetch_file must fail when the transfer keeps failing, rather than leaving a
+# partial file behind as if it were good. The function is checked by running
+# it on its own: sourcing the whole installer is not possible because it
+# runs `set -e` and exits before the functions are defined.
+out="$(bash -c '
+  set -uo pipefail
+  info() { :; }
+  warn() { :; }
+  sleep() { :; }
+  # The body of fetch_file, taken from the installer, with the network
+  # replaced by a curl that always fails the way a reset transfer does.
+  eval "$(sed -n "/^fetch_file()/,/^}/p" "'"$S"'")"
+  curl() { printf "x" > "$3"; return 56; }
+  fetch_file "http://example.test/agent.js" "/tmp/ww-fetch-test.js" 5000
+  echo "EXIT=$?"
+' 2>&1)"
+check_contains "a failed download is not accepted" "EXIT=1" "$out"
+
+# The partial file must not survive a failed download either.
+check "a failed download leaves no file behind" "no" \
+  "$([ -f /tmp/ww-fetch-test.js ] && echo yes || echo no)"
+
+echo ""
+echo "== the README command does not pipe a half-downloaded script into bash =="
+
+# `curl … | bash` runs whatever arrived when the transfer broke. The README
+# therefore downloads to a file first.
+readme="$(cd "$(dirname "$0")/.." && pwd)/README.md"
+if [ -f "$readme" ]; then
+  check "the README downloads the script before running it" "yes" "$([ "$(grep -c 'ww-install.sh' "$readme")" -gt 0 ] && echo yes || echo no)"
+  check "the README download retries" "yes" "$([ "$(grep -c 'retry-all-errors' "$readme")" -gt 0 ] && echo yes || echo no)"
+fi
 
 echo ""
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"

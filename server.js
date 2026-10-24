@@ -2,6 +2,7 @@
 
 const path = require('node:path');
 const fs = require('node:fs');
+const zlib = require('node:zlib');
 
 const { Store } = require('./lib/store');
 const templates = require('./lib/templates');
@@ -11,6 +12,7 @@ const ssh = require('./lib/ssh');
 const tests = require('./lib/tests');
 const protoscan = require('./lib/protoscan');
 const versions = require('./lib/versions');
+const upgrade = require('./lib/upgrade');
 const netcheck = require('./lib/netcheck');
 const certs = require('./lib/certs');
 const linkHealth = require('./lib/links');
@@ -201,6 +203,217 @@ router.get('/api/versions', (req, res) => {
     features: versions.FEATURES,
     servers,
   });
+});
+
+// ---- core upgrade --------------------------------------------------------
+
+/**
+ * The upstream releases the panel can install.
+ *
+ * Cached for a few minutes: the list is the same for every operator and
+ * GitHub rate-limits anonymous API calls, so a page refresh should not spend
+ * one. The cache is only ever a few entries wide and never survives a
+ * restart, which is fine — the panel is restarted when it is upgraded.
+ */
+let releaseCache = { at: 0, releases: null };
+const RELEASE_CACHE_MS = 5 * 60 * 1000;
+
+async function upstreamReleases(force = false) {
+  if (!force && releaseCache.releases && Date.now() - releaseCache.at < RELEASE_CACHE_MS) {
+    return releaseCache.releases;
+  }
+  const releases = await upgrade.fetchReleases({ limit: 12 });
+  releaseCache = { at: Date.now(), releases };
+  return releases;
+}
+
+router.get('/api/upgrade/releases', async (req, res) => {
+  if (guard(req, res)) return;
+  try {
+    const releases = await upstreamReleases(req.url.searchParams.get('refresh') === '1');
+    sendJson(res, 200, {
+      ok: true,
+      current: versions.CURRENT,
+      releases: releases.map((r) => ({
+        version: r.version,
+        tag: r.tag,
+        publishedAt: r.publishedAt,
+        notes: r.notes,
+        assets: r.assets,
+      })),
+    });
+  } catch (err) {
+    sendError(res, 502, `could not reach GitHub: ${err.message}`);
+  }
+});
+
+/**
+ * What an upgrade would do, per server.
+ *
+ * Read-only: this is what the operator looks at before pressing the button,
+ * so it must not change anything on a box. It reports the release each host
+ * is on, the build that host needs (an old CPU gets the old-cpu build), and
+ * the services that would be restarted.
+ */
+router.get('/api/upgrade/plan', async (req, res) => {
+  if (guard(req, res)) return;
+  const target = req.url.searchParams.get('version') || versions.CURRENT;
+  let releases = [];
+  try {
+    releases = await upstreamReleases();
+  } catch (err) {
+    return sendError(res, 502, `could not reach GitHub: ${err.message}`);
+  }
+
+  const servers = store.listServers();
+  const rows = [];
+  for (const server of servers) {
+    const host = await upgrade.inspectHost(ssh, server);
+    if (!host.ok) {
+      rows.push({ id: server.id, name: server.name, host: server.host, ok: false, error: host.error });
+      continue;
+    }
+    const reported = versions.normalise(server.lastStatus?.waterwallVersion);
+    const plan = upgrade.planUpgrade(host, target, releases);
+    rows.push({
+      id: server.id,
+      name: server.name,
+      host: server.host,
+      ok: true,
+      reported,
+      outdated: upgrade.isOutdated(reported, target),
+      arch: host.arch,
+      hasAvx2: host.hasAvx2,
+      units: host.units,
+      binaries: host.binaries,
+      asset: plan.asset ? plan.asset.name : null,
+      assetReason: plan.assetReason,
+      problems: plan.problems,
+      // A box with no WaterWall binary at all has nothing to upgrade; saying
+      // so is more useful than an empty plan.
+      nothingToDo: !host.binaries.length,
+    });
+  }
+  sendJson(res, 200, { ok: true, target, current: versions.CURRENT, servers: rows });
+});
+
+/**
+ * Run the upgrade.
+ *
+ * `serverIds` limits it to some servers; by default every server that has a
+ * WaterWall binary is upgraded. `dryRun` reports the plan without touching
+ * anything.
+ *
+ * The two ends of a tunnel have to be upgraded together — the 1.5.0 release
+ * notes say a reverse client and a reverse server on different versions do
+ * not connect — so the panel refuses a partial upgrade unless the caller
+ * passes `allowPartial: true`. It then says exactly which server would be
+ * left behind.
+ */
+router.post('/api/upgrade/apply', async (req, res) => {
+  if (guard(req, res)) return;
+  const body = await parseJsonBody(req);
+  const target = versions.normalise(body.version) || versions.CURRENT;
+  const dryRun = body.dryRun !== false;
+  const serverIds = Array.isArray(body.serverIds) ? body.serverIds.map(String) : null;
+
+  let releases = [];
+  try {
+    releases = await upstreamReleases(true);
+  } catch (err) {
+    return sendError(res, 502, `could not reach GitHub: ${err.message}`);
+  }
+
+  const all = store.listServers();
+  const chosen = serverIds ? all.filter((s) => serverIds.includes(s.id)) : all;
+  if (!chosen.length) return sendError(res, 400, 'no servers were selected');
+
+  // Which tunnels would be left with one end on the old release?
+  const tunnels = store.listTunnels();
+  const selectedIds = new Set(chosen.map((s) => s.id));
+  const split = [];
+  for (const tunnel of tunnels) {
+    const t = tunnel.targetServers || {};
+    const ids = [t.iran, t.relay, ...(Array.isArray(t.foreign) ? t.foreign : [t.foreign])].filter(Boolean);
+    const inScope = ids.filter((id) => selectedIds.has(id));
+    const outOfScope = ids.filter((id) => !selectedIds.has(id));
+    if (inScope.length && outOfScope.length) {
+      split.push({
+        tunnelId: tunnel.id,
+        name: tunnel.name,
+        selected: inScope.length,
+        leftBehind: outOfScope.length,
+      });
+    }
+  }
+  if (split.length && !body.allowPartial && !dryRun) {
+    return sendError(
+      res,
+      409,
+      'این ارتقا دو سر یک تونل را از هم جدا می‌کند و تونل قطع می‌شود. ' +
+        'همهٔ سرورها را با هم ارتقا دهید، یا اگر مطمئن هستید، allowPartial را بفرستید.',
+      { split },
+    );
+  }
+
+  const results = [];
+  for (const server of chosen) {
+    const host = await upgrade.inspectHost(ssh, server);
+    if (!host.ok) {
+      results.push({ id: server.id, name: server.name, ok: false, error: host.error });
+      continue;
+    }
+    if (!host.binaries.length) {
+      results.push({
+        id: server.id,
+        name: server.name,
+        ok: true,
+        skipped: true,
+        reason: 'این سرور هیچ نصب واتروالی ندارد',
+      });
+      continue;
+    }
+    const plan = upgrade.planUpgrade(host, target, releases);
+    if (plan.problems.length) {
+      results.push({ id: server.id, name: server.name, ok: false, error: plan.problems.join('; ') });
+      continue;
+    }
+    if (dryRun) {
+      results.push({
+        id: server.id,
+        name: server.name,
+        ok: true,
+        dryRun: true,
+        asset: plan.asset.name,
+        units: host.units,
+        reported: versions.normalise(server.lastStatus?.waterwallVersion),
+        outdated: upgrade.isOutdated(server.lastStatus?.waterwallVersion, target),
+      });
+      continue;
+    }
+    const applied = await upgrade.applyUpgrade(ssh, server, {
+      assetUrl: plan.asset.url,
+      version: plan.version,
+      units: host.units,
+      restart: body.restart !== false,
+    });
+    store.log({ type: 'waterwall.upgrade', serverId: server.id, version: plan.version, ok: applied.ok });
+    results.push({
+      id: server.id,
+      name: server.name,
+      ok: applied.ok,
+      version: plan.version,
+      asset: plan.asset.name,
+      installed: applied.installed,
+      services: applied.services,
+      error: applied.error,
+      detail: applied.detail,
+    });
+  }
+
+  const failed = results.filter((r) => !r.ok);
+  broadcast('servers', store.listServers());
+  sendJson(res, failed.length ? 207 : 200, { ok: !failed.length, target, dryRun, results, failed, split });
 });
 
 // ---- servers -------------------------------------------------------------
@@ -672,11 +885,41 @@ async function removeTunnelFromServer(server, files) {
     result.service = `stopped (${(stop.output || '').split(/\r?\n/)[0] || 'inactive'})`;
   };
 
+  /**
+   * Tear the install down completely when this server has nothing left.
+   *
+   * A clone (a record with `clonedFrom`) exists only for the tunnel that
+   * asked for it, so its unit *and* its directory go away together. A base
+   * install may still be the binary of record for the box and is shared with
+   * the panel's other tunnels, so only its unit is removed; the directory
+   * stays so a later tunnel can reuse the binary without downloading it.
+   */
+  const removeInstall = async () => {
+    const isClone = Boolean(server.clonedFrom || server.clonedFor);
+    const removedInstall = await ssh.removeWaterwallInstall(server, {
+      waterwallPath: base,
+      serviceName: server.serviceName || 'waterwall',
+      removeDir: isClone ? 'yes' : 'no',
+    });
+    if (!removedInstall.ok) {
+      result.install = { ok: false, error: removedInstall.error };
+      return;
+    }
+    result.install = {
+      ok: true,
+      unitRemoved: removedInstall.unitRemoved,
+      dirRemoved: removedInstall.dirRemoved,
+      dirKept: !isClone && removedInstall.dirExists,
+    };
+  };
+
   if (!core || !Array.isArray(core.configs)) {
     // Nothing loads these files without a core.json. Only touch the unit when
     // this server really held the tunnel.
-    if (removed.deleted.length) await stopService();
-    else result.service = 'not deployed here';
+    if (removed.deleted.length) {
+      await stopService();
+      await removeInstall();
+    } else result.service = 'not deployed here';
     return result;
   }
 
@@ -698,6 +941,11 @@ async function removeTunnelFromServer(server, files) {
   if (!kept.length) {
     await ssh.sshExec(server, `rm -f ${ssh.shellQuote(corePath)} ${ssh.shellQuote(corePath)}.bak.*`);
     await stopService();
+    // Nothing is left on this box for this tunnel: the unit file and, for a
+    // clone, the whole install directory go away too. Leaving them behind is
+    // what fills /opt with dead services after a few tunnels are created and
+    // deleted.
+    await removeInstall();
     result.core = 'removed';
     return result;
   }
@@ -1441,6 +1689,8 @@ const server = require('node:http').createServer(async (req, res) => {
     // installer, and the offline installer kept at the repo root.
     const DOWNLOADS = {
       '/agent.js': () => path.join(ROOT, 'agent', 'agent.js'),
+      '/agent.js.b64': () => path.join(ROOT, 'agent', 'agent.js'),
+      '/agent.js.gz': () => path.join(ROOT, 'agent', 'agent.js'),
       '/install-agent.sh': () => path.join(PUBLIC_DIR, 'install-agent.sh'),
       '/install.sh': () => path.join(ROOT, 'install.sh'),
       '/panel-install.sh': () => path.join(ROOT, 'panel-install.sh'),
@@ -1453,12 +1703,26 @@ const server = require('node:http').createServer(async (req, res) => {
       } catch {
         return sendError(res, 404, `${url.pathname} is not present in this checkout`);
       }
+      // The raw agent does not always survive the path from the panel to an
+      // exit server: the transfer stops a few hundred bytes in and is reset.
+      // The same bytes gzip- or base64-encoded come through whole, so both
+      // encodings are offered here and the installer falls back to them.
+      //
+      // The encoded forms are sent as plain bytes with no content-encoding
+      // header, so what arrives is always the encoded file whatever flags
+      // the client uses; the installer decodes them itself.
+      let payload = body;
+      if (url.pathname.endsWith('.b64')) {
+        payload = Buffer.from(body.toString('base64'), 'utf8');
+      } else if (url.pathname.endsWith('.gz')) {
+        payload = zlib.gzipSync(body);
+      }
       res.writeHead(200, {
         'content-type': 'text/plain; charset=utf-8',
-        'content-length': body.length,
+        'content-length': payload.length,
         'content-disposition': `attachment; filename="${path.basename(source)}"`,
       });
-      return res.end(body);
+      return res.end(payload);
     }
     // SPA fallback
     if (serveStatic(res, PUBLIC_DIR, '/index.html')) return;

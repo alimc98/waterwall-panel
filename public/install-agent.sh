@@ -21,6 +21,30 @@ WW_AGENT_INTERVAL="${WW_AGENT_INTERVAL:-15}"
 
 PANEL_URL="${WW_PANEL_URL:-}"
 AGENT_TOKEN="${WW_AGENT_TOKEN:-}"
+AGENT_FILE=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agent-file) AGENT_FILE="${2:-}"; shift 2 ;;
+    -h|--help)
+      cat <<'USAGE'
+WaterWall agent installer
+
+ --agent-file FILE Install the agent from this file instead of downloading it
+ -h, --help         This text
+
+Environment equivalents:
+  WW_PANEL_URL     Panel base URL the agent polls
+  WW_AGENT_TOKEN   Per-server agent token
+  WW_AGENT_DIR     Install prefix (default /opt/ww-agent)
+  WW_STATE_DIR     State directory (default /var/lib/ww-agent)
+  WW_SERVICE_NAME  systemd unit name (default ww-agent)
+USAGE
+      exit 0
+      ;;
+    *) echo "unknown option: $1" >&2; exit 1 ;;
+  esac
+done
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "ERROR: run this script as root (sudo)." >&2
@@ -52,18 +76,113 @@ mkdir -p "$WW_AGENT_DIR" "$WW_STATE_DIR"
 echo "==> Downloading the agent from $PANEL_URL"
 AGENT_URL="$PANEL_URL/agent.js"
 TMP_AGENT="$(mktemp)"
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$AGENT_URL" -o "$TMP_AGENT"
-elif command -v wget >/dev/null 2>&1; then
-  wget -qO "$TMP_AGENT" "$AGENT_URL"
-else
-  echo "ERROR: neither curl nor wget is available." >&2
-  exit 1
-fi
 
-if [ ! -s "$TMP_AGENT" ]; then
-  echo "ERROR: could not download the agent from $AGENT_URL" >&2
-  exit 1
+# The panel is reached over a long path, and a transfer that stalls is
+# reset rather than completed. The download therefore retries, aborts a
+# transfer that stops moving, and only accepts a file big enough to be the
+# real agent — a truncated one would be installed and then fail to parse.
+fetch_agent() {
+  local url="${1:-$AGENT_URL}"
+  local attempt=1 attempts=5 size
+  while [ "$attempt" -le "$attempts" ]; do
+    rm -f "$TMP_AGENT"
+    if command -v curl >/dev/null 2>&1; then
+      if curl -fsSL --retry 2 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 20 --max-time 600 \
+              --speed-limit 1024 --speed-time 30 \
+              -o "$TMP_AGENT" "$url"; then
+        size="$(wc -c < "$TMP_AGENT" 2>/dev/null || echo 0)"
+        if [ "$size" -ge 5000 ]; then
+          return 0
+        fi
+        echo "    download finished but the file is only $size bytes; retrying" >&2
+      else
+        echo "    download failed or was interrupted; retrying" >&2
+      fi
+    elif command -v wget >/dev/null 2>&1; then
+      if wget -q --tries=3 --timeout=30 -O "$TMP_AGENT" "$url"; then
+        size="$(wc -c < "$TMP_AGENT" 2>/dev/null || echo 0)"
+        if [ "$size" -ge 5000 ]; then
+          return 0
+        fi
+        echo "    download finished but the file is only $size bytes; retrying" >&2
+      else
+        echo "    download failed or was interrupted; retrying" >&2
+      fi
+    else
+      echo "ERROR: neither curl nor wget is available." >&2
+      return 2
+    fi
+    attempt=$((attempt + 1))
+    [ "$attempt" -le "$attempts" ] && sleep $((attempt * 2))
+  done
+  return 1
+}
+
+# The panel sits behind the same long-haul path as the server, and the raw
+# agent.js does not always survive it: the transfer stops a few hundred bytes
+# in and is reset. The same bytes gzip- or base64-encoded come through
+# whole, so all three forms are tried in turn.
+#
+# Decode a base64 file. `base64 -d` is not on every minimal image, so
+# openssl and python3 are tried as well.
+decode_base64() {
+  local file="$1"
+  if command -v base64 >/dev/null 2>&1; then
+    base64 -d "$file" && return 0
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl base64 -d -in "$file" && return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(open(sys.argv[1],"rb").read()))' "$file" && return 0
+  fi
+  if command -v busybox >/dev/null 2>&1; then
+    busybox base64 -d "$file" && return 0
+  fi
+  return 1
+}
+
+if [ -n "$AGENT_FILE" ]; then
+  [ -f "$AGENT_FILE" ] || { echo "ERROR: --agent-file: no such file: $AGENT_FILE" >&2; exit 1; }
+  cp -f "$AGENT_FILE" "$TMP_AGENT"
+  echo "    using the local file $AGENT_FILE"
+else
+  BASE="${PANEL_URL%/}"
+  ok=0
+  if fetch_agent "$BASE/agent.js"; then
+    ok=1
+  else
+    echo "    retrying with gzip ($BASE/agent.js.gz)" >&2
+    if fetch_agent "$BASE/agent.js.gz" && gunzip -c "$TMP_AGENT" > "$TMP_AGENT.out" 2>/dev/null \
+       && [ "$(wc -c < "$TMP_AGENT.out" 2>/dev/null || echo 0)" -ge 5000 ]; then
+      mv -f "$TMP_AGENT.out" "$TMP_AGENT"
+      ok=1
+    else
+      rm -f "$TMP_AGENT" "$TMP_AGENT.out"
+    fi
+
+    if [ "$ok" -eq 0 ]; then
+      echo "    retrying with base64 ($BASE/agent.js.b64)" >&2
+      if fetch_agent "$BASE/agent.js.b64" && decode_base64 "$TMP_AGENT" > "$TMP_AGENT.out" 2>/dev/null \
+         && [ "$(wc -c < "$TMP_AGENT.out" 2>/dev/null || echo 0)" -ge 5000 ]; then
+        mv -f "$TMP_AGENT.out" "$TMP_AGENT"
+        ok=1
+      else
+        rm -f "$TMP_AGENT" "$TMP_AGENT.out"
+      fi
+    fi
+  fi
+
+  if [ "$ok" -ne 1 ]; then
+    echo "ERROR: could not download the agent from $BASE/agent.js" >&2
+    echo "       The transfer kept failing. Save agent.js on a machine that can" >&2
+    echo "       reach the panel and copy it over with:" >&2
+    echo "         scp agent.js root@SERVER_IP:/root/agent.js" >&2
+    echo "         sudo WW_PANEL_URL=... WW_AGENT_TOKEN=... bash install-agent.sh --agent-file /root/agent.js" >&2
+    rm -f "$TMP_AGENT"
+    exit 1
+  fi
 fi
 
 install -m 0755 "$TMP_AGENT" "$WW_AGENT_DIR/agent.js"
