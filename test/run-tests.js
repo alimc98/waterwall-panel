@@ -1375,9 +1375,10 @@ async function securityTests() {
     });
 
     await step('the upgrade endpoints read their query parameters', async () => {
-      // The router hands the handler a parsed URL, not the raw string on
-      // req.url. Reading `req.url.searchParams` throws, and the endpoint
-      // answers 500 instead of the release list.
+      // The router hands the handler (req, res, ctx) where ctx.url is a
+      // parsed URL object. req.url is the raw string, so req.url.searchParams
+      // was undefined and the endpoint answered 500 with "Cannot read
+      // properties of undefined" instead of the release list.
       const auth = { authorization: `Bearer ${token}` };
       const releases = await fetch(`${base}/api/upgrade/releases?refresh=1`, { headers: auth });
       assert.ok(
@@ -1389,8 +1390,21 @@ async function securityTests() {
         // confused with a broken query parameter.
         const body = await releases.json();
         assert.ok(
-          !/searchParams|Cannot read properties/.test(body.error || ''),
+          !/searchParams|Cannot read properties|is not defined/.test(body.error || ''),
           `the release list failed on its query parameter: ${body.error}`,
+        );
+      }
+      // The plan endpoint reads its version the same way.
+      const plan = await fetch(`${base}/api/upgrade/plan?version=1.5.0`, { headers: auth });
+      assert.ok(
+        plan.status === 200 || plan.status === 500,
+        `the upgrade plan answered ${plan.status}`,
+      );
+      if (plan.status === 500) {
+        const body = await plan.json();
+        assert.ok(
+          !/searchParams|Cannot read properties|is not defined/.test(body.error || ''),
+          `the upgrade plan failed on its query parameter: ${body.error}`,
         );
       }
     });

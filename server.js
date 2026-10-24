@@ -227,10 +227,10 @@ async function upstreamReleases(force = false) {
   return releases;
 }
 
-router.get('/api/upgrade/releases', async (req, res) => {
+router.get('/api/upgrade/releases', async (req, res, ctx) => {
   if (guard(req, res)) return;
   try {
-    const releases = await upstreamReleases(url.searchParams.get('refresh') === '1');
+    const releases = await upstreamReleases(ctx.url.searchParams.get('refresh') === '1');
     sendJson(res, 200, {
       ok: true,
       current: versions.CURRENT,
@@ -255,9 +255,9 @@ router.get('/api/upgrade/releases', async (req, res) => {
  * is on, the build that host needs (an old CPU gets the old-cpu build), and
  * the services that would be restarted.
  */
-router.get('/api/upgrade/plan', async (req, res) => {
+router.get('/api/upgrade/plan', async (req, res, ctx) => {
   if (guard(req, res)) return;
-  const target = url.searchParams.get('version') || versions.CURRENT;
+  const target = ctx.url.searchParams.get('version') || versions.CURRENT;
   let releases = [];
   try {
     releases = await upstreamReleases();
