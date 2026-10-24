@@ -204,6 +204,70 @@ async function tests(ok, fail, failures) {
     }
   });
 
+  check('every bound port comes from a declared option', () => {
+    // The other direction of the same rule: a port the config binds that no
+    // declared option produced would go unnoticed, and a real collision on
+    // that port would be missed.
+    const { store, dir } = freshStore();
+    try {
+      store.addServer({ id: 'relay', name: 'Relay', role: 'relay', host: '10.0.0.2' });
+      for (const tpl of templates.ALL) {
+        if (!tpl.sides.includes('iran') && !tpl.sides.includes('foreign')) continue;
+        const tunnel = store.addTunnel({
+          name: `bound-${tpl.id}`,
+          template: tpl.id,
+          targetServers:
+            tpl.id === 'relay-reality'
+              ? { relay: 'relay' }
+              : { iran: 'iran', foreign: ['london'] },
+          options: {},
+        });
+        const built = provision(store, tunnel);
+        for (const side of ['iran', 'foreign', 'relay']) {
+          const files = built.bundles[side];
+          if (!files) continue;
+          const declared = portfix.portKeysFor(tpl, side);
+          const bound = listenPorts(files).ports;
+          if (!bound.size) continue;
+          const covered = new Set();
+          for (const key of declared) {
+            const value = Number(built.options?.[key] ?? tunnel.options?.[key]);
+            if (Number.isInteger(value)) covered.add(value);
+          }
+          for (const port of bound.keys()) {
+            assert.ok(
+              covered.has(port),
+              `${tpl.id}/${side}: bound port ${port} is not produced by a declared option ` +
+                `(${declared.join(', ')} -> ${[...covered].join(', ')})`,
+            );
+          }
+        }
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  check('the CDN edge port moves together with the origin port', () => {
+    // `cdnPort` is what the CDN edge is configured with and `originPort` is
+    // what the Iran box binds. Moving one without the other breaks the
+    // tunnel, so the two are declared as a pair.
+    const tpl = templates.get('cdn-reverse-wss');
+    assert.ok(tpl, 'the CDN template exists');
+    assert.ok(
+      tpl.listenPorts.pairs.some((p) => p.includes('cdnPort') && p.includes('originPort')),
+      'cdnPort and originPort are a pair',
+    );
+    assert.ok(
+      !tpl.listenPorts.iran.includes('cdnPort'),
+      'cdnPort is not treated as a listener on the Iran box',
+    );
+    assert.ok(
+      tpl.listenPorts.iran.includes('originPort'),
+      'originPort is the listener on the Iran box',
+    );
+  });
+
   // ---- exit ordering ------------------------------------------------------
   check('the stored exit order is the order the tunnel uses', () => {
     const { store, dir } = freshStore();
