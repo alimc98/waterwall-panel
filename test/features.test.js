@@ -60,6 +60,10 @@ function fakeSsh({ openPorts = [], free = true, ownPorts = [], ownPid = 4242, ot
         }
       }
       if (parts.length) return { ok: true, failed: false, stdout: parts.join('\n') };
+      if (command.includes('READY') || command.includes('GONE')) {
+        // The probe for an existing clone: the clone is on the box.
+        return { ok: true, failed: false, stdout: 'READY' };
+      }
       if (command.includes('FREE') || command.includes('TAKEN')) {
         return { ok: true, failed: false, stdout: free ? 'FREE' : 'TAKEN' };
       }
@@ -369,6 +373,117 @@ async function tests(ok, fail, failures) {
         result.targets.foreign,
         [foreignClone.server.id],
         'the newcomer points at the clone',
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('isolating twice reuses the clone instead of making another', async () => {
+    const { store, dir } = freshStore();
+    try {
+      addReality(store, 'first', 'iran', ['london']);
+      const second = addReality(store, 'second', 'iran', ['london']);
+      const ssh = fakeSsh();
+
+      const firstRun = await isolate.isolateTargets(
+        store,
+        store.getTunnel(second.id),
+        ['iran', 'foreign'],
+        ssh,
+      );
+      assert.strictEqual(firstRun.ok, true, `isolation failed: ${JSON.stringify(firstRun.skipped)}`);
+      const cloneCount = store.listServers().filter((s) => s.clonedFor === second.id).length;
+      assert.ok(cloneCount > 0, 'the first run made clones');
+
+      // The newcomer now points at its clones, so nothing is shared any more
+      // and a second apply has nothing to isolate.
+      store.updateTunnel(second.id, { targetServers: firstRun.targets });
+      const secondRun = await isolate.isolateTargets(
+        store,
+        store.getTunnel(second.id),
+        ['iran', 'foreign'],
+        ssh,
+      );
+      assert.strictEqual(secondRun.plan.length, 0, 'the clones removed the collision');
+      assert.strictEqual(
+        store.listServers().filter((s) => s.clonedFor === second.id).length,
+        cloneCount,
+        'no extra clone records were added',
+      );
+
+      // The collision comes back when the tunnel is pointed at the shared
+      // record again — an edit in the UI can do that. The clone this tunnel
+      // already owns has to be reused, not replaced: making a new one each
+      // time piles up units and directories on the box.
+      store.updateTunnel(second.id, {
+        targetServers: { iran: 'iran', foreign: ['london'] },
+      });
+      const thirdRun = await isolate.isolateTargets(
+        store,
+        store.getTunnel(second.id),
+        ['iran', 'foreign'],
+        ssh,
+      );
+      assert.strictEqual(thirdRun.ok, true, `isolation failed: ${JSON.stringify(thirdRun.skipped)}`);
+      assert.ok(thirdRun.clones.length > 0, 'the collision was planned again');
+      assert.ok(
+        thirdRun.clones.every((c) => c.reused),
+        'the existing clones were reused',
+      );
+      assert.strictEqual(
+        store.listServers().filter((s) => s.clonedFor === second.id).length,
+        cloneCount,
+        'no extra clone records were added',
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('a clone that vanished from the box is replaced, not reused', async () => {
+    const { store, dir } = freshStore();
+    try {
+      addReality(store, 'first', 'iran', ['london']);
+      const second = addReality(store, 'second', 'iran', ['london']);
+      const ssh = fakeSsh();
+
+      const firstRun = await isolate.isolateTargets(
+        store,
+        store.getTunnel(second.id),
+        ['iran', 'foreign'],
+        ssh,
+      );
+      store.updateTunnel(second.id, { targetServers: firstRun.targets });
+      const staleCount = store.listServers().filter((s) => s.clonedFor === second.id).length;
+      assert.ok(staleCount > 0, 'the first run made clones');
+
+      // Now the box has lost the clone directories and units. The stale
+      // record must be dropped and a fresh clone made, because the old one
+      // cannot be deployed to.
+      store.updateTunnel(second.id, {
+        targetServers: { iran: 'iran', foreign: ['london'] },
+      });
+      const goneSsh = fakeSsh();
+      const originalExec = goneSsh.sshExec;
+      goneSsh.sshExec = async (server, command) => {
+        if (command.includes('READY') || command.includes('GONE')) {
+          goneSsh.calls.push({ server: server.id, command });
+          return { ok: true, failed: false, stdout: 'GONE' };
+        }
+        return originalExec(server, command);
+      };
+
+      const secondRun = await isolate.isolateTargets(
+        store,
+        store.getTunnel(second.id),
+        ['iran', 'foreign'],
+        goneSsh,
+      );
+      assert.strictEqual(secondRun.ok, true, `isolation failed: ${JSON.stringify(secondRun.skipped)}`);
+      assert.ok(
+        secondRun.clones.some((c) => !c.reused),
+        'a fresh clone was made',
       );
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
