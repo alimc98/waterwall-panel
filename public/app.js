@@ -21,6 +21,7 @@ const state = {
   lastRenderedPage: null,
   page: 'dashboard',
   selectedTemplate: null,
+  tplQuery: '',      // the scenario search box
   draft: null,        // working copy of the tunnel form
   preview: null,      // last preview result
   currentTunnel: null,
@@ -1973,8 +1974,165 @@ function downloadAll() {
 }
 
 // ============================================================ new tunnel
+/**
+ * The template catalogue, grouped by category and filtered by a search box.
+ *
+ * The catalogue holds 40-odd scenarios, and scrolling a wall of cards to
+ * find "the one with Reality" is exactly what the operator does not want to
+ * do. The search box matches the Persian title, the English title, the
+ * summary and the tags, so both "reality" and "Reality" find the same card.
+ *
+ * The filter is pure client-side work: the whole catalogue is already in
+ * `state.templates`, so there is nothing to fetch and nothing to wait for.
+ */
+function templateSearchText(tpl) {
+  return [
+    tpl.titleFa,
+    tpl.title,
+    tpl.summaryFa,
+    tpl.summary,
+    tpl.categoryFa,
+    tpl.category,
+    ...(tpl.tags || []),
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+}
+
+/** Does this template match the search box? An empty box matches everything. */
+function templateMatches(tpl, query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return true;
+  // Every word has to appear somewhere, so "cdn reverse" narrows down the
+  // way an operator expects instead of widening the list.
+  return q.split(/\s+/).every((word) => templateSearchText(tpl).includes(word));
+}
+
+/**
+ * The categories in display order.
+ *
+ * `state.templates` comes back in the order the server sent it, which is the
+ * order the templates were written in — not an order a reader can follow. A
+ * fixed order puts the everyday scenarios first and buries the exotic ones
+ * at the bottom, where they belong.
+ */
+const CATEGORY_ORDER = [
+  'basic',
+  'stream',
+  'proxy',
+  'l3',
+  'layer3',
+  'stealth',
+  'resilience',
+  'ops',
+];
+
+const CATEGORY_META = {
+  basic: { fa: 'پایه', icon: '🔌', hint: 'پورت‌فورد و تونل‌های ساده' },
+  stream: { fa: 'پروتکل', icon: '📡', hint: 'VLESS، Reality و پروتکل‌های کلاینت' },
+  proxy: { fa: 'پروکسی', icon: '🌐', hint: 'پروکسی و زنجیرهٔ بالادست' },
+  l3: { fa: 'لایهٔ ۳', icon: '🛡️', hint: 'VPN و ترافیک کل سیستم' },
+  layer3: { fa: 'لایهٔ ۳', icon: '🔁', hint: 'TUN و tun2socks' },
+  stealth: { fa: 'ضد DPI', icon: '🎭', hint: 'مبهم‌سازی و مقاومت در برابر فیلتر' },
+  resilience: { fa: 'پایداری', icon: '🛟', hint: 'مسیر دوم و تحمل قطعی' },
+  ops: { fa: 'عملیات', icon: '🧪', hint: 'تونل معکوس، CDN، رله و ابزار' },
+};
+
+function categoryLabel(cat, templates) {
+  const meta = CATEGORY_META[cat];
+  if (meta) return meta.fa;
+  const tpl = templates.find((t) => t.category === cat);
+  return tpl?.categoryFa || cat;
+}
+
+function categoryIcon(cat, templates) {
+  const meta = CATEGORY_META[cat];
+  if (meta) return meta.icon;
+  const tpl = templates.find((t) => t.category === cat);
+  return tpl?.icon || '📁';
+}
+
+function templatePickerHtml(templates, query) {
+  const matching = templates.filter((t) => templateMatches(t, query));
+  if (!matching.length) {
+    return `<div class="empty"><div class="ic">🔍</div>سناریویی با «${esc(
+      query || '',
+    )}» پیدا نشد.<br><span class="small">عبارت دیگری امتحان کنید یا فیلتر را پاک کنید.</span></div>`;
+  }
+  // Group the matches, keeping the fixed category order and appending any
+  // category the panel does not know about at the end.
+  const seen = [];
+  for (const t of matching) if (!seen.includes(t.category)) seen.push(t.category);
+  seen.sort((a, b) => {
+    const ia = CATEGORY_ORDER.indexOf(a);
+    const ib = CATEGORY_ORDER.indexOf(b);
+    if (ia === -1 && ib === -1) return a.localeCompare(b);
+    if (ia === -1) return 1;
+    if (ib === -1) return -1;
+    return ia - ib;
+  });
+
+  return seen
+    .map((cat) => {
+      const items = matching.filter((t) => t.category === cat);
+      const icon = categoryIcon(cat, templates);
+      const label = categoryLabel(cat, templates);
+      return `<section class="tpl-group" data-cat="${esc(cat)}">
+        <header class="tpl-group-head">
+          <span class="tpl-group-icon">${icon}</span>
+          <span class="tpl-group-title">${esc(label)}</span>
+          <span class="tpl-group-count">${items.length}</span>
+        </header>
+        <div class="tpl-grid">${items
+          .map(
+            (t) => `<div class="tpl" data-tpl="${t.id}">
+              <div class="ic">${t.icon}</div>
+              <h4>${esc(t.titleFa)}</h4>
+              <div class="en">${esc(t.title)}</div>
+              <p>${esc(t.summaryFa)}</p>
+              <div class="tags">
+                ${t.minVersion ? `<span class="badge warn" title="این سناریو به این نسخه واتروال نیاز دارد">نیازمند ${esc(t.minVersion)}</span>` : ''}
+                ${(t.tags || []).slice(0, 4).map((tag) => `<span class="badge mute">${esc(tag)}</span>`).join('')}
+              </div>
+            </div>`,
+          )
+          .join('')}</div>
+      </section>`;
+    })
+    .join('');
+}
+
+/**
+ * Bind the click handler on the scenario cards.
+ *
+ * The list is rebuilt whenever the search box changes, so the handler is
+ * bound again after every rebuild instead of being attached once.
+ */
+function bindTemplateCards() {
+  $$('[data-tpl]').forEach((el) => {
+    el.onclick = () => {
+      $$('[data-tpl]').forEach((x) => x.classList.remove('sel'));
+      el.classList.add('sel');
+      state.selectedTemplate = state.templates.find((t) => t.id === el.dataset.tpl);
+      const nameInput = $('#nt_name');
+      if (nameInput && !nameInput.value) nameInput.value = el.dataset.tpl;
+      render();
+      $('#nt_name')?.focus();
+    };
+  });
+  $('#cancelTemplate')?.addEventListener('click', () => {
+    state.selectedTemplate = null;
+    render();
+  });
+  $('#createTunnel')?.addEventListener('click', () => createTunnel(state.selectedTemplate));
+  if (state.selectedTemplate) initDynamicFields(state.selectedTemplate);
+}
+
 function pageNewTunnel() {
-  const cats = [...new Set(state.templates.map((t) => t.category))];
+  const query = state.tplQuery || '';
+  const total = state.templates.length;
+  const shown = state.templates.filter((t) => templateMatches(t, query)).length;
   return `
   <div class="page-head">
     <h2>تونل جدید</h2>
@@ -1982,27 +2140,14 @@ function pageNewTunnel() {
   </div>
   <div class="card">
     <h3>۱. انتخاب سناریو</h3>
-    ${cats
-      .map((c) => {
-        const label = state.templates.find((t) => t.category === c)?.categoryFa || c;
-        return `<h4 style="margin:16px 0 10px;font-size:12px;color:var(--accent)">${esc(label)}</h4>
-          <div class="tpl-grid">${state.templates
-            .filter((t) => t.category === c)
-            .map(
-              (t) => `<div class="tpl" data-tpl="${t.id}">
-                <div class="ic">${t.icon}</div>
-                <h4>${esc(t.titleFa)}</h4>
-                <div class="en">${esc(t.title)}</div>
-                <p>${esc(t.summaryFa)}</p>
-                <div class="tags">
-                  ${t.minVersion ? `<span class="badge" title="این سناریو به این نسخه واتروال نیاز دارد">نیازمند ${esc(t.minVersion)}</span>` : ''}
-                  ${(t.tags || []).slice(0, 4).map((tag) => `<span class="badge mute">${esc(tag)}</span>`).join('')}
-                </div>
-              </div>`,
-            )
-            .join('')}</div>`;
-      })
-      .join('')}
+    <div class="tpl-search">
+      <span class="tpl-search-icon">🔍</span>
+      <input type="text" id="tplSearch" placeholder="جستجو در سناریوها — مثلاً reality، cdn، socks5 یا «تونل معکوس»"
+        value="${esc(query)}" autocomplete="off" spellcheck="false" />
+      ${query ? '<button type="button" class="tpl-search-clear" id="tplSearchClear" title="پاک کردن">✕</button>' : ''}
+      <span class="tpl-search-count">${shown === total ? `${total} سناریو` : `${shown} از ${total} سناریو`}</span>
+    </div>
+    <div class="tpl-picker-host">${templatePickerHtml(state.templates, query)}</div>
   </div>
   ${state.selectedTemplate ? templateFormHtml(state.selectedTemplate) : '<div class="card"><div class="empty"><div class="ic">⬅️</div>از فهرست بالا یک سناریو انتخاب کنید.</div></div>'}`;
 }
@@ -2885,23 +3030,40 @@ function afterRender() {
   });
 
   // new tunnel
-  $$('[data-tpl]').forEach((el) => {
-    el.onclick = () => {
-      $$('[data-tpl]').forEach((x) => x.classList.remove('sel'));
-      el.classList.add('sel');
-      state.selectedTemplate = state.templates.find((t) => t.id === el.dataset.tpl);
-      const nameInput = $('#nt_name');
-      if (nameInput && !nameInput.value) nameInput.value = el.dataset.tpl;
-      render();
-      $('#nt_name')?.focus();
+  const search = $('#tplSearch');
+  if (search) {
+    // The filter is applied on every keystroke, but the caret has to stay
+    // where the operator put it. Re-rendering the whole page would blow it
+    // away, so the list is swapped in place and the input keeps its focus.
+    const applyFilter = () => {
+      const card = search.closest('.card');
+      const list = card.querySelector('.tpl-picker-host');
+      if (list) list.innerHTML = templatePickerHtml(state.templates, state.tplQuery || '');
+      bindTemplateCards();
+      const count = card.querySelector('.tpl-search-count');
+      if (count) {
+        const total = state.templates.length;
+        const shown = state.templates.filter((t) => templateMatches(t, state.tplQuery)).length;
+        count.textContent = shown === total ? `${total} سناریو` : `${shown} از ${total} سناریو`;
+      }
+      const clear = card.querySelector('.tpl-search-clear');
+      if (clear) clear.hidden = !state.tplQuery;
     };
-  });
-  $('#cancelTemplate')?.addEventListener('click', () => {
-    state.selectedTemplate = null;
-    render();
-  });
-  $('#createTunnel')?.addEventListener('click', () => createTunnel(state.selectedTemplate));
-  if (state.selectedTemplate) initDynamicFields(state.selectedTemplate);
+    search.oninput = () => {
+      state.tplQuery = search.value;
+      applyFilter();
+    };
+    // Enter must not submit the surrounding form.
+    search.onkeydown = (e) => {
+      if (e.key === 'Enter') e.preventDefault();
+    };
+    $('#tplSearchClear')?.addEventListener('click', () => {
+      state.tplQuery = '';
+      render();
+      $('#tplSearch')?.focus();
+    });
+  }
+  bindTemplateCards();
 
   // tunnel detail
   if (state.page === 'edit' && state.draft) {

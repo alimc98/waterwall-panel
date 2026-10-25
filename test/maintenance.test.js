@@ -718,6 +718,107 @@ await check('the published forms of the agent can be rebuilt', () => {
   assert.strictEqual(Buffer.from(b64, 'base64').length, raw.length);
 });
 
+// ---------------------------------------------------------- scenario catalogue
+//
+// The catalogue is browser code, so the tests read `public/app.js` and run
+// the filter functions in isolation. That way the test cannot drift away
+// from what the browser actually executes.
+
+/** Pull one top-level function out of the app source. */
+function extractFunction(name) {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const start = source.indexOf(`function ${name}(`);
+  assert.ok(start >= 0, `${name} is missing from app.js`);
+  let depth = 0;
+  for (let i = start; i < source.length; i += 1) {
+    if (source[i] === '{') depth += 1;
+    else if (source[i] === '}') {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  throw new Error(`${name} has no closing brace`);
+}
+
+/** The filter logic, rebuilt from the real source. */
+function catalogueFilter() {
+  const body = ['templateSearchText', 'templateMatches']
+    .map(extractFunction)
+    .join('\n');
+  // eslint-disable-next-line no-new-func
+  return new Function(`${body}; return { templateSearchText, templateMatches };`)();
+}
+
+await check('the scenario search finds a scenario by its tag', () => {
+  const { templateMatches } = catalogueFilter();
+  const reality = {
+    id: 'reverse-reality',
+    title: 'Reverse Reality Tunnel',
+    titleFa: 'تونل معکوس با Reality',
+    summary: 'a reverse tunnel with reality',
+    summaryFa: 'تونل معکوس با Reality',
+    category: 'ops',
+    categoryFa: 'عملیات',
+    tags: ['reverse', 'reality', 'bridge', 'stealth', 'no-cert'],
+  };
+  assert.strictEqual(templateMatches(reality, ''), true, 'an empty search matches everything');
+  assert.strictEqual(templateMatches(reality, 'reality'), true, 'the tag matches');
+  assert.strictEqual(templateMatches(reality, 'REALITY'), true, 'the search ignores the case');
+  assert.strictEqual(templateMatches(reality, 'معکوس'), true, 'the Persian title matches');
+  assert.strictEqual(templateMatches(reality, 'reverse reality'), true, 'the English title matches');
+  assert.strictEqual(templateMatches(reality, 'cdn'), false, 'an unrelated word does not match');
+});
+
+await check('every word of the search has to match', () => {
+  // "cdn reverse" has to narrow the list down, not widen it: a search that
+  // matched either word would show half the catalogue.
+  const { templateMatches } = catalogueFilter();
+  const cdn = {
+    id: 'cdn-reverse-wss',
+    title: 'Reverse WebSocket behind a CDN',
+    titleFa: 'تونل معکوس WebSocket پشت CDN',
+    summary: '',
+    summaryFa: '',
+    category: 'ops',
+    categoryFa: 'عملیات',
+    tags: ['cdn', 'websocket', 'wss', 'reverse', 'tls'],
+  };
+  assert.strictEqual(templateMatches(cdn, 'cdn'), true, 'one word matches');
+  assert.strictEqual(templateMatches(cdn, 'cdn reverse'), true, 'both words match');
+  assert.strictEqual(templateMatches(cdn, 'cdn trojan'), false, 'a word that is not there does not match');
+});
+
+await check('the scenario catalogue has a search box and a grouped list', () => {
+  const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  assert.match(app, /id="tplSearch"/, 'the search box is rendered');
+  assert.match(app, /tpl-picker-host/, 'the list can be swapped in place');
+  assert.match(app, /tpl-group-head/, 'the categories have a header');
+  assert.match(app, /CATEGORY_ORDER/, 'the categories are shown in a fixed order');
+  assert.match(app, /function templateMatches/, 'the filter exists');
+  assert.match(app, /function templatePickerHtml/, 'the picker groups the matches');
+});
+
+await check('every scenario carries an icon', () => {
+  const templates = require('../lib/templates');
+  const catalog = templates.catalog();
+  assert.ok(catalog.length > 30, 'the catalogue is not empty');
+  for (const tpl of catalog) {
+    assert.ok(tpl.icon, `${tpl.id} has no icon`);
+    assert.strictEqual(typeof tpl.icon, 'string', `${tpl.id} has a text icon`);
+  }
+});
+
+await check('the catalogue groups into named categories', () => {
+  const templates = require('../lib/templates');
+  const catalog = templates.catalog();
+  const cats = [...new Set(catalog.map((t) => t.category))];
+  assert.ok(cats.length >= 5, 'the catalogue is split into several categories');
+  for (const tpl of catalog) {
+    assert.ok(tpl.category, `${tpl.id} has no category`);
+    assert.ok(tpl.categoryFa, `${tpl.id} has no Persian category name`);
+  }
+});
+
 }
 
 module.exports = { tests };

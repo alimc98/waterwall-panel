@@ -30,7 +30,15 @@ const { resolveTargets, targetsForSide, foreignIds } = require('../lib/targets')
  * the isolation and port code issue, so the stub records them and answers the
  * two shapes that matter: "is this path free?" and "which ports are open?".
  */
-function fakeSsh({ openPorts = [], free = true, ownPorts = [], ownPid = 4242, otherPid = 9999 } = {}) {
+function fakeSsh({
+  openPorts = [],
+  free = true,
+  ownPorts = [],
+  ownPid = 4242,
+  otherPid = 9999,
+  noBinary = false,
+  binaryPaths = [],
+} = {}) {
   const calls = [];
   return {
     calls,
@@ -64,6 +72,22 @@ function fakeSsh({ openPorts = [], free = true, ownPorts = [], ownPid = 4242, ot
         // The probe for an existing clone: the clone is on the box.
         return { ok: true, failed: false, stdout: 'READY' };
       }
+      if (command.includes('HAS_BINARY') || command.includes('NO_BINARY')) {
+        // The probe for the install that holds the binary. The stub has the
+        // binary in every path the panel knows about, unless the test asks
+        // for a box without one — or names the paths that hold it.
+        const probed = (command.match(/'([^']*\/Waterwall)'/g) || []).map((m) =>
+          m.replace(/'/g, '').replace(/\/Waterwall$/, ''),
+        );
+        const holds = binaryPaths.length
+          ? probed.some((p) => binaryPaths.includes(p))
+          : !noBinary;
+        return {
+          ok: true,
+          failed: false,
+          stdout: holds ? 'HAS_BINARY' : 'NO_BINARY',
+        };
+      }
       if (command.includes('FREE') || command.includes('TAKEN')) {
         return { ok: true, failed: false, stdout: free ? 'FREE' : 'TAKEN' };
       }
@@ -71,6 +95,9 @@ function fakeSsh({ openPorts = [], free = true, ownPorts = [], ownPid = 4242, ot
     },
     async ensureWaterwallService(base, spec) {
       calls.push({ server: base.id, command: `ensure ${spec.serviceName} ${spec.waterwallPath}` });
+      if (noBinary) {
+        return { ok: false, error: 'NO_BINARY:/opt/waterwall' };
+      }
       return { ok: true };
     },
   };
@@ -396,8 +423,10 @@ async function tests(ok, fail, failures) {
       const cloneCount = store.listServers().filter((s) => s.clonedFor === second.id).length;
       assert.ok(cloneCount > 0, 'the first run made clones');
 
-      // The newcomer now points at its clones, so nothing is shared any more
-      // and a second apply has nothing to isolate.
+      // The newcomer now points at its clones. The box is still shared in
+      // physical terms — the first tunnel is on the same machine — so the
+      // plan is not empty any more, but every clone is reused and no new
+      // record appears.
       store.updateTunnel(second.id, { targetServers: firstRun.targets });
       const secondRun = await isolate.isolateTargets(
         store,
@@ -405,7 +434,14 @@ async function tests(ok, fail, failures) {
         ['iran', 'foreign'],
         ssh,
       );
-      assert.strictEqual(secondRun.plan.length, 0, 'the clones removed the collision');
+      assert.ok(
+        secondRun.clones.length > 0,
+        'the shared box is still planned, because the first tunnel is on it',
+      );
+      assert.ok(
+        secondRun.clones.every((c) => c.reused),
+        'the existing clones were reused',
+      );
       assert.strictEqual(
         store.listServers().filter((s) => s.clonedFor === second.id).length,
         cloneCount,
@@ -435,6 +471,256 @@ async function tests(ok, fail, failures) {
         store.listServers().filter((s) => s.clonedFor === second.id).length,
         cloneCount,
         'no extra clone records were added',
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The first tunnel moves onto a clone, so it no longer points at the base
+  // record. A third tunnel aimed at that base record used to look like it had
+  // the box to itself and never got a service of its own — the second tunnel's
+  // service simply never appeared in the server list.
+  check('a clone of the base still counts as the same box', () => {
+    const { store, dir } = freshStore();
+    try {
+      addReality(store, 'first', 'iran', ['london']);
+      const second = addReality(store, 'second', 'iran', ['london']);
+      const servers = store.listServers();
+      const base = servers.find((s) => s.id === 'london');
+      const first = store.listTunnels().find((t) => t.id !== second.id);
+
+      // A clone of the base, owned by the first tunnel.
+      const clone = store.addServer({
+        name: 'london · first',
+        role: base.role,
+        host: base.host,
+        waterwallPath: '/opt/waterwall-2',
+        serviceName: 'waterwall-2',
+        clonedFrom: base.id,
+        clonedFor: first.id,
+      });
+      store.updateTunnel(first.id, { targetServers: { iran: 'iran', foreign: [clone.id] } });
+
+      assert.strictEqual(
+        isolate.sharesBox(store.listServers(), first, base),
+        true,
+        'but it is on the same box, so the base is not free',
+      );
+
+      const plan = isolate.isolationPlan(store, store.getTunnel(second.id), ['iran', 'foreign']);
+      const shared = plan.filter((row) => row.server.id === 'london');
+      assert.strictEqual(shared.length, 1, 'the shared box is in the plan');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('the third tunnel gets its own numbered service', async () => {
+    const { store, dir } = freshStore();
+    try {
+      const first = addReality(store, 'first', 'iran', ['london']);
+      const second = addReality(store, 'second', 'iran', ['london']);
+      const ssh = fakeSsh();
+
+      // The second tunnel takes a clone, as before.
+      const firstRun = await isolate.isolateTargets(
+        store,
+        store.getTunnel(second.id),
+        ['iran', 'foreign'],
+        ssh,
+      );
+      store.updateTunnel(second.id, { targetServers: firstRun.targets });
+      const secondClone = store
+        .listServers()
+        .find((s) => s.clonedFor === second.id && s.role === 'foreign');
+      assert.ok(secondClone, 'the second tunnel got a clone of the exit');
+      assert.strictEqual(
+        secondClone.serviceName,
+        'waterwall-reality-2',
+        'the first clone is numbered 2, counting from the base',
+      );
+
+      // A third tunnel aimed at the *base* record. It has to get a service of
+      // its own: `waterwall-3`, not the base's `waterwall`.
+      const third = addReality(store, 'third', 'iran', ['london']);
+      const thirdRun = await isolate.isolateTargets(
+        store,
+        store.getTunnel(third.id),
+        ['iran', 'foreign'],
+        ssh,
+      );
+      assert.strictEqual(thirdRun.ok, true, `isolation failed: ${JSON.stringify(thirdRun.skipped)}`);
+      const thirdClone = thirdRun.clones.find((c) => c.side === 'foreign');
+      assert.ok(thirdClone, 'the third tunnel got a clone of the exit');
+      assert.strictEqual(
+        thirdClone.server.serviceName,
+        'waterwall-reality-3',
+        'the third service is numbered 3, counting from the base',
+      );
+      assert.strictEqual(
+        thirdClone.server.waterwallPath,
+        '/opt/waterwall-reality-3',
+        'the third install path is numbered 3',
+      );
+      assert.ok(
+        store.listServers().some((s) => s.serviceName === 'waterwall-reality-3'),
+        'the third service shows up in the server list',
+      );
+      // The first tunnel is untouched.
+      assert.deepStrictEqual(
+        foreignIds(store.getTunnel(first.id)),
+        ['london'],
+        'the first tunnel still points at the original record',
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('the clone copies the binary from an install that has one', async () => {
+    // A box whose base install was removed still has the binary in one of its
+    // clones. The panel used to copy from the base path only, and refused
+    // with `NO_BINARY` even though the box had everything it needed.
+    const { store, dir } = freshStore();
+    try {
+      addReality(store, 'first', 'iran', ['london']);
+      const second = addReality(store, 'second', 'iran', ['london']);
+      const base = store.listServers().find((s) => s.id === 'london');
+
+      // A clone from an earlier tunnel, and the base install is gone.
+      store.addServer({
+        name: 'london · first',
+        role: base.role,
+        host: base.host,
+        waterwallPath: '/opt/waterwall-reality-2',
+        serviceName: 'waterwall-reality-2',
+        clonedFrom: base.id,
+        clonedFor: store.listTunnels().find((t) => t.id !== second.id).id,
+      });
+
+      // Only the clone holds the binary.
+      const ssh = fakeSsh({ binaryPaths: ['/opt/waterwall-reality-2'] });
+      const run = await isolate.isolateTargets(
+        store,
+        store.getTunnel(second.id),
+        ['iran', 'foreign'],
+        ssh,
+      );
+      assert.strictEqual(run.ok, true, `isolation failed: ${JSON.stringify(run.skipped)}`);
+      assert.strictEqual(run.skipped.length, 0, 'nothing was skipped');
+      const clone = run.clones.find((c) => c.side === 'foreign');
+      assert.ok(clone, 'the second tunnel got a clone of the exit');
+
+      const ensure = ssh.calls.find((c) => c.command.startsWith('ensure '));
+      assert.ok(ensure, 'the panel created a service');
+      const source = ssh.calls.find(
+        (c) => c.command.includes('HAS_BINARY') && c.command.includes('/opt/waterwall-reality-2'),
+      );
+      assert.ok(
+        source,
+        'the binary was looked for in the install that actually holds it',
+      );
+      assert.ok(
+        !source.command.includes("'/opt/waterwall-reality/Waterwall'") ||
+          source.command.includes('/opt/waterwall-reality-2'),
+        'the base path was not the only candidate',
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('the service name is unique across the whole panel', async () => {
+    // The server list is one table. Two rows both called `waterwall-2` — one
+    // on the Asiatech box, one on the Romania box — are impossible to tell
+    // apart, so the second one has to move on to `waterwall-3`.
+    const { store, dir } = freshStore();
+    try {
+      addReality(store, 'first', 'iran', ['london']);
+      const second = addReality(store, 'second', 'iran', ['london']);
+
+      // Another box already uses the name `waterwall-reality-2`.
+      store.addServer({
+        name: 'Asiatech',
+        role: 'foreign',
+        host: '203.0.113.30',
+        waterwallPath: '/opt/waterwall-reality-2',
+        serviceName: 'waterwall-reality-2',
+      });
+
+      const ssh = fakeSsh();
+      const run = await isolate.isolateTargets(
+        store,
+        store.getTunnel(second.id),
+        ['iran', 'foreign'],
+        ssh,
+      );
+      assert.strictEqual(run.ok, true, `isolation failed: ${JSON.stringify(run.skipped)}`);
+      const clone = run.clones.find((c) => c.side === 'foreign');
+      assert.ok(clone, 'the second tunnel got a clone of the exit');
+      assert.strictEqual(
+        clone.server.serviceName,
+        'waterwall-reality-3',
+        'the name that was taken on another box was skipped',
+      );
+      const names = store.listServers()
+        .map((s) => s.serviceName)
+        .filter(Boolean);
+      // The fixture itself has two records with the same name — the panel
+      // cannot rename the ones it already knows. What matters is that the
+      // clone it just created does not add another duplicate.
+      const dupes = names.filter((n, i) => names.indexOf(n) !== i);
+      assert.strictEqual(
+        dupes.filter((n) => n === 'waterwall-reality-2').length,
+        0,
+        'the clone did not take a name that was already in use',
+      );
+      assert.ok(
+        !names.includes('waterwall-reality-3') ||
+          names.filter((n) => n === 'waterwall-reality-3').length === 1,
+        'the new name appears once',
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('a clone of a clone is still numbered from the base', async () => {
+    const { store, dir } = freshStore();
+    try {
+      addReality(store, 'first', 'iran', ['london']);
+      const second = addReality(store, 'second', 'iran', ['london']);
+      const ssh = fakeSsh();
+
+      const firstRun = await isolate.isolateTargets(
+        store,
+        store.getTunnel(second.id),
+        ['iran', 'foreign'],
+        ssh,
+      );
+      store.updateTunnel(second.id, { targetServers: firstRun.targets });
+      const clone = store
+        .listServers()
+        .find((s) => s.clonedFor === second.id && s.role === 'foreign');
+
+      // The third tunnel aims at the *clone*, not the base. The number still
+      // counts from the base, so it is `waterwall-3` and never
+      // `waterwall-2-2`.
+      const third = addReality(store, 'third', 'iran', [clone.id]);
+      const thirdRun = await isolate.isolateTargets(
+        store,
+        store.getTunnel(third.id),
+        ['iran', 'foreign'],
+        ssh,
+      );
+      assert.strictEqual(thirdRun.ok, true, `isolation failed: ${JSON.stringify(thirdRun.skipped)}`);
+      const thirdClone = thirdRun.clones.find((c) => c.side === 'foreign');
+      assert.ok(thirdClone, 'the third tunnel got a clone');
+      assert.strictEqual(
+        thirdClone.server.serviceName,
+        'waterwall-reality-3',
+        'the number counts from the base of the family',
       );
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
