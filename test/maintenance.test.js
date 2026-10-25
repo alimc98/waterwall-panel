@@ -327,6 +327,274 @@ await checkAsync('a service name that is not a systemd name is refused', async (
   assert.match(built.error, /invalid service name/);
 });
 
+await checkAsync('an install path that walks out of its directory is refused', async () => {
+  // The path becomes `rm -rf "$BASE"`. `/opt/waterwall/../..` is the root, so
+  // a path that walks out has to be refused before the script is written.
+  for (const bad of ['/opt/waterwall/../..', '/opt/../', '/../etc']) {
+    const built = require('../lib/ssh').buildRemoveInstallScript({
+      waterwallPath: bad,
+      serviceName: 'waterwall',
+      removeDir: true,
+    });
+    assert.strictEqual(built.ok, false, `${bad} was accepted`);
+    assert.match(built.error, /invalid install path/);
+  }
+});
+
+await checkAsync('the root is never removed as an install directory', async () => {
+  for (const bad of ['/', '//']) {
+    const built = require('../lib/ssh').buildRemoveInstallScript({
+      waterwallPath: bad,
+      serviceName: 'waterwall',
+      removeDir: true,
+    });
+    assert.strictEqual(built.ok, false, `${bad} was accepted`);
+  }
+});
+
+await checkAsync('the server cleanup refuses a path that walks out', async () => {
+  const built = require('../lib/ssh').buildRemoveServerScript({
+    waterwallPath: '/opt/waterwall/../..',
+    serviceName: 'waterwall',
+    removeDir: true,
+    removeAgent: true,
+    removeAllUnits: true,
+  });
+  assert.strictEqual(built.ok, false, 'the install path was accepted');
+  assert.match(built.error, /invalid install path/);
+});
+
+await checkAsync('the server cleanup refuses an agent path that walks out', async () => {
+  for (const agentDir of ['/opt/../../', '/', '/opt/ww-agent/../..']) {
+    const built = require('../lib/ssh').buildRemoveServerScript({
+      waterwallPath: '/opt/waterwall',
+      serviceName: 'waterwall',
+      removeDir: false,
+      removeAgent: true,
+      removeAllUnits: false,
+      agentDir,
+      agentStateDir: '/var/lib/ww-agent',
+    });
+    assert.strictEqual(built.ok, false, `agentDir ${agentDir} was accepted`);
+    assert.match(built.error, /invalid agent path/);
+  }
+  for (const agentStateDir of ['/var/lib/../../', '/', '/var/lib/ww-agent/../..']) {
+    const built = require('../lib/ssh').buildRemoveServerScript({
+      waterwallPath: '/opt/waterwall',
+      serviceName: 'waterwall',
+      removeDir: false,
+      removeAgent: true,
+      removeAllUnits: false,
+      agentDir: '/opt/ww-agent',
+      agentStateDir,
+    });
+    assert.strictEqual(built.ok, false, `agentStateDir ${agentStateDir} was accepted`);
+    assert.match(built.error, /invalid agent path/);
+  }
+});
+
+await checkAsync('an oversized request body is answered as 413, not 500', async () => {
+  // The size limit is the client's fault. A 500 blamed the panel and read as
+  // a server fault, and on the routes that call readBody without a catch the
+  // message went out as a plain internal error.
+  const { readBody } = require('../lib/util');
+  const { EventEmitter } = require('node:events');
+  const req = new EventEmitter();
+  req.destroy = () => { req.destroyed = true; };
+  const promise = readBody(req, 10);
+  req.emit('data', Buffer.alloc(6));
+  req.emit('data', Buffer.alloc(6));
+  let err = null;
+  try {
+    await promise;
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, 'the oversized body was accepted');
+  assert.strictEqual(err.statusCode, 413, 'the failure was not marked as the client\'s fault');
+  assert.strictEqual(req.destroyed, true, 'the stream was not stopped');
+});
+
+await checkAsync('a clone record can be repointed at a fresh install', async () => {
+  // When a clone's unit vanishes from the box, the panel repoints the same
+  // record at a new install instead of adding a second one. The record has
+  // to name the tunnel that owns it *now* — otherwise the cleanup of that
+  // tunnel does not recognise the record and it stays behind as an orphan.
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { Store } = require('../lib/store');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wwpanel-repoint-'));
+  try {
+    const store = new Store(dir);
+    store.addServer({ id: 'base', name: 'Base', role: 'foreign', host: '1.2.3.4' });
+    store.addServer({
+      id: 'clone',
+      name: 'Clone',
+      role: 'foreign',
+      host: '1.2.3.4',
+      waterwallPath: '/opt/waterwall-2',
+      serviceName: 'waterwall-2',
+      clonedFrom: 'base',
+      clonedFor: 'tunnel-1',
+    });
+
+    const updated = store.updateServer('clone', {
+      waterwallPath: '/opt/waterwall-3',
+      serviceName: 'waterwall-3',
+      clonedFrom: 'base',
+      clonedFor: 'tunnel-2',
+    });
+    assert.strictEqual(updated.clonedFor, 'tunnel-2', 'the new owner was not stored');
+    assert.strictEqual(updated.clonedFrom, 'base', 'the base was not stored');
+
+    // And it reached the disk, not just the in-memory copy.
+    const onDisk = JSON.parse(fs.readFileSync(path.join(dir, 'servers.json'), 'utf8'));
+    const record = onDisk.find((s) => s.id === 'clone');
+    assert.strictEqual(record.clonedFor, 'tunnel-2', 'the new owner did not reach the disk');
+    assert.strictEqual(record.serviceName, 'waterwall-3', 'the new service name did not reach the disk');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await checkAsync('a clone that finds no binary leaves no directory behind', async () => {
+  // The directory is created before the binary is copied, so a failure has to
+  // take it away again. A half-made install with no binary in it makes the
+  // next run give up: the path looks taken.
+  const server = {
+    host: '203.0.113.1',
+    sshPort: 22,
+    sshUser: 'root',
+    sshKeyPath: '/opt/waterwall-panel/data/panel-ssh-key',
+    transport: 'key',
+  };
+  const { EventEmitter } = require('node:events');
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  let script = '';
+  childProcess.spawn = function patched(cmd, args) {
+    script = (args || []).join(' ');
+    const e = new EventEmitter();
+    e.stdout = new EventEmitter();
+    e.stderr = new EventEmitter();
+    e.stdin = { write() {}, end() {} };
+    process.nextTick(() => {
+      e.stdout.emit('data', Buffer.from('NO_BINARY:/opt/waterwall\n'));
+      e.emit('close', 3);
+    });
+    return e;
+  };
+  try {
+    delete require.cache[require.resolve('../lib/ssh')];
+    const stubbed = require('../lib/ssh');
+    const res = await stubbed.ensureWaterwallService(server, {
+      sourcePath: '/opt/waterwall',
+      waterwallPath: '/opt/waterwall-9',
+      serviceName: 'waterwall-9',
+    });
+    assert.strictEqual(res.ok, false, 'the clone was reported as ready');
+    assert.match(res.error, /NO_BINARY/);
+    assert.match(
+      script,
+      /CREATED=no/,
+      'the script remembers whether it made the directory',
+    );
+    assert.match(
+      script,
+      /if \[ "\$CREATED" = yes \]; then rm -rf "\$BASE"; fi/,
+      'the directory is taken away when the copy fails',
+    );
+    // The removal is guarded by the flag, so an existing install is never
+    // removed by a failed copy.
+    assert.match(
+      script,
+      /if \[ ! -d "\$BASE" \]; then CREATED=yes; fi/,
+      'the flag is only set for a directory the script itself made',
+    );
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[require.resolve('../lib/ssh')];
+  }
+});
+
+await checkAsync('the clone source path is validated', async () => {
+  // The source is where the binary is copied from. A relative path would
+  // resolve against the SSH session's directory, and "/" would collapse to an
+  // empty string and then to "/Waterwall" — outside any install the panel
+  // knows about.
+  //
+  // The check runs before any SSH happens, so a bad path is refused without
+  // touching a box. The good path does reach the SSH layer, so the module's
+  // transport is stubbed for the duration of the test.
+  const server = {
+    host: '203.0.113.1',
+    sshPort: 22,
+    sshUser: 'root',
+    sshKeyPath: '/opt/waterwall-panel/data/panel-ssh-key',
+    transport: 'key',
+  };
+  const ssh = require('../lib/ssh');
+
+  // A bad path never reaches the transport: the refusal comes first.
+  for (const bad of ['/', 'relative/path', '/opt/waterwall/../../etc', '/opt/ww agent']) {
+    const res = await ssh.ensureWaterwallService(server, {
+      sourcePath: bad,
+      waterwallPath: '/opt/waterwall-3',
+      serviceName: 'waterwall-3',
+    });
+    assert.strictEqual(res.ok, false, `sourcePath ${bad} was accepted`);
+    assert.match(res.error, /invalid source path/);
+  }
+
+  // An empty path falls back to the default install, and a normal path is
+  // accepted. Both get as far as the transport, which is stubbed here.
+  //
+  // `ensureWaterwallService` reaches SSH through the module's own `run`,
+  // which is a module-local call, so the stub has to be installed on the
+  // child_process spawn BEFORE the ssh module is loaded.
+  const { EventEmitter } = require('node:events');
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  const seen = [];
+  childProcess.spawn = function patched(cmd, args, opts) {
+    seen.push((args || []).join(' '));
+    const e = new EventEmitter();
+    e.stdout = new EventEmitter();
+    e.stderr = new EventEmitter();
+    e.stdin = { write() {}, end() {} };
+    process.nextTick(() => {
+      e.stdout.emit('data', Buffer.from('READY:waterwall-3:/opt/waterwall-3\n'));
+      e.emit('close', 0);
+    });
+    return e;
+  };
+  try {
+    // A fresh copy of the module, loaded with the stub in place.
+    delete require.cache[require.resolve('../lib/ssh')];
+    const stubbed = require('../lib/ssh');
+    const good = await stubbed.ensureWaterwallService(server, {
+      sourcePath: '/opt/waterwall',
+      waterwallPath: '/opt/waterwall-3',
+      serviceName: 'waterwall-3',
+    });
+    assert.strictEqual(good.ok, true, `a normal source path was refused: ${good.error}`);
+    const fallback = await stubbed.ensureWaterwallService(server, {
+      sourcePath: '',
+      waterwallPath: '/opt/waterwall-3',
+      serviceName: 'waterwall-3',
+    });
+    assert.strictEqual(fallback.ok, true, `the fallback source was refused: ${fallback.error}`);
+    assert.ok(
+      seen.length >= 2 && seen.every((cmd) => cmd.includes("SRC='/opt/waterwall'")),
+      'the source path in the script is the default install',
+    );
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[require.resolve('../lib/ssh')];
+  }
+});
+
 await checkAsync('the cleanup reports what it removed', async () => {
   const built = require('../lib/ssh').buildRemoveInstallScript({
     waterwallPath: '/opt/waterwall',

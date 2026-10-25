@@ -2075,6 +2075,23 @@ const maintenancePending = (async () => {
   );
 })();
 
+// ---- the HTTP plane: what the API hands out over the wire ------------------
+// This one starts the real server and talks to it, so it is a suite of its
+// own rather than a set of unit checks.
+const httpSecurityPending = (async () => {
+  const ok = (label) => {
+    pass += 1;
+    console.log(`  ✓ ${label}`);
+  };
+  await require('./http-security.test').tests(
+    ok,
+    () => {
+      fail += 1;
+    },
+    failures,
+  );
+})();
+
 // ---- store round trip -----------------------------------------------------
 assert.strictEqual(store.listServers().length, 3, 'server store');
 assert.ok(store.addTunnel({ name: 'x', template: 'tcp-forward' }).id, 'tunnel store');
@@ -2085,7 +2102,7 @@ fs.rmSync(tmp, { recursive: true, force: true });
 // Both pending suites are awaited before the summary. Reporting failures (and
 // exiting) while they are still running would kill them and print a count that
 // does not include their results.
-Promise.all([netcheckPending, securityTestsPending, linkPending, certPending, featurePending, maintenancePending])
+Promise.all([netcheckPending, securityTestsPending, linkPending, certPending, featurePending, maintenancePending, httpSecurityPending])
   .then(() => {
     console.log('');
     console.log(`  ${pass} passed, ${fail} failed (${usedVariables} config variables resolved)`);

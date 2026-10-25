@@ -31,7 +31,12 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.dirname(ROOT)
 OUT = os.path.join(BASE, "out")
 RUN = os.path.join(BASE, "run")
-CORE = "/opt/waterwall/Waterwall"
+# The core to test against. The environment wins over the default so a box
+# that keeps its binary somewhere else can be pointed at it without editing
+# this file: `WATERWALL_CORE=/opt/waterwall-2/Waterwall python3 run.py`.
+# A path that does not exist is caught here rather than as the core's own
+# "exec of "" failed", which says nothing about what went wrong.
+CORE = os.environ.get("WATERWALL_CORE", "").strip() or "/opt/waterwall/Waterwall"
 IRAN_NS = "wwiran"
 FOREIGN_NS = "wwforeign"
 IRAN_IP = "10.200.0.2"
@@ -270,20 +275,68 @@ def wait_for_service(timeout=15.0):
 
 
 def ensure_cert():
+    """Put the throwaway certificate where the generated configs look for it.
+
+    The configs name their certificate file in one of two ways: the generator
+    overrides it with a throwaway path, while some templates keep the
+    template's own default. Both paths have to hold a certificate, or the
+    core refuses to start with "ssl certificate file error" and the template
+    is reported as broken when only the path was wrong.
+
+    The paths are read out of the generated configs themselves rather than
+    hard-coded here, so a new template that names a different path works
+    without touching this file.
+    """
     os.makedirs(CERT_DIR, exist_ok=True)
     full, key = os.path.join(CERT_DIR, "fullchain.pem"), os.path.join(CERT_DIR, "privkey.pem")
-    if os.path.exists(full) and os.path.exists(key):
-        return
-    subprocess.run(
-        [
-            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "30",
-            "-keyout", key, "-out", full,
-            "-subj", "/CN=example.com",
-            "-addext", "subjectAltName=DNS:example.com",
-        ],
-        capture_output=True,
-        check=True,
-    )
+    if not (os.path.exists(full) and os.path.exists(key)):
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "30",
+                "-keyout", key, "-out", full,
+                "-subj", "/CN=example.com",
+                "-addext", "subjectAltName=DNS:example.com",
+            ],
+            capture_output=True,
+            check=True,
+        )
+    for cert_path, key_path in cert_paths_in_configs():
+        for src, dst in ((full, cert_path), (key, key_path)):
+            if os.path.abspath(src) == os.path.abspath(dst):
+                continue
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copyfile(src, dst)
+            except OSError as exc:
+                print(f"WARN: cannot place the certificate at {dst}: {exc}", flush=True)
+
+
+def cert_paths_in_configs():
+    """Every (cert, key) pair the generated configs name.
+
+    The keys are the ones WaterWall reads: "cert-file" and "key-file" in the
+    node settings. A pair is only used when both halves are present, so a
+    config that names only a certificate does not send the harness looking for
+    a key that was never mentioned.
+    """
+    pairs = set()
+    for tpl in sorted(os.listdir(OUT)):
+        cfg_root = os.path.join(OUT, tpl)
+        if not os.path.isdir(cfg_root):
+            continue
+        for side in ("iran", "foreign"):
+            cfg_dir = os.path.join(cfg_root, side, "configs")
+            if not os.path.isdir(cfg_dir):
+                continue
+            for fn in os.listdir(cfg_dir):
+                if not fn.endswith(".json"):
+                    continue
+                text = open(os.path.join(cfg_dir, fn), encoding="utf-8", errors="replace").read()
+                cert = re.search(r'"cert-file"\s*:\s*"([^"]+)"', text)
+                key = re.search(r'"key-file"\s*:\s*"([^"]+)"', text)
+                if cert and key:
+                    pairs.add((cert.group(1), key.group(1)))
+    return sorted(pairs)
 
 
 def start_core(ns, side_dir, verbose=False):
@@ -656,6 +709,13 @@ def main(argv):
     # can travel through the same comma list.
     verbose = "--verbose" in args
     ids = [x for x in args if not x.startswith("-")]
+    # The core is what every template is judged against. A wrong or empty
+    # path makes all of them fail with "Connection refused", which reads as a
+    # broken template rather than a broken setup — so it is checked first and
+    # said plainly.
+    if not (os.path.isfile(CORE) and os.access(CORE, os.X_OK)):
+        print(f"FATAL: the WaterWall core is not runnable at {CORE}", flush=True)
+        return 2
     ensure_cert()
     os.makedirs(RUN, exist_ok=True)
     del_bridge()

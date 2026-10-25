@@ -1178,7 +1178,7 @@ function serverIsDomestic(server) {
 // The GitHub raw base the agent and the installer are published in.
 const AGENT_REPO_RAW = 'https://raw.githubusercontent.com/alimc98/waterwall-panel/main';
 
-function installCommand(server) {
+function installCommand(server, token) {
   const domestic = serverIsDomestic(server);
   const role = server && server.role ? server.role : 'foreign';
   // The installer itself is fetched from the source that suits the server:
@@ -1189,7 +1189,7 @@ function installCommand(server) {
   return [
     `curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 ${installerUrl} -o /tmp/ww-install-agent.sh && \\`,
     `sudo WW_PANEL_URL="${location.origin}" \\`,
-    `     WW_AGENT_TOKEN="${(server && server.agentToken) || ''}" \\`,
+    `     WW_AGENT_TOKEN="${token || ''}" \\`,
     `     WW_ROLE="${domestic ? 'iran' : 'foreign'}" \\`,
     `     bash /tmp/ww-install-agent.sh`,
   ].join('\n');
@@ -1201,19 +1201,47 @@ function installSourceNote(server) {
     : 'این سرور خارج از کشور است: نصب‌کننده و ایجنت مستقیم از GitHub گرفته می‌شوند، چون مسیر پنل ایرانی تا اینجا قطع می‌شود. اگر GitHub در دسترس نبود، خودکار از پنل هم امتحان می‌شود.';
 }
 
-function showAgentSetup(server) {
+/**
+ * The agent setup, with the token.
+ *
+ * The token does not travel with the server list — it authorises the agent
+ * plane, so it is fetched here, on its own, when the operator opens this
+ * dialog. A server whose token cannot be read still gets the dialog, with
+ * the reason in it, rather than a script with an empty token in it.
+ */
+async function showAgentSetup(server) {
   openModal(
     `اتصال کلاینت — ${server.name}`,
     `
+    <p class="small muted">در حال خواندن توکن…</p>`,
+    [{ text: 'بستن', class: 'primary', onClick: closeModal }],
+  );
+  let token = '';
+  let problem = '';
+  try {
+    const r = await api(`/api/servers/${server.id}/agent-token`);
+    if (!r.ok) problem = r.error || 'توکن در دسترس نبود.';
+    else token = r.agentToken || '';
+  } catch (err) {
+    problem = err.message;
+  }
+  const body = problem
+    ? `<div class="err-box">${esc(problem)}</div>`
+    : `
     <p class="small muted">این اسکریپت را روی سرور اجرا کنید. ایجنت هر چند ثانیه کانفیگ را از پنل می‌گیرد، می‌نویسد و سرویس را ری‌استارت می‌کند.</p>
     <label class="f"><span class="lbl">توکن Agent</span>
-      <input type="text" id="agentTokenOut" class="mono" value="${esc(server.agentToken || '')}" readonly></label>
+      <input type="text" id="agentTokenOut" class="mono" value="${esc(token)}" readonly></label>
     <label class="f"><span class="lbl">دستور نصب (کپی کنید)</span>
-      <textarea id="agentCmd" readonly style="min-height:170px">${installCommand(server)}</textarea></label>
+      <textarea id="agentCmd" readonly style="min-height:170px">${esc(installCommand(server, token))}</textarea></label>
     <p class="small muted">${installSourceNote(server)}</p>
-    <p class="small muted">اگر پنل را روی HTTP ساده اجرا می‌کنید، از یک reverse proxy با HTTPS استفاده کنید تا توکن در مسیر رمزنشده نباشد.</p>`,
-    [{ text: 'کپی توکن', class: '', onClick: () => copy(server.agentToken, 'توکن') }, { text: 'بستن', class: 'primary', onClick: closeModal }],
-  );
+    <p class="small muted">اگر پنل را روی HTTP ساده اجرا می‌کنید، از یک reverse proxy با HTTPS استفاده کنید تا توکن در مسیر رمزنشده نباشد.</p>`;
+  const buttons = problem
+    ? [{ text: 'بستن', class: 'primary', onClick: closeModal }]
+    : [
+        { text: 'کپی توکن', class: '', onClick: () => copy(token, 'توکن') },
+        { text: 'بستن', class: 'primary', onClick: closeModal },
+      ];
+  openModal(`اتصال کلاینت — ${server.name}`, body, buttons);
 }
 
 async function probeServer(id) {

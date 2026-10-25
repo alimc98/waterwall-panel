@@ -534,8 +534,28 @@ router.get('/api/servers', (req, res) => {
   sendJson(res, 200, { ok: true, servers: store.listServers().map(redact) });
 });
 
+/**
+ * The shape of a server record that leaves the panel.
+ *
+ * The SSH password never leaves the panel in any form. The agent token is
+ * different: it is a credential, but the operator has to be able to read it
+ * to install the agent on the box (`showAgentSetup` puts it in the install
+ * command).
+ *
+ * So it does not travel with the ordinary server list — there it would be
+ * handed to every reader of `GET /api/servers`, and with it the ability to
+ * fetch every tunnel's generated configuration and to write the server's
+ * status record. It is fetched on its own, from `GET /api/servers/:id/agent-token`,
+ * which the operator opens deliberately.
+ */
 function redact(server) {
-  return { ...server, sshPassword: server.sshPassword ? '***' : '' };
+  // The agent token is a credential: it authorises `GET /api/agent/config`
+  // (every tunnel's generated configuration) and `POST /api/agent/status`
+  // (a write to the server's record). The server list is read by the whole
+  // UI, so the token does not travel with it. The operator who needs it —
+  // to install the agent — asks for it explicitly, below.
+  const { agentToken, ...rest } = server;
+  return { ...rest, sshPassword: server.sshPassword ? '***' : '' };
 }
 
 router.post('/api/servers', async (req, res) => {
@@ -554,6 +574,24 @@ router.patch('/api/servers/:id', async (req, res, ctx) => {
   if (!server) return sendError(res, 404, 'server not found');
   broadcast('servers', store.listServers().map(redact));
   sendJson(res, 200, { ok: true, server: redact(server) });
+});
+
+/**
+ * The agent token of one server, on its own.
+ *
+ * The token is not part of the server list — it authorises the agent plane
+ * (`GET /api/agent/config` hands over every tunnel's generated configuration,
+ * `POST /api/agent/status` writes to the server's record), so it is only
+ * handed out here, to an operator who opens the agent setup deliberately.
+ */
+router.get('/api/servers/:id/agent-token', (req, res, ctx) => {
+  if (guard(req, res)) return;
+  const server = store.getServer(ctx.params.id);
+  if (!server) return sendError(res, 404, 'server not found');
+  if (!server.agentToken) {
+    return sendError(res, 404, 'this server has no agent token; save it once to get one');
+  }
+  sendJson(res, 200, { ok: true, id: server.id, name: server.name, agentToken: server.agentToken });
 });
 
 /**
