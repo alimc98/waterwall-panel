@@ -1,0 +1,14 @@
+# The installers are shell scripts and have to keep LF line endings.
+#
+# A CRLF line ending makes bash fail at the first function definition with
+# a syntax error that points nowhere near the cause, and the script is then
+# served to every server that installs from the panel.
+*.sh text eol=lf
+
+# The agent is run by node, which is happy either way, but keeping it LF
+# avoids a needless diff on every checkout.
+agent/agent.js text eol=lf
+
+# The published forms of the agent are binary as far as git is concerned.
+agent/agent.js.gz binary
+agent/agent.js.b64 text eol=lf

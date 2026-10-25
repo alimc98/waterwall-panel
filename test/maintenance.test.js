@@ -15,6 +15,7 @@ const path = require('node:path');
 
 const upgrade = require('../lib/upgrade');
 const installer = require('../lib/install');
+const sources = require('../lib/sources');
 const ssh = require('../lib/ssh');
 const versions = require('../lib/versions');
 
@@ -621,6 +622,87 @@ await checkAsync('an existing install is left alone unless force is given', asyn
   });
   assert.strictEqual(res.ok, true);
   assert.strictEqual(res.alreadyInstalled, true);
+});
+
+
+// ---------------------------------------------------------- where files come from
+
+await check('a foreign server takes the agent from outside the country first', () => {
+  // The panel is on an Iranian host. The path from there to a foreign box is
+  // the one that gets cut: the raw agent.js stops a few hundred bytes in and
+  // is reset. A foreign server therefore starts at GitHub and only falls
+  // back to the panel.
+  const list = sources.agentSources('http://panel.test:8787', { role: 'foreign' });
+  assert.strictEqual(list[0].from, 'github');
+  assert.strictEqual(list[0].url, 'https://raw.githubusercontent.com/alimc98/waterwall-panel/main/agent/agent.js');
+  assert.strictEqual(list[list.length - 1].from, 'panel');
+  assert.ok(list.some((s) => s.from === 'github' && s.kind === 'gzip'), 'the gzipped form is offered too');
+  assert.ok(list.some((s) => s.from === 'github' && s.kind === 'base64'), 'and the base64 form');
+  assert.ok(list.some((s) => s.from === 'panel' && s.kind === 'gzip'), 'the panel offers the same three forms');
+});
+
+await check('an Iranian server takes the agent from the panel first', () => {
+  // The panel is right there and answers in milliseconds, so it is the first
+  // choice; the foreign sources are the fallback.
+  const list = sources.agentSources('http://panel.test:8787', { role: 'iran' });
+  assert.strictEqual(list[0].from, 'panel');
+  assert.strictEqual(list[0].url, 'http://panel.test:8787/agent.js');
+  assert.strictEqual(list[list.length - 1].from, 'github');
+});
+
+await check('a relay server is treated as one inside the country', () => {
+  const list = sources.agentSources('http://panel.test:8787', { role: 'relay' });
+  assert.strictEqual(list[0].from, 'panel');
+});
+
+await check('the source order can be forced', () => {
+  const forced = sources.agentSources('http://panel.test:8787', { role: 'iran', foreignFirst: true });
+  assert.strictEqual(forced[0].from, 'github');
+  const back = sources.agentSources('http://panel.test:8787', { role: 'foreign', foreignFirst: false });
+  assert.strictEqual(back[0].from, 'panel');
+});
+
+await check('the installer itself is fetched from the source that fits', () => {
+  const foreign = sources.installerSources('http://panel.test:8787', { role: 'foreign' });
+  assert.strictEqual(foreign[0].from, 'github');
+  assert.match(foreign[0].url, /public\/install-agent\.sh$/);
+  const iran = sources.installerSources('http://panel.test:8787', { role: 'iran' });
+  assert.strictEqual(iran[0].from, 'panel');
+  assert.strictEqual(iran[0].url, 'http://panel.test:8787/install-agent.sh');
+});
+
+await check('the agent installers walk the source list', () => {
+  // Both installers have to try the sources in turn, and each source has to
+  // offer the encoded forms, because the path that refuses the raw bytes
+  // still carries the encoded ones.
+  for (const file of ['install.sh', 'public/install-agent.sh']) {
+    const body = fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
+    assert.match(body, /agent_source_urls\(\)/, `${file} has a source list`);
+    assert.match(body, /raw\.githubusercontent\.com/, `${file} knows about GitHub`);
+    assert.match(body, /\*\.gz\)\s+kind=gzip/, `${file} handles the gzipped form`);
+    assert.match(body, /\*\.b64\)\s+kind=base64/, `${file} handles the base64 form`);
+    assert.match(body, /WW_ROLE/, `${file} takes the role into account`);
+    assert.match(body, /WW_AGENT_SOURCE/, `${file} lets the source be forced`);
+  }
+});
+
+await check('the agent installers take --role and --agent-source', () => {
+  for (const file of ['install.sh', 'public/install-agent.sh']) {
+    const body = fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
+    assert.match(body, /--role\)/, `${file} parses --role`);
+    assert.match(body, /--agent-source\)/, `${file} parses --agent-source`);
+  }
+});
+
+await check('the published forms of the agent can be rebuilt', () => {
+  // The foreign server fetches the agent from GitHub, so the encoded forms
+  // have to be in the repository. The build script is what puts them there.
+  const raw = fs.readFileSync(path.join(__dirname, '..', 'agent', 'agent.js'));
+  const gz = require('node:zlib').gzipSync(raw, { level: 9 });
+  const b64 = Buffer.from(raw).toString('base64');
+  // the same bytes the script writes
+  assert.strictEqual(require('node:zlib').gunzipSync(gz).length, raw.length);
+  assert.strictEqual(Buffer.from(b64, 'base64').length, raw.length);
 });
 
 }

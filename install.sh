@@ -29,6 +29,19 @@ WW_STATE_DIR="${WW_STATE_DIR:-/var/lib/ww-agent}"
 WW_AGENT_SERVICE="${WW_AGENT_SERVICE:-ww-agent}"
 WW_AGENT_INTERVAL="${WW_AGENT_INTERVAL:-15}"
 WW_GITHUB_REPO="${WW_GITHUB_REPO:-radkesvat/WaterWall}"
+# The panel's own repository, where the agent and the installer are
+# published. A server outside the country fetches the agent from here
+# rather than from the panel, because the path from the panel to a foreign
+# box is the one that gets cut.
+WW_PANEL_REPO="${WW_PANEL_REPO:-alimc98/waterwall-panel}"
+# "auto" tries the sources in the order that fits where this server sits:
+# a server in the same country as the panel takes the panel first, a server
+# outside it takes GitHub first. "github" and "panel" force one of them.
+WW_AGENT_SOURCE="${WW_AGENT_SOURCE:-auto}"
+# Which country this server sits in. "foreign" is the safe default: a
+# foreign box reaches GitHub without the interruption, and only falls back
+# to the panel when it has to.
+WW_ROLE="${WW_ROLE:-foreign}"
 
 PANEL_URL="${WW_PANEL_URL:-}"
 AGENT_TOKEN="${WW_AGENT_TOKEN:-}"
@@ -64,6 +77,8 @@ WaterWall Panel installer
   --arch ARCH           Force asset: x64 | x64-old | arm64 | arm64-old
   --waterwall-zip FILE  Install from this zip; implies --offline for the binary
   --agent-file FILE     Install the agent from this file instead of downloading
+  --role ROLE           Where this server sits: iran | foreign    (WW_ROLE)
+  --agent-source SRC    auto | github | panel                    (WW_AGENT_SOURCE)
   --offline             Never contact the network
   --skip-waterwall      Only install the agent
   --skip-agent          Only install WaterWall
@@ -86,6 +101,8 @@ while [ $# -gt 0 ]; do
     --arch)            ARCH_OVERRIDE="${2:-}"; shift 2 ;;
     --waterwall-zip)   WATERWALL_ZIP="${2:-}"; shift 2 ;;
     --agent-file)      AGENT_FILE="${2:-}"; shift 2 ;;
+    --role)            WW_ROLE="${2:-}"; shift 2 ;;
+    --agent-source)    WW_AGENT_SOURCE="${2:-}"; shift 2 ;;
     --offline)         OFFLINE=1; shift ;;
     --skip-waterwall)  SKIP_WATERWALL=1; shift ;;
     --skip-agent)      SKIP_AGENT=1; shift ;;
@@ -332,6 +349,33 @@ UNIT
 
 # --------------------------------------------------------------------- agent
 
+# The list of places the agent can be fetched from, in the order they are
+# tried. The panel and GitHub each offer the raw file, a gzipped one and a
+# base64-encoded one, because a path that refuses the raw bytes still
+# carries the encoded ones.
+agent_source_urls() {
+  local base="${PANEL_URL%/}"
+  local github="https://raw.githubusercontent.com/${WW_PANEL_REPO}/main"
+  local panel_sources github_sources
+  panel_sources="$base/agent.js $base/agent.js.gz $base/agent.js.b64"
+  github_sources="$github/agent/agent.js $github/agent/agent.js.gz $github/agent/agent.js.b64"
+
+  case "$WW_AGENT_SOURCE" in
+    github) echo "$github_sources $panel_sources" ;;
+    panel)  echo "$panel_sources $github_sources" ;;
+    *)
+      # auto: a server that shares the panel's country reaches the panel
+      # instantly; a server outside it does not, and GitHub carries the
+      # traffic without the interruption.
+      if [ "$WW_ROLE" = "iran" ] || [ "$WW_ROLE" = "relay" ]; then
+        echo "$panel_sources $github_sources"
+      else
+        echo "$github_sources $panel_sources"
+      fi
+      ;;
+  esac
+}
+
 install_agent() {
   local target="${WW_AGENT_DIR}/agent.js"
   install -d -m 0755 "$WW_AGENT_DIR" "$WW_STATE_DIR"
@@ -346,54 +390,66 @@ install_agent() {
     major="$(node -p 'process.versions.node.split(".")[0]')"
     [ "$major" -ge 18 ] || die "Node.js 18+ required (found $(node -v))."
 
-    # The panel sits behind the same long-haul path as the server. The raw
-    # agent.js does not always survive that path: the transfer stops a few
-    # hundred bytes in and is reset, which used to leave a truncated
-    # agent.js on disk that then failed to parse. The same bytes gzip- or
-    # base64-encoded come through whole, so all three forms are tried in
-    # turn and only a complete file is moved into place.
-    local base="${PANEL_URL%/}"
+    # The agent is fetched from a list of sources rather than from one URL.
+    #
+    # The panel sits behind a long path to a foreign box, and the raw
+    # agent.js does not always survive it: the transfer stops a few hundred
+    # bytes in and is reset, which used to leave a truncated agent.js on
+    # disk that then failed to parse. The same bytes gzip- or base64-encoded
+    # come through whole, so each source offers all three forms.
+    #
+    # A server outside the country starts at GitHub, which carries the
+    # traffic without the interruption, and falls back to the panel. A
+    # server in the same country starts at the panel, which answers in
+    # milliseconds.
     local tmp="${target}.download"
     local ok=0
+    local src kind
 
-    # 1. the raw file
-    info "agent       : downloading $base/agent.js"
-    if fetch_file "$base/agent.js" "$tmp" 5000; then
-      ok=1
-    else
-      # 2. gzip
-      info "agent       : retrying with gzip ($base/agent.js.gz)"
-      if fetch_file "$base/agent.js.gz" "$tmp.gz" 500 \
-         && gunzip -c "$tmp.gz" > "$tmp" 2>/dev/null \
-         && [ "$(wc -c < "$tmp" 2>/dev/null || echo 0)" -ge 5000 ]; then
-        ok=1
-      else
-        rm -f "$tmp"
-      fi
-      rm -f "$tmp.gz"
+    for src in $(agent_source_urls); do
+      case "$src" in
+        *.gz)  kind=gzip ;;
+        *.b64) kind=base64 ;;
+        *)     kind=raw ;;
+      esac
 
-      # 3. base64: plain text, which the path has never refused
-      if [ "$ok" -eq 0 ]; then
-        info "agent       : retrying with base64 ($base/agent.js.b64)"
-        if fetch_file "$base/agent.js.b64" "$tmp.b64" 500 \
-           && decode_base64 "$tmp.b64" > "$tmp" 2>/dev/null \
-           && [ "$(wc -c < "$tmp" 2>/dev/null || echo 0)" -ge 5000 ]; then
+      info "agent       : trying $src"
+      rm -f "$tmp" "$tmp.gz" "$tmp.b64" "$tmp.out"
+
+      if [ "$kind" = gzip ]; then
+        if fetch_file "$src" "$tmp.gz" 500 \
+           && gunzip -c "$tmp.gz" > "$tmp.out" 2>/dev/null \
+           && [ "$(wc -c < "$tmp.out" 2>/dev/null || echo 0)" -ge 5000 ]; then
+          mv -f "$tmp.out" "$tmp"
           ok=1
-        else
-          rm -f "$tmp"
+          break
         fi
-        rm -f "$tmp.b64"
+      elif [ "$kind" = base64 ]; then
+        if fetch_file "$src" "$tmp.b64" 500 \
+           && decode_base64 "$tmp.b64" > "$tmp.out" 2>/dev/null \
+           && [ "$(wc -c < "$tmp.out" 2>/dev/null || echo 0)" -ge 5000 ]; then
+          mv -f "$tmp.out" "$tmp"
+          ok=1
+          break
+        fi
+      else
+        if fetch_file "$src" "$tmp" 5000; then
+          ok=1
+          break
+        fi
       fi
-    fi
+    done
+    rm -f "$tmp.gz" "$tmp.b64" "$tmp.out"
 
     if [ "$ok" -eq 1 ]; then
       install -m 0755 "$tmp" "$target"
       rm -f "$tmp"
     else
       rm -f "$tmp"
-      die "could not download the agent from ${base}/agent.js.
-If the panel is unreachable, save agent.js on any machine that can reach it
-and re-run with:  --agent-file /path/to/agent.js"
+      die "could not download the agent from any source.
+The sources tried were: $(agent_source_urls)
+If none of them is reachable, save agent.js on any machine that can reach
+it and re-run with:  --agent-file /path/to/agent.js"
     fi
   fi
   chmod 0755 "$target"

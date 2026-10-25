@@ -22,15 +22,24 @@ WW_AGENT_INTERVAL="${WW_AGENT_INTERVAL:-15}"
 PANEL_URL="${WW_PANEL_URL:-}"
 AGENT_TOKEN="${WW_AGENT_TOKEN:-}"
 AGENT_FILE=""
+# Which country this server sits in. "foreign" is the safe default: a
+# foreign box reaches GitHub without the interruption, and only falls back
+# to the panel when it has to.
+WW_ROLE="${WW_ROLE:-foreign}"
+WW_AGENT_SOURCE="${WW_AGENT_SOURCE:-auto}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --agent-file) AGENT_FILE="${2:-}"; shift 2 ;;
+    --agent-file)   AGENT_FILE="${2:-}"; shift 2 ;;
+    --role)         WW_ROLE="${2:-}"; shift 2 ;;
+    --agent-source) WW_AGENT_SOURCE="${2:-}"; shift 2 ;;
     -h|--help)
       cat <<'USAGE'
 WaterWall agent installer
 
  --agent-file FILE Install the agent from this file instead of downloading it
+ --role ROLE       Where this server sits: iran | foreign (default foreign)
+ --agent-source S  auto | github | panel (default auto)
  -h, --help         This text
 
 Environment equivalents:
@@ -39,6 +48,8 @@ Environment equivalents:
   WW_AGENT_DIR     Install prefix (default /opt/ww-agent)
   WW_STATE_DIR     State directory (default /var/lib/ww-agent)
   WW_SERVICE_NAME  systemd unit name (default ww-agent)
+  WW_ROLE          iran | foreign - decides which source is tried first
+  WW_AGENT_SOURCE  auto | github | panel - forces one source
 USAGE
       exit 0
       ;;
@@ -73,7 +84,42 @@ echo "==> Creating directories"
 mkdir -p "$WW_AGENT_DIR" "$WW_STATE_DIR"
 
 # ------------------------------------------------------------------ download
-echo "==> Downloading the agent from $PANEL_URL"
+# The agent is fetched from a list of sources rather than from one URL.
+#
+# The panel sits behind a long path to a foreign box, and the raw agent.js
+# does not always survive it: the transfer stops a few hundred bytes in and
+# is reset, which used to leave a truncated agent.js on disk that then
+# failed to parse. The same bytes gzip- or base64-encoded come through
+# whole, so each source offers all three forms.
+#
+# A server outside the country starts at GitHub, which carries the traffic
+# without the interruption, and falls back to the panel. A server in the
+# same country starts at the panel, which answers in milliseconds.
+WW_ROLE="${WW_ROLE:-foreign}"
+WW_AGENT_SOURCE="${WW_AGENT_SOURCE:-auto}"
+WW_PANEL_REPO="${WW_PANEL_REPO:-alimc98/waterwall-panel}"
+
+agent_source_urls() {
+  local base="${PANEL_URL%/}"
+  local github="https://raw.githubusercontent.com/${WW_PANEL_REPO}/main"
+  local panel_sources github_sources
+  panel_sources="$base/agent.js $base/agent.js.gz $base/agent.js.b64"
+  github_sources="$github/agent/agent.js $github/agent/agent.js.gz $github/agent/agent.js.b64"
+
+  case "$WW_AGENT_SOURCE" in
+    github) echo "$github_sources $panel_sources" ;;
+    panel)  echo "$panel_sources $github_sources" ;;
+    *)
+      if [ "$WW_ROLE" = "iran" ] || [ "$WW_ROLE" = "relay" ]; then
+        echo "$panel_sources $github_sources"
+      else
+        echo "$github_sources $panel_sources"
+      fi
+      ;;
+  esac
+}
+
+echo "==> Downloading the agent"
 AGENT_URL="$PANEL_URL/agent.js"
 TMP_AGENT="$(mktemp)"
 
@@ -150,34 +196,47 @@ if [ -n "$AGENT_FILE" ]; then
 else
   BASE="${PANEL_URL%/}"
   ok=0
-  if fetch_agent "$BASE/agent.js"; then
-    ok=1
-  else
-    echo "    retrying with gzip ($BASE/agent.js.gz)" >&2
-    if fetch_agent "$BASE/agent.js.gz" && gunzip -c "$TMP_AGENT" > "$TMP_AGENT.out" 2>/dev/null \
-       && [ "$(wc -c < "$TMP_AGENT.out" 2>/dev/null || echo 0)" -ge 5000 ]; then
-      mv -f "$TMP_AGENT.out" "$TMP_AGENT"
-      ok=1
-    else
-      rm -f "$TMP_AGENT" "$TMP_AGENT.out"
-    fi
+  src=""
+  kind=""
+  for src in $(agent_source_urls); do
+    case "$src" in
+      *.gz)  kind=gzip ;;
+      *.b64) kind=base64 ;;
+      *)     kind=raw ;;
+    esac
 
-    if [ "$ok" -eq 0 ]; then
-      echo "    retrying with base64 ($BASE/agent.js.b64)" >&2
-      if fetch_agent "$BASE/agent.js.b64" && decode_base64 "$TMP_AGENT" > "$TMP_AGENT.out" 2>/dev/null \
+    echo "    trying $src" >&2
+    rm -f "$TMP_AGENT" "$TMP_AGENT.out"
+
+    if [ "$kind" = gzip ]; then
+      if fetch_agent "$src" && gunzip -c "$TMP_AGENT" > "$TMP_AGENT.out" 2>/dev/null \
          && [ "$(wc -c < "$TMP_AGENT.out" 2>/dev/null || echo 0)" -ge 5000 ]; then
         mv -f "$TMP_AGENT.out" "$TMP_AGENT"
         ok=1
-      else
-        rm -f "$TMP_AGENT" "$TMP_AGENT.out"
+        break
+      fi
+    elif [ "$kind" = base64 ]; then
+      if fetch_agent "$src" && decode_base64 "$TMP_AGENT" > "$TMP_AGENT.out" 2>/dev/null \
+         && [ "$(wc -c < "$TMP_AGENT.out" 2>/dev/null || echo 0)" -ge 5000 ]; then
+        mv -f "$TMP_AGENT.out" "$TMP_AGENT"
+        ok=1
+        break
+      fi
+    else
+      if fetch_agent "$src"; then
+        ok=1
+        break
       fi
     fi
-  fi
+    rm -f "$TMP_AGENT" "$TMP_AGENT.out"
+  done
 
   if [ "$ok" -ne 1 ]; then
-    echo "ERROR: could not download the agent from $BASE/agent.js" >&2
-    echo "       The transfer kept failing. Save agent.js on a machine that can" >&2
-    echo "       reach the panel and copy it over with:" >&2
+    echo "ERROR: could not download the agent from any source." >&2
+    echo "       The sources tried were:" >&2
+    for src in $(agent_source_urls); do echo "         $src" >&2; done
+    echo "       If none of them is reachable, save agent.js on a machine that" >&2
+    echo "       can and copy it over with:" >&2
     echo "         scp agent.js root@SERVER_IP:/root/agent.js" >&2
     echo "         sudo WW_PANEL_URL=... WW_AGENT_TOKEN=... bash install-agent.sh --agent-file /root/agent.js" >&2
     rm -f "$TMP_AGENT"

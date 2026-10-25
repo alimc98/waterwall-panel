@@ -124,12 +124,19 @@ check "the agent download retries" "yes" "$([ "$(grep -c 'retry-all-errors' "$S"
 # The download has to land in a temporary file and only be moved into place
 # once it is complete, and its size has to be checked.
 check "the download lands in a temporary file first" "yes" "$([ "$(grep -c 'part\.\$\$' "$S")" -gt 0 ] && echo yes || echo no)"
-check "the size of the agent download is checked" "yes" "$([ "$(grep -c 'fetch_file "$base/agent.js" "$tmp" 5000' "$S")" -gt 0 ] && echo yes || echo no)"
+check "the size of the agent download is checked" "yes" "$([ "$(grep -c 'fetch_file "$src" "$tmp" 5000' "$S")" -gt 0 ] && echo yes || echo no)"
 
 # The raw agent does not always survive the long path from the panel to an
 # exit server, so the installer falls back to the gzip and base64 forms.
 check "the installer falls back to gzip" "yes" "$([ "$(grep -c 'agent\.js\.gz' "$S")" -gt 0 ] && echo yes || echo no)"
 check "the installer falls back to base64" "yes" "$([ "$(grep -c 'agent\.js\.b64' "$S")" -gt 0 ] && echo yes || echo no)"
+
+# A server outside the country fetches the agent from outside the country.
+# The path from the panel to a foreign box is the one that gets cut, so the
+# installer walks a list of sources and starts at GitHub for a foreign server.
+check "the installer knows about GitHub as a source" "yes" "$([ "$(grep -c 'raw\.githubusercontent\.com' "$S")" -gt 0 ] && echo yes || echo no)"
+check "the installer walks a list of sources" "yes" "$([ "$(grep -c 'agent_source_urls' "$S")" -gt 0 ] && echo yes || echo no)"
+check "the role decides which source comes first" "yes" "$([ "$(grep -c 'WW_ROLE' "$S")" -gt 0 ] && echo yes || echo no)"
 check "the base64 decoder has alternatives" "yes" "$([ "$(grep -c 'openssl base64 -d' "$S")" -gt 0 ] && echo yes || echo no)"
 
 # fetch_file must fail when the transfer keeps failing, rather than leaving a

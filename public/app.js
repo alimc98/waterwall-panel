@@ -1006,11 +1006,25 @@ function pageServers() {
     </p>
 
     <h4 style="margin:14px 0 8px;font-size:12px;color:var(--accent)">نصب خودکار</h4>
-    <pre class="code" style="direction:ltr;text-align:left">curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \\
+    <p class="small muted">
+      سرورهای خارج از کشور فایل‌ها را مستقیم از GitHub می‌گیرند و سرورهای داخل کشور از خودِ پنل.
+      با توجه به نقش سرور، خودکار انتخاب می‌شود.
+    </p>
+    <pre class="code" style="direction:ltr;text-align:left"># سرور خارج از کشور (پیش‌فرض):
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \\
+  ${AGENT_REPO_RAW}/install.sh -o /tmp/ww-install.sh && \\
+sudo bash /tmp/ww-install.sh \\
+  --panel-url ${esc(location.origin)} \\
+  --agent-token AGENT_TOKEN \\
+  --role foreign
+
+# سرور ایرانی (داخل کشور):
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \\
   ${esc(location.origin)}/install.sh -o /tmp/ww-install.sh && \\
 sudo bash /tmp/ww-install.sh \\
   --panel-url ${esc(location.origin)} \\
-  --agent-token AGENT_TOKEN</pre>
+  --agent-token AGENT_TOKEN \\
+  --role iran</pre>
     <div class="small muted">توکن هر سرور جداست: در جدول بالا دکمه «ویرایش» را بزنید.</div>
     <div class="small muted" style="margin-top:6px">
       فایل اول دانلود می‌شود و بعد اجرا — اگر دانلود وسط کار قطع شود، نصبِ نیمه‌کاره جا نمی‌ماند.
@@ -1148,6 +1162,44 @@ async function saveServer(existing) {
   }
 }
 
+// Where the installer and the agent are fetched from.
+//
+// The panel sits on an Iranian host, and the path from there to a foreign
+// box is the one that gets cut: the raw agent.js stops a few hundred bytes
+// in and is reset. A foreign server therefore takes the installer and the
+// agent from GitHub, which carries the traffic without the interruption,
+// and only falls back to the panel when GitHub cannot be reached. An
+// Iranian server takes them from the panel, which answers in milliseconds.
+function serverIsDomestic(server) {
+  return server && (server.role === 'iran' || server.role === 'relay');
+}
+
+// The GitHub raw base the agent and the installer are published in.
+const AGENT_REPO_RAW = 'https://raw.githubusercontent.com/alimc98/waterwall-panel/main';
+
+function installCommand(server) {
+  const domestic = serverIsDomestic(server);
+  const role = server && server.role ? server.role : 'foreign';
+  // The installer itself is fetched from the source that suits the server:
+  // GitHub for a foreign box, the panel for one in the same country.
+  const installerUrl = domestic
+    ? `${location.origin}/install-agent.sh`
+    : `${AGENT_REPO_RAW}/public/install-agent.sh`;
+  return [
+    `curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 ${installerUrl} -o /tmp/ww-install-agent.sh && \\`,
+    `sudo WW_PANEL_URL="${location.origin}" \\`,
+    `     WW_AGENT_TOKEN="${(server && server.agentToken) || ''}" \\`,
+    `     WW_ROLE="${domestic ? 'iran' : 'foreign'}" \\`,
+    `     bash /tmp/ww-install-agent.sh`,
+  ].join('\n');
+}
+
+function installSourceNote(server) {
+  return serverIsDomestic(server)
+    ? 'این سرور داخل کشور است: نصب‌کننده و ایجنت از خودِ سرور پنل گرفته می‌شوند.'
+    : 'این سرور خارج از کشور است: نصب‌کننده و ایجنت مستقیم از GitHub گرفته می‌شوند، چون مسیر پنل ایرانی تا اینجا قطع می‌شود. اگر GitHub در دسترس نبود، خودکار از پنل هم امتحان می‌شود.';
+}
+
 function showAgentSetup(server) {
   openModal(
     `اتصال کلاینت — ${server.name}`,
@@ -1156,7 +1208,8 @@ function showAgentSetup(server) {
     <label class="f"><span class="lbl">توکن Agent</span>
       <input type="text" id="agentTokenOut" class="mono" value="${esc(server.agentToken || '')}" readonly></label>
     <label class="f"><span class="lbl">دستور نصب (کپی کنید)</span>
-      <textarea id="agentCmd" readonly style="min-height:150px">curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 ${location.origin}/install-agent.sh -o /tmp/ww-install-agent.sh && sudo WW_PANEL_URL="${location.origin}" WW_AGENT_TOKEN="${server.agentToken || ''}" bash /tmp/ww-install-agent.sh</textarea></label>
+      <textarea id="agentCmd" readonly style="min-height:170px">${installCommand(server)}</textarea></label>
+    <p class="small muted">${installSourceNote(server)}</p>
     <p class="small muted">اگر پنل را روی HTTP ساده اجرا می‌کنید، از یک reverse proxy با HTTPS استفاده کنید تا توکن در مسیر رمزنشده نباشد.</p>`,
     [{ text: 'کپی توکن', class: '', onClick: () => copy(server.agentToken, 'توکن') }, { text: 'بستن', class: 'primary', onClick: closeModal }],
   );
