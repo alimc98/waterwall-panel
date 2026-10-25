@@ -694,6 +694,19 @@ await check('the agent installers take --role and --agent-source', () => {
   }
 });
 
+await check('the agent unit does not name a path that is not there', () => {
+  // The unit's sandbox lists the WaterWall directory in ReadWritePaths. A
+  // path that does not exist cannot be made writable, and systemd then
+  // refuses to set the namespace up at all - the agent exits with
+  // 226/NAMESPACE and restart-loops. The agent may well be installed before
+  // WaterWall is, so the directory is only named when it is there.
+  const body = fs.readFileSync(path.join(__dirname, '..', 'public', 'install-agent.sh'), 'utf8');
+  assert.match(body, /SANDBOX_PATHS="\$WW_STATE_DIR"/, 'the sandbox starts from the state directory');
+  assert.match(body, /if \[ -d "\$WW_WATERWALL_PATH" \]; then/, 'the WaterWall path is only named when it exists');
+  assert.match(body, /ReadWritePaths=\$SANDBOX_PATHS/, 'and the unit uses the computed list');
+  assert.match(body, /systemctl is-active --quiet "\$WW_SERVICE_NAME"/, 'a service that does not start is reported');
+});
+
 await check('the published forms of the agent can be rebuilt', () => {
   // The foreign server fetches the agent from GitHub, so the encoded forms
   // have to be in the repository. The build script is what puts them there.

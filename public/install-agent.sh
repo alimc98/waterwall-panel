@@ -250,6 +250,20 @@ echo "    installed to $WW_AGENT_DIR/agent.js"
 
 # ------------------------------------------------------------------- systemd
 echo "==> Writing $WW_SERVICE_NAME.service"
+
+# The unit's sandbox names the WaterWall directory in ReadWritePaths. A path
+# that is not there cannot be made writable, and systemd then refuses to set
+# the namespace up at all - the agent exits with 226/NAMESPACE and
+# restart-loops. The agent may well be installed before WaterWall is, so the
+# directory is only named when it exists.
+SANDBOX_PATHS="$WW_STATE_DIR"
+if [ -d "$WW_WATERWALL_PATH" ]; then
+  SANDBOX_PATHS="$SANDBOX_PATHS $WW_WATERWALL_PATH"
+else
+  echo "    note: $WW_WATERWALL_PATH is not there yet, so the unit's sandbox"
+  echo "          will not name it. Install WaterWall and restart the agent."
+fi
+
 cat > "/etc/systemd/system/$WW_SERVICE_NAME.service" <<EOF
 [Unit]
 Description=WaterWall Panel Agent
@@ -271,7 +285,7 @@ RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=$WW_STATE_DIR $WW_WATERWALL_PATH
+ReadWritePaths=$SANDBOX_PATHS
 
 [Install]
 WantedBy=multi-user.target
@@ -281,11 +295,20 @@ systemctl daemon-reload
 systemctl enable "$WW_SERVICE_NAME" >/dev/null 2>&1 || true
 systemctl restart "$WW_SERVICE_NAME"
 
-sleep 2
+sleep 3
 echo ""
 systemctl --no-pager --lines=15 status "$WW_SERVICE_NAME" || true
 echo ""
-echo "  Agent installed and running."
+
+# A service that cannot start is not a successful install, and the reason
+# has to be said out loud rather than left in the journal.
+if systemctl is-active --quiet "$WW_SERVICE_NAME"; then
+  echo "  Agent installed and running."
+else
+  echo "  ERROR: the agent was installed but the service does not start." >&2
+  echo "         journalctl -u $WW_SERVICE_NAME -n 30" >&2
+  exit 1
+fi
 echo "  Panel : $PANEL_URL"
 echo "  State : $WW_STATE_DIR/state.json"
 echo "  WaterWall path: $WW_WATERWALL_PATH (service: $WW_WATERWALL_SERVICE)"
