@@ -145,11 +145,17 @@ ls -l /opt/waterwall/Waterwall
 {
   "name": "Reverse Reality Arvan UK",
   "template": "reverse-reality",
-  "targetServers": ["<SERVER_ID_IRAN>"],
-  "foreign": ["<SERVER_ID_UK>", "<SERVER_ID_ROMANIA>"],
-  "settings": {
-    "listenPort": 443,
-    "targetPort": 443
+  "targetServers": {
+    "iran": "<SERVER_ID_IRAN>",
+    "foreign": ["<SERVER_ID_UK>", "<SERVER_ID_ROMANIA>"]
+  },
+  "options": {
+    "userPort": 443,
+    "reversePort": 443,
+    "samePort": true,
+    "finalPort": 80,
+    "camouflageHost": "www.microsoft.com",
+    "realitySni": "www.microsoft.com"
   }
 }
 ```
@@ -161,9 +167,18 @@ curl -s -X POST -H "Authorization: Bearer <TOKEN>" \
   -d '{
     "name": "Reverse Reality Arvan UK",
     "template": "reverse-reality",
-    "targetServers": ["eb51e3e2-b7a8-4d1d-ad46-51e973447cad"],
-    "foreign": ["96dc29fe-c193-46aa-904e-69ef7386457d", "da665af9-f743-469a-83bd-5cc340bdbb47"],
-    "settings": {"listenPort": 443, "targetPort": 443}
+    "targetServers": {
+      "iran": "eb51e3e2-b7a8-4d1d-ad46-51e973447cad",
+      "foreign": ["96dc29fe-c193-46aa-904e-69ef7386457d", "da665af9-f743-469a-83bd-5cc340bdbb47"]
+    },
+    "options": {
+      "userPort": 443,
+      "reversePort": 443,
+      "samePort": true,
+      "finalPort": 80,
+      "camouflageHost": "www.microsoft.com",
+      "realitySni": "www.microsoft.com"
+    }
   }' \
   http://188.121.106.83:8787/api/tunnels
 ```
@@ -172,10 +187,12 @@ curl -s -X POST -H "Authorization: Bearer <TOKEN>" \
 
 ### ۴.۲ ترتیب خروجی‌های تونل
 ترتیب آرایه `foreign` ترتیب خروجی‌های تونل را تعیین می‌کند:
-- `foreign[0]` = خارج اول (لندن)
-- `foreign[1]` = خارج دوم (رومانی)
+- `foreign[0]` = خروجی اول (مثلاً لندن)
+- `foreign[1]` = خروجی دوم (مثلاً رومانی)
 
-این ترتیب در پیکربندی تولیدی (`ip_server_kharej`) حفظ می‌شود.
+در فرم ساخت تونل، لیست خروجی‌ها **خالی** شروع می‌شود؛ سرورها را به همان ترتیبی که می‌خواهید اضافه کنید. دکمه‌های ↑/↓ هم ترتیب را عوض می‌کنند. صفحهٔ «تونل‌ها» همین ترتیب را به شکل `1. London → 2. Romania` نشان می‌دهد.
+
+این ترتیب در آرایهٔ ذخیره‌شده و در پیکربندی تولیدی (`ip_server_kharej`) حفظ می‌شود و با اولویت جهانی سرورها بازنویسی نمی‌شود. دو تونل می‌توانند عمداً همان دو سرور را در ترتیب معکوس داشته باشند.
 
 ---
 
@@ -234,9 +251,11 @@ if [ "$CREATED" = yes ]; then rm -rf "$BASE"; fi
 تست رگرسیون در `test/maintenance.test.js` اضافه شد: "a clone that finds no binary leaves no directory behind".
 
 ### ۷.۲ باگ ترتیب/swap در خروجی تونل
-**مشکل:** ترتیب سرورهای خارج در پیکربندی تولیدی با ترتیب ذخیره‌شده مطابقت نداشت.
+**مشکل:** کاربر لندن را اول و رومانی را دوم انتخاب می‌کرد، ولی تونل ساخته‌شده رومانی→لندن ذخیره می‌شد.
 
-**نتیجه بررسی:** `ip_server_kharej` در کانفیگ ایران ترتیب ذخیره‌شده را حفظ می‌کند (英國 اول). باگ در مسیر build/clone نبود، بلکه در نحوه ارسال `foreign` به API بود. اصلاح با لیست صریح و مرتب `targetServers`/`foreign` در هنگام ایجاد تونل.
+**علت:** فرم ساخت تونل اولین سرور خارجی را بر اساس اولویت جهانی (رومانی) از قبل انتخاب می‌کرد. رومانی از قبل ردیف اول لیست بود و اضافه‌کردن لندن آن را به ردیف دوم می‌برد؛ بنابراین آرایهٔ ذخیره‌شده رومانی→لندن می‌شد، نه انتخاب واقعی کاربر.
+
+**اصلاح:** لیست خروجی‌ها در فرم ساخت خالی شروع می‌شود؛ `readTargets` ترتیب ردیف‌های DOM را ذخیره می‌کند و `resolveTargets` هم همان ترتیب را بدون مرتب‌سازی مجدد برمی‌گرداند. صفحهٔ تونل‌ها ترتیب ذخیره‌شده را نشان می‌دهد. تست رگرسیون در `test/maintenance.test.js` اضافه شد: «the create form starts with no exit server selected».
 
 ### ۷.۳ بازبینی سورس
 تمام فایل‌های کلیدی (`lib/ssh.js`, `lib/store.js`, `lib/util.js`, `public/app.js`, `server.js`, `agent/agent.js`) توسط sub-agents بازبینی شدند (فقط گزارش، بدون تغییر فایل). ۱۹۶ تست (`npm test`) پاس می‌کنند.
