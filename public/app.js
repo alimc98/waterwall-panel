@@ -1350,10 +1350,11 @@ function pageTunnels() {
     .map((t) => {
       const tpl = state.templates.find((x) => x.id === t.template);
       const exits = foreignList(t.targetServers?.foreign).length;
+      const exitOrder = exitOrderLabel(t.targetServers?.foreign);
       return `
       <tr>
         <td><strong>${esc(t.name)}</strong>${t.notes ? `<br><span class="small muted">${esc(t.notes)}</span>` : ''}</td>
-        <td><span class="badge">${tpl?.icon || ''} ${esc(tpl?.titleFa || t.template)}</span>${exits > 1 ? `<br><span class="small muted">${exits} سرور خارج</span>` : ''}</td>
+        <td><span class="badge">${tpl?.icon || ''} ${esc(tpl?.titleFa || t.template)}</span>${exits > 1 ? `<br><span class="small muted">${exits} سرور خارج</span><br><span class="small muted">${esc(exitOrder)}</span>` : ''}</td>
         <td><span class="badge ${t.enabled ? 'ok' : 'mute'}">${t.enabled ? 'فعال' : 'غیرفعال'}</span></td>
         <td class="small">${fmtDate(t.updatedAt)}</td>
         <td style="white-space:nowrap">
@@ -2187,6 +2188,17 @@ function foreignList(value) {
   return value ? [value] : [];
 }
 
+/** The stored exit order as readable text, e.g. `1. London → 2. Romania`. */
+function exitOrderLabel(value) {
+  return foreignList(value)
+    .map((id, i) => {
+      const server = state.servers.find((s) => s.id === id);
+      return server ? `${i + 1}. ${server.name}` : '';
+    })
+    .filter(Boolean)
+    .join(' → ');
+}
+
 /** Human label for a server role / bundle side. */
 function roleLabel(role) {
   if (role === 'iran') return 'ایران';
@@ -2358,7 +2370,7 @@ function templateFormHtml(tpl) {
     }
     ${
       tpl.multiExit
-        ? `<label class="f"><span class="lbl">سرورهای خارج <span class="badge ok">چند-سروری</span></span>${foreignPickerHtml('nt', foreign, foreign.length ? [foreign[0].id] : [])}</label>`
+        ? `<label class="f"><span class="lbl">سرورهای خارج <span class="badge ok">چند-سروری</span></span>${foreignPickerHtml('nt', foreign, [])}</label>`
         : tpl.sides?.includes('foreign') === false
           ? ''
           : `<label class="f"><span class="lbl">سرور خارج</span>

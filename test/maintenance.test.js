@@ -1066,6 +1066,21 @@ await check('the scenario catalogue has a search box and a grouped list', () => 
   assert.match(app, /function templatePickerHtml/, 'the picker groups the matches');
 });
 
+await check('the create form starts with no exit server selected', () => {
+  // The picker used to pre-select the first foreign server in global order.
+  // An operator who then added London followed by Romania got Romania first,
+  // because the hidden pre-selection was already at the top of the list. The
+  // create form must start empty so the stored array is exactly what the
+  // operator adds.
+  const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  assert.match(app, /foreignPickerHtml\('nt', foreign, \[\]\)/, 'the create picker starts empty');
+  assert.ok(
+    !app.includes("foreignPickerHtml('nt', foreign, foreign.length ? [foreign[0].id] : [])"),
+    'the first global exit is not pre-selected',
+  );
+  assert.match(app, /function exitOrderLabel/, 'the tunnel list shows the stored exit order');
+});
+
 await check('every scenario carries an icon', () => {
   const templates = require('../lib/templates');
   const catalog = templates.catalog();
