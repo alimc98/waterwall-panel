@@ -3349,8 +3349,8 @@ function addUserRow(host, row) {
   div.innerHTML = `
     <input type="text" data-col="username" placeholder="نام کاربری" value="${esc(row.username || '')}" style="flex:1;min-width:120px">
     <input type="text" data-col="password" placeholder="رمز" value="${esc(row.password || '')}" style="flex:1;min-width:120px">
-    <input type="number" data-col="deviceLimit" placeholder="سقف دستگاه" value="${row.deviceLimit ?? ''}" style="width:110px">
-    <input type="number" data-col="totalLimitGb" placeholder="سقف GB" value="${row.totalLimitGb ?? ''}" style="width:100px">
+    <input type="number" data-col="deviceLimit" placeholder="سقف دستگاه" value="${esc(row.deviceLimit ?? '')}" style="width:110px">
+    <input type="number" data-col="totalLimitGb" placeholder="سقف GB" value="${esc(row.totalLimitGb ?? '')}" style="width:100px">
     <input type="checkbox" data-col="enabled" ${row.enabled !== false ? 'checked' : ''} title="فعال">
     <button class="sm danger" data-rm>✕</button>`;
   div.querySelector('[data-rm]').onclick = () => div.remove();
