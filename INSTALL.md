@@ -197,6 +197,9 @@ curl -s -X POST -H "Authorization: Bearer <TOKEN>" \
 ### ۴.۳ چند تونل روی یک پورت 443 (HAProxy)
 اگر می‌خواهید چند تونل روی سرور ایران داشته باشید و همه از بیرون روی `443` دیده شوند، از HAProxy در حالت `mode tcp` (SNI passthrough) استفاده کنید. راهنمای کامل: [`docs/HAPROXY.md`](docs/HAPROXY.md).
 
+### ۴.۴ دامنه و گواهی برای خود پنل
+راهنمای کامل: [`docs/PANEL-TLS.md`](docs/PANEL-TLS.md).
+
 ---
 
 ## 5. اعمال پیکربندی (Apply) روی تونل‌ها
