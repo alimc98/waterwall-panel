@@ -410,7 +410,17 @@ async function tick() {
         await safeStatus(payload, basePath, { lastError: null, lastApply: result });
       }
     } else {
-      await safeStatus(payload, basePath, { lastError: state.lastError || null });
+      // The files on disk are unchanged, but the service may still be down
+      // (a manual stop, a crash, a failed start). Re-running apply is cheap
+      // in that case: it never restarts a healthy service, and it starts one
+      // that is inactive instead of leaving the tunnel down forever.
+      const result = await apply(payload.bundles, basePath);
+      if (result.error) {
+        log('apply failed:', result.error);
+        await safeStatus(payload, basePath, { lastError: result.error, lastApply: result });
+      } else {
+        await safeStatus(payload, basePath, { lastError: state.lastError || null, lastApply: result });
+      }
     }
   } catch (err) {
     log('poll failed:', err.message);
