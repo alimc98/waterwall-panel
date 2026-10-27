@@ -6,7 +6,7 @@ const zlib = require('node:zlib');
 
 const { Store } = require('./lib/store');
 const templates = require('./lib/templates');
-const { buildBundle, renderClientConfig, resolveOptions, regenerateOptions } = require('./lib/build');
+const { buildBundle, renderClientConfig, resolveOptions, regenerateOptions, tailorForeignBundle } = require('./lib/build');
 const { validateBundle, preprocessConfig } = require('./lib/generator');
 const ssh = require('./lib/ssh');
 const tests = require('./lib/tests');
@@ -1412,7 +1412,13 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
         per.push({ ok: false, server: server.name, error: why });
         continue;
       }
-      const uploaded = await ssh.uploadFiles(server, files, server.waterwallPath);
+      // A helper exit has no local service of its own: it bridges into the main
+      // exit's service, so its bundle points at the main exit's address.
+      const serverFiles =
+        side === 'foreign' && fleet.length > 1 && server.id !== fleet[0]?.id
+          ? tailorForeignBundle(files, fleet[0].host)
+          : files;
+      const uploaded = await ssh.uploadFiles(server, serverFiles, server.waterwallPath);
       if (!uploaded.ok) {
         per.push({ ok: false, server: server.name, error: uploaded.error });
         continue;
@@ -1617,9 +1623,19 @@ router.get('/api/tunnels/:id/logs', async (req, res, ctx) => {
   const side = url.searchParams.get('side') || 'foreign';
   const server = servers[side];
   if (!server) return sendError(res, 404, 'server not found');
-  const file = url.searchParams.get('file') || 'log/core.log';
+  const file = String(url.searchParams.get('file') || 'log/core.log');
+  // The file is read on the server, so it must stay inside the install
+  // directory: a value such as '../../etc/passwd' would otherwise escape it.
+  if (file.startsWith('/') || file.includes('\\')) {
+    return sendError(res, 400, 'invalid file path');
+  }
   const remote = path.posix.join(server.waterwallPath, file);
-  const out = await ssh.tailRemoteFile(server, remote, Number(url.searchParams.get('lines') || 200));
+  const root = path.posix.resolve(server.waterwallPath || '/');
+  if (!path.posix.resolve(remote).startsWith(root + '/')) {
+    return sendError(res, 400, 'invalid file path');
+  }
+  const lines = Math.max(1, Math.min(10000, Number(url.searchParams.get('lines')) || 200));
+  const out = await ssh.tailRemoteFile(server, remote, lines);
   sendJson(res, 200, { ok: out.ok, content: out.content, error: out.error });
 });
 
@@ -1841,7 +1857,17 @@ router.get('/api/agent/config', (req, res) => {
     if (!isTarget(targets, tunnel, server, templates.get(tunnel.template)?.sides)) continue;
     const built = buildBundle(store, tunnel);
     if (!built.bundles[server.role]) continue;
-    bundles[tunnel.id] = built.bundles[server.role];
+    // A helper exit has no local service of its own; its bundle points at the
+    // main exit's address instead of 127.0.0.1.
+    let sideBundle = built.bundles[server.role];
+    if (
+      server.role === 'foreign' &&
+      targets.foreign.length > 1 &&
+      server.id !== targets.foreign[0]?.id
+    ) {
+      sideBundle = tailorForeignBundle(sideBundle, targets.foreign[0].host);
+    }
+    bundles[tunnel.id] = sideBundle;
     meta.push({ id: tunnel.id, name: tunnel.name, template: tunnel.template, updatedAt: tunnel.updatedAt });
   }
   sendJson(res, 200, {

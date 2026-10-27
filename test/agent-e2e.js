@@ -25,7 +25,7 @@ const path = require('node:path');
 
 const repo = path.join(__dirname, '..');
 const { Store } = require(path.join(repo, 'lib', 'store'));
-const { buildBundle, resolveOptions } = require(path.join(repo, 'lib', 'build'));
+const { buildBundle, resolveOptions, tailorForeignBundle } = require(path.join(repo, 'lib', 'build'));
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-agent-e2e-'));
 const dataDir = path.join(tmp, 'panel-data');
@@ -322,8 +322,11 @@ async function main() {
   const f2res = await fetch('http://127.0.0.1:8791/api/agent/config', { headers: { 'x-ww-agent-token': FOREIGN2_TOKEN } });
   check('a targeted exit agent is accepted', () => assert.strictEqual(f2res.status, 200));
   const f2 = await f2res.json();
+  // The second exit is a helper: it has no local service of its own, so its
+  // bundle points at the main exit's address instead of 127.0.0.1.
+  const expectedMultiHelper = tailorForeignBundle(expectedMulti.bundles.foreign, '192.0.2.20');
   check('a targeted exit gets the shared exit bundle and the chain exit', () => {
-    assert.deepStrictEqual(f2.bundles[multiTunnel.id], expectedMulti.bundles.foreign);
+    assert.deepStrictEqual(f2.bundles[multiTunnel.id], expectedMultiHelper);
     assert.deepStrictEqual(f2.bundles[chainTunnel.id], expectedChain.bundles.foreign);
     assert.deepStrictEqual(Object.keys(f2.bundles), [multiTunnel.id, chainTunnel.id]);
   });
