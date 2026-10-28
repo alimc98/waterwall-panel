@@ -1395,7 +1395,7 @@ async function securityTests() {
         );
       }
       // The plan endpoint reads its version the same way.
-      const plan = await fetch(`${base}/api/upgrade/plan?version=1.5.0`, { headers: auth });
+      const plan = await fetch(`${base}/api/upgrade/plan?version=1.5.2`, { headers: auth });
       assert.ok(
         plan.status === 200 || plan.status === 500,
         `the upgrade plan answered ${plan.status}`,
@@ -1460,7 +1460,7 @@ async function securityTests() {
       const res = await fetch(`${base}/api/servers/${server.id}/install`, {
         method: 'POST',
         headers: { ...auth, 'content-type': 'application/json' },
-        body: JSON.stringify({ version: '1.5.0', dryRun: true }),
+        body: JSON.stringify({ version: '1.5.2', dryRun: true }),
       });
       assert.ok(
         res.status === 200 || res.status === 502 || res.status === 404,

@@ -64,7 +64,7 @@ probe() {
 
 echo "  (parser checked via the real script's --help path)"
 out="$(bash "$S" --help 2>&1)"
-check_contains "default version documented" "1.5.0" "$out"
+check_contains "default version documented" "1.5.2" "$out"
 check_contains "default base documented" "/opt/waterwall" "$out"
 
 echo ""
