@@ -990,6 +990,7 @@ function pageServers() {
           <button class="sm" data-srv-logs="${s.id}">لاگ</button>
           <button class="sm" data-srv-conn="${s.id}">اتصال کلاینت</button>
           <button class="sm" data-srv-install="${s.id}" title="نصب واتروال روی این سرور">نصب واتروال</button>
+          <button class="sm" data-srv-agent="${s.id}" title="ایجنت همان پنل را روی این سرور نشر می‌کند (برای بروزرسانی ایجنت)">نشر ایجنت</button>
           <button class="sm danger" data-srv-del="${s.id}">حذف</button>
         </td>
       </tr>`;
@@ -3018,6 +3019,25 @@ function afterRender() {
       } finally {
         b.disabled = false;
         b.textContent = 'نصب واتروال';
+        render();
+      }
+    };
+  });
+  $$('[data-srv-agent]').forEach((b) => {
+    b.onclick = async () => {
+      const s = state.servers.find((x) => x.id === b.dataset.srvAgent);
+      if (!s) return;
+      b.disabled = true;
+      b.textContent = 'در حال نشر…';
+      try {
+        const r = await api(`/api/servers/${s.id}/deploy-agent`, { method: 'POST' });
+        if (r.ok) toast(`ایجنت روی «${s.name}» به‌روز شد`, 'ok');
+        else toast(r.error || 'نشر ایجنت ناموفق بود', 'err');
+      } catch (e) {
+        toast(e.message || 'نشر ایجنت ناموفق بود', 'err');
+      } finally {
+        b.disabled = false;
+        b.textContent = 'نشر ایجنت';
         render();
       }
     };

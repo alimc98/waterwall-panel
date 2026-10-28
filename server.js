@@ -340,6 +340,79 @@ router.post('/api/servers/:id/install', async (req, res, ctx) => {
   });
 });
 
+/**
+ * Push the panel's own agent to one server and restart it.
+ *
+ * The agent normally installs itself from the panel/GitHub, but a watchdog or
+ * protocol fix has to reach boxes that are already installed — re-running the
+ * installer would redownload everything. This writes the agent file the panel
+ * is running (so the panel and its agents never disagree) and restarts the
+ * unit. Servers without the unit are reported, not silently skipped.
+ */
+async function deployAgentToServer(server, { agentDir } = {}) {
+  const source = fs.readFileSync(path.join(ROOT, 'agent', 'agent.js'), 'utf8');
+  const unit = await ssh.sshExec(
+    server,
+    `systemctl cat ww-agent.service >/dev/null 2>&1 && echo HAS_UNIT || echo NO_UNIT`,
+    { timeout: 20000 },
+  );
+  if (unit.failed || /NO_UNIT/.test(unit.stdout)) {
+    return { ok: false, error: 'ایجنت روی این سرور نصب نیست؛ اول از صفحهٔ سرورها آن را وصل کنید' };
+  }
+  // The unit's ExecStart names the agent file; its directory is where the new
+  // file goes. Everything after the node binary is the script path.
+  const exec = await ssh.sshExec(
+    server,
+    `systemctl show ww-agent.service -p ExecStart --value 2>/dev/null`,
+    { timeout: 20000 },
+  );
+  const m = /(\/[^\s]*agent\.js)/.exec(exec.stdout || '');
+  const dir = String(agentDir || (m ? path.posix.dirname(m[1]) : '/opt/ww-agent')).replace(/\/+$/, '');
+  if (!/^\/[A-Za-z0-9._/-]+$/.test(dir) || dir.split('/').includes('..')) {
+    return { ok: false, error: `مسیر ایجنت نامعتبر است: ${dir}` };
+  }
+  const uploaded = await ssh.uploadFiles(server, { 'agent.js': source }, dir);
+  if (!uploaded.ok) return { ok: false, error: uploaded.error };
+  // `serviceAction` drives the server's *waterwall* unit; the agent unit is
+  // named directly instead.
+  const res = await ssh.sshExec(
+    server,
+    `systemctl restart ww-agent.service 2>&1; systemctl is-active ww-agent.service 2>&1`,
+    { timeout: 60000 },
+  );
+  const state = (res.stdout || '').trim().split(/\r?\n/).pop();
+  return {
+    ok: !res.failed && state === 'active',
+    agentDir: dir,
+    service: state || 'unknown',
+  };
+}
+
+/** Deploy the panel's agent to one server. */
+router.post('/api/servers/:id/deploy-agent', async (req, res, ctx) => {
+  if (guard(req, res)) return;
+  const server = store.getServer(ctx.params.id);
+  if (!server) return sendError(res, 404, 'server not found');
+  const result = await deployAgentToServer(server, {});
+  store.log({ type: 'agent.deploy', serverId: server.id, ok: result.ok });
+  if (!result.ok) return sendError(res, 500, result.error || 'agent deploy failed', result);
+  sendJson(res, 200, { ok: true, ...result });
+});
+
+/** Deploy the panel's agent to every server that has one installed. */
+router.post('/api/agents/deploy', async (req, res) => {
+  if (guard(req, res)) return;
+  const results = [];
+  for (const server of store.listServers()) {
+    try {
+      results.push({ server: server.name, ...(await deployAgentToServer(server, {})) });
+    } catch (err) {
+      results.push({ server: server.name, ok: false, error: err.message });
+    }
+  }
+  sendJson(res, 200, { ok: results.every((r) => r.ok), results });
+});
+
 router.get('/api/upgrade/releases', async (req, res, ctx) => {
   if (guard(req, res)) return;
   try {
