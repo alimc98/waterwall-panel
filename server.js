@@ -2082,19 +2082,25 @@ async function watchdogTick() {
     if (health.ok || !watchdogState.restartEnabled) continue;
 
     // Which side to restart, per state. `entry-down` and `exit-down` with an
-    // active service are the wedged-process cases; a dead service is already
-    // restarted by the agent on the next tick.
+    // active service are the wedged-process cases. A dead service is normally
+    // restarted by the agent on its next tick; a box the panel can reach over
+    // SSH is restarted here too, so SSH-only servers are not left down.
+    const byId = new Map(store.listServers().map((s) => [s.id, s]));
     const failing = new Map();
-    const mark = (row, why) => {
-      if (row.service === 'active') failing.set(row.serverId, { server: row, why });
+    const mark = (serverId, why) => {
+      const server = byId.get(serverId);
+      if (server) failing.set(serverId, { server, why });
     };
+    if (health.state === 'service-down') {
+      for (const s of health.sides) if (s.service !== 'active') mark(s.serverId, 'service-down');
+    }
     if (health.state === 'entry-down') {
-      for (const s of health.sides) if (s.side === 'iran' && s.checks.some((c) => c.name === 'users' && !c.ok)) mark(s, 'entry-down');
+      for (const s of health.sides) if (s.side === 'iran' && s.checks.some((c) => c.name === 'users' && !c.ok)) mark(s.serverId, 'entry-down');
     }
     if (health.state === 'exit-down' || health.state === 'degraded') {
       for (const s of health.sides) {
         if (s.side !== 'foreign') continue;
-        if (s.checks.some((c) => c.name === 'exit' && !c.ok)) mark(s, 'exit-down');
+        if (s.checks.some((c) => c.name === 'exit' && !c.ok)) mark(s.serverId, 'exit-down');
       }
     }
     for (const { server, why } of failing.values()) {
