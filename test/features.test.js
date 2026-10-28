@@ -15,7 +15,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { Store } = require('../lib/store');
-const { buildBundle, versionMismatch } = require('../lib/build');
+const { buildBundle, versionMismatch, tailorForeignBundle } = require('../lib/build');
 const templates = require('../lib/templates');
 const isolate = require('../lib/isolate');
 const portfix = require('../lib/portfix');
@@ -1108,13 +1108,16 @@ async function tests(ok, fail, failures) {
       assert.strictEqual(exit[0].host, '127.0.0.1', 'the local service is on the exit box itself');
       assert.strictEqual(exit[0].port, outbound.settings.port, 'the exit probe uses the outbound port');
 
-      // A helper exit gets no exit probe: its local service is on the main
-      // exit, and its own bundle points there — localhost is empty here.
-      const helperChecks = watchdog.checksForServer(tunnel, built.bundles.foreign, store.getServer('london'), {
+      // A helper exit's bundle points at the main exit, so its `exit` probe
+      // dials the main exit — the exact path its data takes. Probing its own
+      // localhost would only raise a false alarm.
+      const tailored = tailorForeignBundle(built.bundles.foreign, '203.0.113.10');
+      const helperChecks = watchdog.checksForServer(tunnel, tailored, store.getServer('romania'), {
         iranHost: '10.0.0.1',
-        helper: true,
       });
-      assert.strictEqual(helperChecks.filter((c) => c.name === 'exit').length, 0, 'helpers get no exit probe');
+      const helperExit = helperChecks.filter((c) => c.name === 'exit');
+      assert.strictEqual(helperExit.length, 1, 'helpers probe the main exit');
+      assert.strictEqual(helperExit[0].host, '203.0.113.10', 'the helper probes the main exit address');
       assert.ok(helperChecks.some((c) => c.name === 'link'), 'helpers still probe the reverse link');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
