@@ -67,25 +67,40 @@ function writeState(state) {
 
 // ------------------------------------------------------------------- http
 async function api(pathname, { method = 'GET', body } = {}) {
-  const res = await fetch(`${PANEL_URL}${pathname}`, {
-    method,
-    headers: {
-      'x-ww-agent-token': AGENT_TOKEN,
-      accept: 'application/json',
-      ...(body ? { 'content-type': 'application/json' } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(20000),
-  });
-  const text = await res.text();
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new Error(`panel returned non-JSON (HTTP ${res.status})`);
+  // The panel is reached over the international link, which can drop flows
+  // for minutes at a time. A pooled keep-alive socket from before such a
+  // drop stays half-open forever, so every request asks for a fresh
+  // connection and a failed request is retried once before giving up.
+  const headers = {
+    'x-ww-agent-token': AGENT_TOKEN,
+    accept: 'application/json',
+    connection: 'close',
+    ...(body ? { 'content-type': 'application/json' } : {}),
+  };
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const res = await fetch(`${PANEL_URL}${pathname}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(20000),
+      });
+      const text = await res.text();
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        throw new Error(`panel returned non-JSON (HTTP ${res.status})`);
+      }
+      if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+      return json;
+    } catch (err) {
+      lastErr = err;
+      log(`poll attempt ${attempt + 1} failed:`, err.message);
+    }
   }
-  if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
-  return json;
+  throw lastErr;
 }
 
 // ------------------------------------------------------------------ local
@@ -237,7 +252,7 @@ async function localFacts() {
     loadAvg: os.loadavg().map((n) => Number(n.toFixed(2))),
     waterwallVersion: core.version,
     waterwallProblem: core.problem,
-    agentVersion: '1.2.0',
+    agentVersion: '1.2.1',
   };
 }
 
