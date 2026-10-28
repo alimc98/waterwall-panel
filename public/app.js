@@ -30,6 +30,7 @@ const state = {
   upgrade: null,      // upstream releases + the per-server upgrade plan
   upgradeBusy: false,
   upgradeMsg: null,   // the outcome of the last upgrade run
+  health: {},         // tunnelId -> watchdog verdict (from SSE + list payloads)
 };
 
 // ------------------------------------------------------------------ utils
@@ -225,7 +226,7 @@ function connectEvents() {
   eventSource = new EventSource(`/api/events?token=${encodeURIComponent(state.token)}`);
   eventSource.addEventListener('open', () => setConn(true));
   eventSource.addEventListener('error', () => setConn(false));
-  for (const evt of ['servers', 'tunnels', 'log', 'server-status', 'outbound']) {
+  for (const evt of ['servers', 'tunnels', 'log', 'server-status', 'outbound', 'tunnel-health']) {
     eventSource.addEventListener(evt, async (e) => {
       try {
         const data = JSON.parse(e.data);
@@ -233,6 +234,10 @@ function connectEvents() {
         if (evt === 'tunnels' && Array.isArray(data)) {
           state.tunnels = data;
           if (state.page === 'dashboard' || state.page === 'tunnels') render();
+        }
+        if (evt === 'tunnel-health' && data && data.tunnelId) {
+          state.health[data.tunnelId] = data.health;
+          if (state.page === 'tunnels' || state.page === 'edit') render();
         }
         if (evt === 'outbound' && data && typeof data === 'object') {
           state.outbound = data;
@@ -1351,11 +1356,12 @@ function pageTunnels() {
       const tpl = state.templates.find((x) => x.id === t.template);
       const exits = foreignList(t.targetServers?.foreign).length;
       const exitOrder = exitOrderLabel(t.targetServers?.foreign);
+      const h = t.health || state.health[t.id];
       return `
       <tr>
         <td><strong>${esc(t.name)}</strong>${t.notes ? `<br><span class="small muted">${esc(t.notes)}</span>` : ''}</td>
         <td><span class="badge">${tpl?.icon || ''} ${esc(tpl?.titleFa || t.template)}</span>${exits > 1 ? `<br><span class="small muted">${exits} سرور خارج</span><br><span class="small muted">${esc(exitOrder)}</span>` : ''}</td>
-        <td><span class="badge ${t.enabled ? 'ok' : 'mute'}">${t.enabled ? 'فعال' : 'غیرفعال'}</span></td>
+        <td><span class="badge ${t.enabled ? 'ok' : 'mute'}">${t.enabled ? 'فعال' : 'غیرفعال'}</span>${h ? `<br>${healthBadgeHtml(h)}` : ''}</td>
         <td class="small">${fmtDate(t.updatedAt)}</td>
         <td style="white-space:nowrap">
           <button class="sm primary" data-tn-open="${t.id}">✏️ ویرایش</button>
@@ -1386,6 +1392,7 @@ function pageTunnels() {
 function openTunnel(id) {
   state.currentTunnel = state.tunnels.find((t) => t.id === id);
   state.draft = { ...state.currentTunnel, options: { ...state.currentTunnel.options } };
+  if (state.currentTunnel?.health) state.health[id] = state.currentTunnel.health;
   state.preview = null;
   go('edit');
 }
@@ -1422,6 +1429,7 @@ function pageEditTunnel() {
     <button class="primary" id="editSave">💾 ذخیره</button>
     <button class="ok" id="editApply">🚀 ذخیره و اعمال روی سرورها</button>
   </div>
+  ${tunnelHealthHtml(t)}
 
   <div class="card">
     <h3>⚙️ تنظیمات تونل</h3>
@@ -2197,6 +2205,46 @@ function exitOrderLabel(value) {
     })
     .filter(Boolean)
     .join(' → ');
+}
+
+/** The watchdog card on the tunnel detail page. */
+function tunnelHealthHtml(t) {
+  const h = state.health[t.id] || t.health;
+  if (!h) return '';
+  const rows = (h.sides || [])
+    .map((s) => {
+      const checks = (s.checks || [])
+        .map(
+          (c) =>
+            `<span class="badge ${c.ok ? 'ok' : 'err'}" title="${esc(c.host)}:${c.port}${c.error ? ' — ' + esc(c.error) : ''}">${esc(c.name)} ${c.ok ? '✓' : '✕'}</span>`,
+        )
+        .join(' ');
+      const svc =
+        s.service === 'active' ? '<span class="badge ok">active</span>' : `<span class="badge err">${esc(s.service)}</span>`;
+      return `<tr><td>${sideLabel(s.side)}</td><td>${esc(s.serverName)}</td><td>${svc}</td><td>${checks || '<span class="small muted">—</span>'}</td></tr>`;
+    })
+    .join('');
+  const problems = (h.problems || []).map((p) => `<li>${esc(p)}</li>`).join('');
+  return `
+  <div class="card">
+    <h3>🩺 سلامت تونل ${healthBadgeHtml(h)}</h3>
+    <p class="small muted">بررسی بر پایهٔ پروب‌های ایجنت روی خود سرورها (حداکثر ۱۵ ثانیه تأخیر). «خروجی قطع» با سرویس فعال یعنی سرویس محلی پشت تونل (مثلاً xray) روی پورت finalPort نیست — ری‌استارت واتروال آن را درست نمی‌کند.</p>
+    ${problems ? `<ul class="small">${problems}</ul>` : ''}
+    <table><thead><tr><th>سمت</th><th>سرور</th><th>سرویس</th><th>پروب‌ها</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="mt"><button class="sm" id="healthRefresh">🔄 بررسی الآن</button></div>
+  </div>`;
+}
+
+/** Watchdog verdict badge. `h` is the health object the panel sends. */
+function healthBadgeHtml(h) {
+  if (!h) return '';
+  const cls =
+    h.state === 'ok' ? 'ok'
+    : h.state === 'unknown' ? 'mute'
+    : h.state === 'degraded' ? 'warn'
+    : 'err';
+  const title = (h.problems || []).join('\n');
+  return `<span class="badge ${cls}" ${title ? `title="${esc(title)}"` : ''}>${esc(h.label || h.state || '؟')}</span>`;
 }
 
 /** Human label for a server role / bundle side. */
@@ -3115,6 +3163,13 @@ function afterRender() {
     if (await saveTunnel()) render();
   });
   $('#editApply')?.addEventListener('click', () => doApply(false));
+  $('#healthRefresh')?.addEventListener('click', async () => {
+    const r = await api(`/api/tunnels/${state.draft.id}/healthcheck`, { method: 'POST' });
+    if (r.health) {
+      state.health[r.tunnelId] = r.health;
+      render();
+    }
+  });
   $('#doDry')?.addEventListener('click', () => doApply(true));
   $('#doLogs')?.addEventListener('click', showLogs);
   $('#doProtocolScan')?.addEventListener('click', runProtocolScan);

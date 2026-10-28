@@ -29,6 +29,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const net = require('node:net');
 // `execFile` only: a command is run as an argv array with no shell in between,
 // so a value containing shell metacharacters cannot become a second command.
 const { execFile } = require('node:child_process');
@@ -141,6 +142,61 @@ async function waterwallVersion(basePath) {
   return { version: null, problem };
 }
 
+/**
+ * One bare TCP connect. The panel derives the probe list from the generated
+ * bundles, so the agent only has to dial and report; it never interprets.
+ * A connect that completes means the listener is up — what happens after the
+ * handshake is WaterWall's business.
+ */
+function probe(host, port, { timeout = 3000 } = {}) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    let settled = false;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    let sock;
+    try {
+      sock = net.connect({ host, port });
+    } catch (err) {
+      done({ ok: false, error: err.message });
+      return;
+    }
+    const timer = setTimeout(() => {
+      sock.destroy();
+      done({ ok: false, error: 'timeout' });
+    }, timeout);
+    sock.once('connect', () => {
+      clearTimeout(timer);
+      sock.destroy();
+      done({ ok: true, ms: Date.now() - started });
+    });
+    sock.once('error', (err) => {
+      clearTimeout(timer);
+      sock.destroy();
+      done({ ok: false, error: err.code || err.message });
+    });
+  });
+}
+
+async function runChecks(checks) {
+  const results = [];
+  for (const c of checks || []) {
+    if (!c || !c.host || !Number.isFinite(Number(c.port))) continue;
+    const outcome = await probe(c.host, Number(c.port));
+    results.push({
+      tunnelId: c.tunnelId,
+      name: c.name,
+      host: c.host,
+      port: c.port,
+      ...outcome,
+    });
+  }
+  return results;
+}
+
 async function localFacts() {
   const serviceName = process.env.WW_SERVICE || 'waterwall';
   const [service, enabled, listeners, bootId, core] = await Promise.all([
@@ -181,7 +237,7 @@ async function localFacts() {
     loadAvg: os.loadavg().map((n) => Number(n.toFixed(2))),
     waterwallVersion: core.version,
     waterwallProblem: core.problem,
-    agentVersion: '1.1.0',
+    agentVersion: '1.2.0',
   };
 }
 
@@ -398,16 +454,19 @@ async function tick() {
     const hash = hashOf(payload.bundles);
 
     const state = readState();
+    // Port probes for the watchdog: the panel derives the list from the
+    // bundles, so this is just dials with results to report back.
+    const checks = await runChecks(payload.checks);
     if (state.appliedHash !== hash) {
       log(`configuration changed (${payload.meta.length} tunnel(s)) — applying`);
       const result = await apply(payload.bundles, basePath);
       if (result.error) {
         log('apply failed:', result.error);
-        await safeStatus(payload, basePath, { lastError: result.error, lastApply: result });
+        await safeStatus(payload, basePath, { lastError: result.error, lastApply: result, checks });
       } else {
         log('applied:', result.written.join(', '));
         writeState({ appliedHash: hash, appliedAt: new Date().toISOString(), tunnels: payload.meta });
-        await safeStatus(payload, basePath, { lastError: null, lastApply: result });
+        await safeStatus(payload, basePath, { lastError: null, lastApply: result, checks });
       }
     } else {
       // The files on disk are unchanged, but the service may still be down
@@ -417,9 +476,9 @@ async function tick() {
       const result = await apply(payload.bundles, basePath);
       if (result.error) {
         log('apply failed:', result.error);
-        await safeStatus(payload, basePath, { lastError: result.error, lastApply: result });
+        await safeStatus(payload, basePath, { lastError: result.error, lastApply: result, checks });
       } else {
-        await safeStatus(payload, basePath, { lastError: state.lastError || null, lastApply: result });
+        await safeStatus(payload, basePath, { lastError: state.lastError || null, lastApply: result, checks });
       }
     }
   } catch (err) {

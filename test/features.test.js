@@ -22,6 +22,7 @@ const portfix = require('../lib/portfix');
 const versions = require('../lib/versions');
 const { listenPorts, findFreePort, parseListeningPorts } = require('../lib/ports');
 const { resolveTargets, targetsForSide, foreignIds } = require('../lib/targets');
+const watchdog = require('../lib/watchdog');
 
 /**
  * A stand-in for the ssh module.
@@ -1069,6 +1070,188 @@ async function tests(ok, fail, failures) {
         built.warnings.some((w) => /یکسان نیست/.test(w)),
         `the warning is in the bundle: ${JSON.stringify(built.warnings)}`,
       );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  // ---- watchdog ------------------------------------------------------------
+  check('checksForServer derives the users, link and exit probes from the bundle', () => {
+    const { store, dir } = freshStore();
+    try {
+      const t = addReality(store, 'ww', 'iran', ['london']);
+      provision(store, t);
+      const tunnel = store.getTunnel(t.id);
+      const built = buildBundle(store, tunnel);
+
+      const iranChecks = watchdog.checksForServer(tunnel, built.bundles.iran, store.getServer('iran'), {
+        iranHost: '10.0.0.1',
+      });
+      const iranCfg = watchdog.sideConfig(built.bundles.iran);
+      const usersNode = iranCfg.nodes.find((n) => n.name === 'users_inbound');
+      const users = iranChecks.filter((c) => c.name === 'users');
+      assert.strictEqual(users.length, 1, 'the Iran side probes its user-facing listener');
+      assert.strictEqual(users[0].host, '127.0.0.1', 'the probe is from the box itself');
+      assert.strictEqual(users[0].port, usersNode.settings.port, 'the probe uses the user listener port');
+
+      const londonChecks = watchdog.checksForServer(tunnel, built.bundles.foreign, store.getServer('london'), {
+        iranHost: '10.0.0.1',
+      });
+      const foreignCfg = watchdog.sideConfig(built.bundles.foreign);
+      const toIran = foreignCfg.nodes.find((n) => n.name === 'tcp_to_iran');
+      const outbound = foreignCfg.nodes.find((n) => n.name === 'outbound_to_local_service');
+      const link = londonChecks.filter((c) => c.name === 'link');
+      const exit = londonChecks.filter((c) => c.name === 'exit');
+      assert.strictEqual(link.length, 1, 'the exit probes the reverse link to Iran');
+      assert.strictEqual(link[0].host, '10.0.0.1', 'the link probe dials the Iran entry');
+      assert.strictEqual(link[0].port, toIran.settings.port, 'the link probe uses the reverse port');
+      assert.strictEqual(exit.length, 1, 'the exit probes its local service');
+      assert.strictEqual(exit[0].host, '127.0.0.1', 'the local service is on the exit box itself');
+      assert.strictEqual(exit[0].port, outbound.settings.port, 'the exit probe uses the outbound port');
+
+      // A helper exit gets no exit probe: its local service is on the main
+      // exit, and its own bundle points there — localhost is empty here.
+      const helperChecks = watchdog.checksForServer(tunnel, built.bundles.foreign, store.getServer('london'), {
+        iranHost: '10.0.0.1',
+        helper: true,
+      });
+      assert.strictEqual(helperChecks.filter((c) => c.name === 'exit').length, 0, 'helpers get no exit probe');
+      assert.ok(helperChecks.some((c) => c.name === 'link'), 'helpers still probe the reverse link');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  check('a healthy tunnel evaluates to ok', () => {
+    const { store, dir } = freshStore();
+    try {
+      const t = addReality(store, 'ww', 'iran', ['london']);
+      const tunnel = store.getTunnel(t.id);
+      store.reportStatus('iran', {
+        service: 'active',
+        checks: [{ tunnelId: tunnel.id, name: 'users', ok: true, ms: 2 }],
+      });
+      store.reportStatus('london', {
+        service: 'active',
+        checks: [
+          { tunnelId: tunnel.id, name: 'link', ok: true, ms: 30 },
+          { tunnelId: tunnel.id, name: 'exit', ok: true, ms: 1 },
+        ],
+      });
+      const health = watchdog.evaluateTunnel(tunnel, store.listServers());
+      assert.strictEqual(health.state, 'ok', JSON.stringify(health));
+      assert.strictEqual(health.ok, true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  check('a dead local service on the exit is exit-down, not a link problem', () => {
+    const { store, dir } = freshStore();
+    try {
+      const t = addReality(store, 'ww', 'iran', ['london']);
+      const tunnel = store.getTunnel(t.id);
+      store.reportStatus('iran', {
+        service: 'active',
+        checks: [{ tunnelId: tunnel.id, name: 'users', ok: true, ms: 2 }],
+      });
+      store.reportStatus('london', {
+        service: 'active',
+        checks: [
+          { tunnelId: tunnel.id, name: 'link', ok: true, ms: 30 },
+          { tunnelId: tunnel.id, name: 'exit', ok: false, error: 'ECONNREFUSED' },
+        ],
+      });
+      const health = watchdog.evaluateTunnel(tunnel, store.listServers());
+      assert.strictEqual(health.state, 'exit-down', health.state);
+      assert.ok(health.problems.some((p) => /خروجی/.test(p)), 'the problem names the exit');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  check('an inactive service is reported as service-down', () => {
+    const { store, dir } = freshStore();
+    try {
+      const t = addReality(store, 'ww', 'iran', ['london']);
+      const tunnel = store.getTunnel(t.id);
+      store.reportStatus('iran', {
+        service: 'active',
+        checks: [{ tunnelId: tunnel.id, name: 'users', ok: true, ms: 2 }],
+      });
+      store.reportStatus('london', {
+        service: 'inactive',
+        checks: [
+          { tunnelId: tunnel.id, name: 'link', ok: true, ms: 30 },
+          { tunnelId: tunnel.id, name: 'exit', ok: true, ms: 1 },
+        ],
+      });
+      const health = watchdog.evaluateTunnel(tunnel, store.listServers());
+      assert.strictEqual(health.state, 'service-down');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  check('a failing user listener is entry-down', () => {
+    const { store, dir } = freshStore();
+    try {
+      const t = addReality(store, 'ww', 'iran', ['london']);
+      const tunnel = store.getTunnel(t.id);
+      store.reportStatus('iran', {
+        service: 'active',
+        checks: [{ tunnelId: tunnel.id, name: 'users', ok: false, error: 'timeout' }],
+      });
+      store.reportStatus('london', {
+        service: 'active',
+        checks: [
+          { tunnelId: tunnel.id, name: 'link', ok: true, ms: 30 },
+          { tunnelId: tunnel.id, name: 'exit', ok: true, ms: 1 },
+        ],
+      });
+      const health = watchdog.evaluateTunnel(tunnel, store.listServers());
+      assert.strictEqual(health.state, 'entry-down');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  check('one dead exit out of two is degraded, not down', () => {
+    const { store, dir } = freshStore();
+    try {
+      const t = addReality(store, 'ww', 'iran', ['london', 'romania']);
+      const tunnel = store.getTunnel(t.id);
+      store.reportStatus('iran', {
+        service: 'active',
+        checks: [{ tunnelId: tunnel.id, name: 'users', ok: true, ms: 2 }],
+      });
+      store.reportStatus('london', {
+        service: 'active',
+        checks: [
+          { tunnelId: tunnel.id, name: 'link', ok: true, ms: 30 },
+          { tunnelId: tunnel.id, name: 'exit', ok: true, ms: 1 },
+        ],
+      });
+      store.reportStatus('romania', {
+        service: 'active',
+        checks: [
+          { tunnelId: tunnel.id, name: 'link', ok: true, ms: 40 },
+          { tunnelId: tunnel.id, name: 'exit', ok: false, error: 'ECONNREFUSED' },
+        ],
+      });
+      const health = watchdog.evaluateTunnel(tunnel, store.listServers());
+      assert.strictEqual(health.state, 'degraded', health.state);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  check('a tunnel with no agent reports yet is unknown, not broken', () => {
+    const { store, dir } = freshStore();
+    try {
+      const t = addReality(store, 'ww', 'iran', ['london']);
+      const health = watchdog.evaluateTunnel(store.getTunnel(t.id), store.listServers());
+      assert.strictEqual(health.state, 'unknown');
+      assert.strictEqual(health.ok, false);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

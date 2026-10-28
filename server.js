@@ -19,6 +19,7 @@ const certs = require('./lib/certs');
 const linkHealth = require('./lib/links');
 const isolate = require('./lib/isolate');
 const portfix = require('./lib/portfix');
+const watchdog = require('./lib/watchdog');
 const { Outbound } = require('./lib/outbound');
 const { resolveTargets, targetsForSide, isTarget } = require('./lib/targets');
 const { Router, sendJson, sendError, sendText, parseJsonBody, serveStatic, parseUrl } = require('./lib/http');
@@ -1026,7 +1027,11 @@ router.delete('/api/certs/:id', (req, res, ctx) => {
 
 router.get('/api/tunnels', (req, res) => {
   if (guard(req, res)) return;
-  sendJson(res, 200, { ok: true, tunnels: store.listTunnels() });
+  const servers = store.listServers();
+  sendJson(res, 200, {
+    ok: true,
+    tunnels: store.listTunnels().map((t) => ({ ...t, health: watchdog.evaluateTunnel(t, servers) })),
+  });
 });
 
 router.post('/api/tunnels', async (req, res) => {
@@ -1045,8 +1050,30 @@ router.get('/api/tunnels/:id', (req, res, ctx) => {
   if (guard(req, res)) return;
   const tunnel = store.getTunnel(ctx.params.id);
   if (!tunnel) return sendError(res, 404, 'tunnel not found');
-  sendJson(res, 200, { ok: true, tunnel });
+  sendJson(res, 200, {
+    ok: true,
+    tunnel,
+    health: watchdog.evaluateTunnel(tunnel, store.listServers()),
+  });
 });
+
+/**
+ * Tunnel health, on demand.
+ *
+ * The verdict is computed from the agents' latest port-probe reports, so it is
+ * at most one agent interval old (15s by default). The probes themselves run
+ * on the servers, never from the panel.
+ */
+function tunnelHealth(req, res, ctx) {
+  if (guard(req, res)) return;
+  const tunnel = store.getTunnel(ctx.params.id);
+  if (!tunnel) return sendError(res, 404, 'tunnel not found');
+  const health = watchdog.evaluateTunnel(tunnel, store.listServers());
+  sendJson(res, 200, { ok: true, tunnelId: tunnel.id, health });
+}
+
+router.get('/api/tunnels/:id/health', tunnelHealth);
+router.post('/api/tunnels/:id/healthcheck', tunnelHealth);
 
 router.patch('/api/tunnels/:id', async (req, res, ctx) => {
   if (guard(req, res)) return;
@@ -1850,6 +1877,7 @@ router.get('/api/agent/config', (req, res) => {
     : all;
   const bundles = {};
   const meta = [];
+  const checks = [];
   for (const tunnel of selected) {
     const targets = resolveTargets(store.listServers(), tunnel);
     // Only the servers this tunnel actually points at get its bundle. The old
@@ -1869,6 +1897,16 @@ router.get('/api/agent/config', (req, res) => {
     }
     bundles[tunnel.id] = sideBundle;
     meta.push({ id: tunnel.id, name: tunnel.name, template: tunnel.template, updatedAt: tunnel.updatedAt });
+    // The watchdog's probe list, derived from the same files this side
+    // receives (helpers included): which ports this box should dial. A helper
+    // exit gets no `exit` probe — its local service lives on the main exit.
+    const isHelper = server.role === 'foreign' && targets.foreign.length > 1 && server.id !== targets.foreign[0]?.id;
+    checks.push(
+      ...watchdog.checksForServer(tunnel, sideBundle, server, {
+        iranHost: targets.iran?.host,
+        helper: isHelper,
+      }),
+    );
   }
   sendJson(res, 200, {
     ok: true,
@@ -1876,6 +1914,7 @@ router.get('/api/agent/config', (req, res) => {
     revision: store.getPanel().revision || 0,
     bundles,
     meta,
+    checks,
   });
 });
 
@@ -1886,6 +1925,141 @@ router.post('/api/agent/status', async (req, res) => {
   const updated = store.reportStatus(server.id, body);
   broadcast('server-status', { serverId: server.id, status: body });
   sendJson(res, 200, { ok: true, server: redact(updated) });
+});
+
+// ---- watchdog ------------------------------------------------------------
+/**
+ * Tunnel health watchdog.
+ *
+ * Every interval the panel re-evaluates each enabled tunnel from the agents'
+ * latest port-probe reports (the agents run the probes; the panel only reads
+ * the results). On a transition to an unhealthy state it logs an event and
+ * tells the UI. With WW_WATCHDOG_RESTART=1 it also restarts the WaterWall
+ * service of the failing side — a wedged ReverseClient or a dead listener is
+ * the one class of failure a restart fixes, and it is the same remedy an
+ * operator would apply by hand.
+ *
+ * A failing *exit* probe (the local service behind the tunnel, e.g. xray) is
+ * reported but never "fixed" by restarting WaterWall: that would restart the
+ * wrong process. The event names the port, which is the actionable part.
+ */
+const watchdogState = {
+  intervalMs: Math.max(15000, Number(process.env.WW_WATCHDOG_MS || 60000)),
+  restartEnabled: process.env.WW_WATCHDOG_RESTART === '1',
+  cooldownMs: Math.max(60000, Number(process.env.WW_WATCHDOG_COOLDOWN_MS || 600000)),
+  lastStates: new Map(),
+  lastRestart: new Map(),
+  lastTick: null,
+};
+
+function watchdogEvaluateAll() {
+  const servers = store.listServers();
+  return store
+    .listTunnels()
+    .filter((t) => t.enabled !== false)
+    .map((t) => ({ tunnel: t, health: watchdog.evaluateTunnel(t, servers) }));
+}
+
+async function watchdogRestartSide(tunnel, server) {
+  // Only boxes the panel can reach directly can be restarted from here; an
+  // agent-only server is already covered by the agent's own apply loop.
+  if (!server.sshKeyPath && !server.sshPassword) {
+    store.log({ type: 'watchdog.restart.skipped', tunnelId: tunnel.id, serverId: server.id, reason: 'no ssh access' });
+    return;
+  }
+  const res = await ssh.serviceAction(server, 'restart');
+  store.log({
+    type: 'watchdog.restart',
+    tunnelId: tunnel.id,
+    serverId: server.id,
+    server: server.name,
+    service: server.serviceName || 'waterwall',
+    ok: res.ok,
+    output: (res.output || '').slice(0, 500),
+  });
+}
+
+async function watchdogTick() {
+  let rows;
+  try {
+    rows = watchdogEvaluateAll();
+  } catch (err) {
+    console.error('[watchdog] evaluation failed:', err.message);
+    return;
+  }
+  watchdogState.lastTick = new Date().toISOString();
+  const now = Date.now();
+  for (const { tunnel, health } of rows) {
+    const previous = watchdogState.lastStates.get(tunnel.id);
+    if (previous !== health.state) {
+      watchdogState.lastStates.set(tunnel.id, health.state);
+      broadcast('tunnel-health', { tunnelId: tunnel.id, health });
+      if (health.ok) {
+        store.log({ type: 'watchdog.healthy', tunnelId: tunnel.id, name: tunnel.name });
+      } else {
+        store.log({
+          type: 'watchdog.unhealthy',
+          tunnelId: tunnel.id,
+          name: tunnel.name,
+          state: health.state,
+          problems: health.problems,
+        });
+      }
+    }
+    if (health.ok || !watchdogState.restartEnabled) continue;
+
+    // Which side to restart, per state. `entry-down` and `exit-down` with an
+    // active service are the wedged-process cases; a dead service is already
+    // restarted by the agent on the next tick.
+    const failing = new Map();
+    const mark = (row, why) => {
+      if (row.service === 'active') failing.set(row.serverId, { server: row, why });
+    };
+    if (health.state === 'entry-down') {
+      for (const s of health.sides) if (s.side === 'iran' && s.checks.some((c) => c.name === 'users' && !c.ok)) mark(s, 'entry-down');
+    }
+    if (health.state === 'exit-down' || health.state === 'degraded') {
+      for (const s of health.sides) {
+        if (s.side !== 'foreign') continue;
+        if (s.checks.some((c) => c.name === 'exit' && !c.ok)) mark(s, 'exit-down');
+      }
+    }
+    for (const { server, why } of failing.values()) {
+      const key = `${tunnel.id}:${server.id}`;
+      const last = watchdogState.lastRestart.get(key) || 0;
+      if (now - last < watchdogState.cooldownMs) continue;
+      watchdogState.lastRestart.set(key, now);
+      store.log({ type: 'watchdog.restart.planned', tunnelId: tunnel.id, serverId: server.id, why });
+      try {
+        await watchdogRestartSide(tunnel, server);
+      } catch (err) {
+        store.log({ type: 'watchdog.restart.error', tunnelId: tunnel.id, serverId: server.id, error: err.message });
+      }
+    }
+  }
+}
+
+if (process.env.WW_WATCHDOG !== '0') {
+  setInterval(watchdogTick, watchdogState.intervalMs).unref();
+  // Evaluate once at boot so the first render already has a verdict.
+  watchdogTick().catch(() => {});
+}
+
+router.get('/api/watchdog', (req, res) => {
+  if (guard(req, res)) return;
+  sendJson(res, 200, {
+    ok: true,
+    enabled: process.env.WW_WATCHDOG !== '0',
+    restart: watchdogState.restartEnabled,
+    intervalMs: watchdogState.intervalMs,
+    cooldownMs: watchdogState.cooldownMs,
+    lastTick: watchdogState.lastTick,
+    tunnels: watchdogEvaluateAll().map(({ tunnel, health }) => ({
+      id: tunnel.id,
+      name: tunnel.name,
+      health,
+    })),
+  });
 });
 
 // ---- events --------------------------------------------------------------
