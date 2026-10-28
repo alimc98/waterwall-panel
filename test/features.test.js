@@ -1259,6 +1259,17 @@ async function tests(ok, fail, failures) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  check('a failed version check does not erase the known version', () => {
+    const { store, dir } = freshStore();
+    try {
+      store.reportStatus('iran', { service: 'active', waterwallVersion: '1.5.2' });
+      store.reportStatus('iran', { service: 'active', waterwallVersion: null });
+      assert.strictEqual(store.getServer('iran').lastStatus.waterwallVersion, '1.5.2');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 }
 
 module.exports = { tests };
