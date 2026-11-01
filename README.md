@@ -123,14 +123,16 @@ curl -X POST "$PANEL/api/servers/<id>/forget-host-key" \
 | مسیر کلید SSH | `/opt/waterwall-panel/data/panel-ssh-key` |
 | رمز SSH | **خالی** |
 
-کلید عمومی‌اش که باید روی هر سروری که می‌خواهید پنل به آن وصل شود در `authorized_keys` باشد:
+کلید عمومی‌اش که باید روی هر سروری که می‌خواهید پنل به آن وصل شود در `authorized_keys` باشد. هیچ کلیدی
+در این مستند نوشته نشده؛ **کلید عمومی خودِ پنل شما** را از دستور پایین بردارید و در جای مشخص‌شده بگذارید:
 
 ```bash
-# روی هر سرور خارجی (به‌عنوان root):
+# روی هر سرور خارجی (به‌عنوان root)
+# خط اول را با خروجی cat /opt/waterwall-panel/data/panel-ssh-key.pub جایگزین کنید:
+PUBKEY='<کلید-عمومی-پنل-شما-را-اینجا-بگذارید>'
+
 mkdir -p /root/.ssh && chmod 700 /root/.ssh
-cat >> /root/.ssh/authorized_keys <<'KEY'
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDKXTZzerX0CEVhne8oad/n4d7oVYHBzohNWuL6PRQG3 waterwall-panel
-KEY
+echo "$PUBKEY" >> /root/.ssh/authorized_keys
 chmod 600 /root/.ssh/authorized_keys
 ```
 
