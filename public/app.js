@@ -31,6 +31,9 @@ const state = {
   upgradeBusy: false,
   upgradeMsg: null,   // the outcome of the last upgrade run
   health: {},         // tunnelId -> watchdog verdict (from SSE + list payloads)
+  applyJobs: {},      // jobId -> live apply progress (SSE + polling fallback)
+  activeApplyJob: null,
+  applyPoll: null,
 };
 
 // ------------------------------------------------------------------ utils
@@ -63,7 +66,7 @@ function toast(message, kind = '') {
   setTimeout(() => el.remove(), 4500);
 }
 
-async function api(path, { method = 'GET', body } = {}) {
+async function api(path, { method = 'GET', body, allowFailure = false } = {}) {
   const res = await fetch(path, {
     method,
     headers: {
@@ -79,9 +82,11 @@ async function api(path, { method = 'GET', body } = {}) {
   } catch {
     throw new Error(`پاسخ نامعتبر از سرور (HTTP ${res.status})`);
   }
-  if (!res.ok || json.ok === false) {
+  if (!res.ok || (json.ok === false && !allowFailure)) {
     const err = new Error(json.error || `HTTP ${res.status}`);
     err.problems = json.problems;
+    err.data = json;
+    err.status = res.status;
     throw err;
   }
   return json;
@@ -226,7 +231,15 @@ function connectEvents() {
   eventSource = new EventSource(`/api/events?token=${encodeURIComponent(state.token)}`);
   eventSource.addEventListener('open', () => setConn(true));
   eventSource.addEventListener('error', () => setConn(false));
-  for (const evt of ['servers', 'tunnels', 'log', 'server-status', 'outbound', 'tunnel-health']) {
+  for (const evt of [
+    'servers',
+    'tunnels',
+    'log',
+    'server-status',
+    'outbound',
+    'tunnel-health',
+    'apply-progress',
+  ]) {
     eventSource.addEventListener(evt, async (e) => {
       try {
         const data = JSON.parse(e.data);
@@ -250,6 +263,13 @@ function connectEvents() {
             s.lastStatus = data.status;
             if (state.page === 'servers') render();
           }
+        }
+        if (evt === 'apply-progress' && data?.jobId) {
+          state.applyJobs[data.jobId] = data;
+          // Keep the map bounded; the modal only ever reads the active job.
+          const ids = Object.keys(state.applyJobs);
+          if (ids.length > 20) for (const id of ids.slice(0, ids.length - 20)) delete state.applyJobs[id];
+          if (state.activeApplyJob === data.jobId) refreshApplyProgress(data);
         }
       } catch {
         /* ignore malformed events */
@@ -987,6 +1007,7 @@ function pageServers() {
           <button class="sm" data-srv-down="${s.id}" title="پایین — اولویت دیرتر">▼</button>
           <button class="sm" data-srv-edit="${s.id}">ویرایش</button>
           <button class="sm" data-srv-probe="${s.id}">بررسی</button>
+          <button class="sm" data-srv-forget-key="${s.id}" title="کلید SSH قدیمی را از known_hosts پنل پاک می‌کند (بعد از نصب دوبارهٔ سیستم‌عامل سرور)">کلید SSH</button>
           <button class="sm" data-srv-logs="${s.id}">لاگ</button>
           <button class="sm" data-srv-conn="${s.id}">اتصال کلاینت</button>
           <button class="sm" data-srv-install="${s.id}" title="نصب واتروال روی این سرور">نصب واتروال</button>
@@ -1929,16 +1950,105 @@ function portFixHtml(fix) {
   )}<br><span class="small">پورت جدید را در لینک‌های کلاینت و در فایروال سرور ایران در نظر بگیرید.</span></div>`;
 }
 
+/**
+ * The graphical log of an apply: one row per step and one bar for the whole
+ * run. A server that finishes turns into a ✓ row with its own 100%, so a
+ * multi-exit tunnel says which box is still being worked on instead of showing
+ * a single "applied" message at the end.
+ */
+function applyProgressHtml(job) {
+  if (!job) return '';
+  const percent = Math.max(0, Math.min(100, Math.round(Number(job.percent) || 0)));
+  const events = (job.events || []).slice(-16);
+  const icon = (status) =>
+    ({ ok: '✓', error: '✗', running: '⏳', info: '•' })[status] || '•';
+  const cls = (status) => (status === 'error' ? 'bad' : status === 'ok' ? 'good' : status === 'running' ? 'live' : '');
+  const rows = events
+    .map((e) => {
+      const pct =
+        e.serverPercent === null || e.serverPercent === undefined
+          ? ''
+          : `<span class="apply-pct">${Math.round(Number(e.serverPercent) || 0)}%</span>`;
+      return `<div class="apply-line ${cls(e.status)}">
+        <span class="apply-ic">${icon(e.status)}</span>
+        <span class="apply-msg">${esc(e.message || '')}</span>${pct}
+      </div>`;
+    })
+    .join('');
+  return `<div class="apply-progress" data-apply-progress="${esc(job.jobId || '')}">
+    <div class="apply-head">
+      <b>${job.done ? (job.ok === false ? 'اعمال با خطا تمام شد' : 'اعمال تمام شد') : 'در حال اعمال روی سرورها…'}</b>
+      <span class="mono">${percent}%</span>
+    </div>
+    <div class="apply-bar"><span style="width:${percent}%"></span></div>
+    <div class="apply-log">${rows || '<span class="muted">در انتظار شروع…</span>'}</div>
+  </div>`;
+}
+
+/** Replace the progress block in the open modal without touching the results. */
+function refreshApplyProgress(job) {
+  const host = $('#modalBody [data-apply-progress]');
+  if (!host) return;
+  host.outerHTML = applyProgressHtml(job);
+}
+
 async function doApply(dryRun = false) {
   const t = state.draft;
   if (!t) return;
   const saved = await saveTunnel(true);
   if (!saved) return;
+  const jobId = `apply-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const initial = {
+    jobId,
+    tunnelId: t.id,
+    percent: 0,
+    done: false,
+    events: [{ status: 'info', percent: 0, message: 'اتصال به پنل و شروع اعمال…' }],
+  };
+  state.applyJobs[jobId] = initial;
+  state.activeApplyJob = jobId;
+  openModal(
+    dryRun ? 'اعمال آزمایشی' : 'اعمال روی سرورها',
+    applyProgressHtml(initial),
+    [{ text: 'بستن', class: '', onClick: closeModal }],
+  );
+  // The event stream is the fast path. Polling covers a proxy that buffered the
+  // SSE connection or a browser that reconnected after the first event.
+  clearInterval(state.applyPoll);
+  state.applyPoll = setInterval(async () => {
+    if (state.activeApplyJob !== jobId) {
+      clearInterval(state.applyPoll);
+      return;
+    }
+    try {
+      const r = await api(`/api/apply-jobs/${jobId}`);
+      if (r.job) {
+        state.applyJobs[jobId] = r.job;
+        refreshApplyProgress(r.job);
+      }
+    } catch {
+      /* the job may not exist yet; the next tick tries again */
+    }
+  }, 1200);
   try {
+    // `ok: false` here means "some server failed", not "the request failed":
+    // the per-server results are the report the operator needs, so they are
+    // rendered instead of being thrown away as an HTTP error.
     const r = await api(`/api/tunnels/${t.id}/apply`, {
       method: 'POST',
-      body: { dryRun, restart: !dryRun },
+      body: { dryRun, restart: !dryRun, jobId },
+      allowFailure: true,
     });
+    clearInterval(state.applyPoll);
+    // 200 with `ok: false` carries the per-server report (the normal failure
+    // case). A rejected build is a different thing: there are no results to
+    // render, and treating the missing object as a TypeError would hide the
+    // validation problems the server sent.
+    if (!r.results) {
+      const err = new Error(r.error || 'اعمال انجام نشد');
+      err.problems = r.problems;
+      throw err;
+    }
     const lines = Object.entries(r.results)
       .map(([side, res]) => {
         const label = sideLabel(side);
@@ -1954,9 +2064,14 @@ async function doApply(dryRun = false) {
           : `<div class="err-box">${label}: ${detail || esc(res.error || '')}</div>`;
       })
       .join('');
+    const finalJob = state.applyJobs[jobId] || { ...initial, percent: 100, done: true, ok: r.ok };
+    finalJob.done = true;
+    finalJob.ok = r.ok;
+    finalJob.percent = 100;
     openModal(
       dryRun ? 'اعمال آزمایشی' : 'نتیجه اعمال',
-      (lines || '<p class="muted">چیزی برای نمایش نیست.</p>') +
+      applyProgressHtml(finalJob) +
+        (lines || '<p class="muted">چیزی برای نمایش نیست.</p>') +
         isolationHtml(r.isolation, dryRun) +
         portFixHtml(r.portFix) +
         reachabilityHtml(r.reachability, t.id),
@@ -1977,8 +2092,24 @@ async function doApply(dryRun = false) {
     }
     if (r.ok && !r.reachability?.problems?.length) toast('روی سرورها اعمال شد', 'ok');
     else if (r.ok) toast('اعمال شد، ولی ارتباط دو سرور برقرار نیست', 'err');
+    else toast('اعمال با خطا تمام شد؛ جزئیات هر سرور را در پنجره ببینید', 'err');
   } catch (err) {
+    clearInterval(state.applyPoll);
+    const failed = state.applyJobs[jobId] || initial;
+    failed.done = true;
+    failed.ok = false;
+    failed.percent = 100;
+    const problemBox = err.problems?.length
+      ? `<div class="err-box">${err.problems.map((p) => esc(String(p))).join('<br>')}</div>`
+      : '';
+    openModal(
+      'اعمال ناموفق',
+      applyProgressHtml(failed) + `<div class="err-box">${esc(err.message)}</div>` + problemBox,
+      [{ text: 'بستن', class: 'primary', onClick: closeModal }],
+    );
     toast(err.message, 'err');
+  } finally {
+    if (state.activeApplyJob === jobId) state.activeApplyJob = null;
   }
 }
 
@@ -2969,6 +3100,24 @@ function afterRender() {
   });
   $$('[data-upgrade-one]').forEach((b) => {
     b.onclick = () => runUpgrade([b.dataset.upgradeOne], true);
+  });
+  $$('[data-srv-forget-key]').forEach((b) => {
+    b.onclick = async () => {
+      const s = state.servers.find((x) => x.id === b.dataset.srvForgetKey);
+      if (!s) return;
+      if (!confirm(`کلید SSH قدیمی سرور «${s.name}» از known_hosts پنل پاک شود؟`)) return;
+      b.disabled = true;
+      b.textContent = 'در حال پاک‌سازی…';
+      try {
+        const r = await api(`/api/servers/${s.id}/forget-host-key`, { method: 'POST' });
+        toast(r.note || 'کلید قدیمی پاک شد', 'ok');
+      } catch (err) {
+        toast(err.message || 'پاک کردن کلید قدیمی ناموفق بود', 'err');
+      } finally {
+        b.disabled = false;
+        b.textContent = 'کلید SSH';
+      }
+    };
   });
   $$('[data-srv-logs]').forEach((b) => {
     b.onclick = () => showServerLogs(b.dataset.srvLogs);

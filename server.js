@@ -6,7 +6,14 @@ const zlib = require('node:zlib');
 
 const { Store } = require('./lib/store');
 const templates = require('./lib/templates');
-const { buildBundle, renderClientConfig, resolveOptions, regenerateOptions, tailorForeignBundle } = require('./lib/build');
+const {
+  buildBundle,
+  renderClientConfig,
+  resolveOptions,
+  regenerateOptions,
+  tailorForeignBundle,
+  tunnelConfigSuffix,
+} = require('./lib/build');
 const { validateBundle, preprocessConfig } = require('./lib/generator');
 const ssh = require('./lib/ssh');
 const tests = require('./lib/tests');
@@ -20,8 +27,9 @@ const linkHealth = require('./lib/links');
 const isolate = require('./lib/isolate');
 const portfix = require('./lib/portfix');
 const watchdog = require('./lib/watchdog');
+const cleanup = require('./lib/cleanup');
 const { Outbound } = require('./lib/outbound');
-const { resolveTargets, targetsForSide, isTarget } = require('./lib/targets');
+const { resolveTargets, targetsForSide, isTarget, foreignIds } = require('./lib/targets');
 const { Router, sendJson, sendError, sendText, parseJsonBody, serveStatic, parseUrl } = require('./lib/http');
 const { timingSafeEqual, readBody } = require('./lib/util');
 
@@ -58,6 +66,10 @@ const certStore = new certs.CertStore(DATA_DIR);
  */
 const outbound = new Outbound(DATA_DIR);
 ssh.setProxyPortProvider(() => outbound.proxyPort());
+// A changed host key is cleared automatically on the next SSH command, but it
+// still has to leave a trace: the operator should be able to see that the panel
+// trusted a new fingerprint for a server whose OS was reinstalled.
+ssh.setAuditLogger((event) => store.log(event));
 const panelToken = process.env.WW_PANEL_TOKEN || store.getPanel().token;
 
 // ---------------------------------------------------------------- helpers
@@ -105,6 +117,59 @@ function broadcast(event, data) {
 }
 
 store.onLog((entry) => broadcast('log', entry));
+
+/**
+ * Progress for an in-flight apply.
+ *
+ * The apply endpoint can take a minute on a slow box, and the UI used to show
+ * nothing until the last server finished. Each step publishes a small event on
+ * the existing SSE stream, and the latest job is kept for a few minutes so a
+ * reloaded page (or a client that missed an event) can still read the log.
+ */
+const applyJobs = new Map();
+const APPLY_JOB_TTL = 10 * 60 * 1000;
+
+function pruneApplyJobs() {
+  const cutoff = Date.now() - APPLY_JOB_TTL;
+  for (const [id, job] of applyJobs) {
+    if (job.done && job.updatedAt < cutoff) applyJobs.delete(id);
+  }
+}
+
+function applyJobUpdate(jobId, patch = {}) {
+  if (!jobId) return null;
+  pruneApplyJobs();
+  const job =
+    applyJobs.get(jobId) ||
+    { jobId, createdAt: Date.now(), updatedAt: Date.now(), percent: 0, events: [], done: false };
+  if (patch.percent !== undefined) job.percent = Math.max(0, Math.min(100, Math.round(Number(patch.percent) || 0)));
+  for (const key of ['done', 'ok', 'phase', 'tunnelId']) {
+    if (patch[key] !== undefined) job[key] = patch[key];
+  }
+  job.updatedAt = Date.now();
+  if (patch.message || patch.status) {
+    job.events.push({
+      at: new Date().toISOString(),
+      percent: job.percent,
+      serverPercent: patch.serverPercent === undefined ? null : Math.round(Number(patch.serverPercent) || 0),
+      side: patch.side || null,
+      server: patch.server || null,
+      status: patch.status || 'info',
+      message: patch.message || '',
+    });
+    // A long fleet can produce a few hundred lines; the UI only shows the tail
+    // and the whole payload travels over SSE on every step.
+    if (job.events.length > 120) job.events.splice(0, job.events.length - 120);
+  }
+  applyJobs.set(jobId, job);
+  broadcast('apply-progress', job);
+  return job;
+}
+
+function applyJobFor(id) {
+  pruneApplyJobs();
+  return applyJobs.get(id) || null;
+}
 
 /**
  * Every server a tunnel is deployed to. Reverse tunnels can name several exits,
@@ -651,6 +716,43 @@ router.patch('/api/servers/:id', async (req, res, ctx) => {
 });
 
 /**
+ * Forget the panel's cached host key for a server.
+ *
+ * A reinstalled box keeps its old known_hosts entry, so every SSH command dies
+ * with "REMOTE HOST IDENTIFICATION HAS CHANGED". The panel already clears that
+ * entry automatically and retries once; this endpoint is the explicit repair
+ * for the operator who wants to do it before applying a tunnel, and for a
+ * known_hosts file the automatic path could not write (permissions).
+ */
+router.post('/api/servers/:id/forget-host-key', async (req, res, ctx) => {
+  if (guard(req, res)) return;
+  const server = store.getServer(ctx.params.id);
+  if (!server) return sendError(res, 404, 'server not found');
+  const result = await ssh.forgetHostKey(server);
+  store.log({
+    type: 'server.hostkey.forget',
+    serverId: server.id,
+    name: server.name,
+    ok: result.ok,
+    removed: Boolean(result.removed),
+    error: result.error || null,
+  });
+  if (!result.ok) {
+    return sendJson(res, 500, { ok: false, error: result.error, target: result.target || null });
+  }
+  sendJson(res, 200, {
+    ok: true,
+    server: server.name,
+    host: server.host,
+    target: result.target,
+    removed: Boolean(result.removed),
+    note: result.removed
+      ? 'کلید قبلی از known_hosts پنل پاک شد.'
+      : 'کلیدی برای این سرور در known_hosts پنل نبود؛ دفعهٔ بعد کلید تازه پذیرفته می‌شود.',
+  });
+});
+
+/**
  * The agent token of one server, on its own.
  *
  * The token is not part of the server list — it authorises the agent plane
@@ -1180,152 +1282,20 @@ router.post('/api/tunnels/:id/regenerate', async (req, res, ctx) => {
 /**
  * Take a deleted tunnel off the servers it was deployed to.
  *
- * Deleting the row used to leave everything else behind: the generated
- * config, the core.json that lists it and a running systemd unit. The tunnel
- * kept serving users after it vanished from the panel, and came back after a
- * reboot. Cleanup removes this tunnel's config plus its backups, then rewrites
- * core.json to name only the configs that still exist on that server:
- *
- *  - another tunnel sharing the same install path keeps its config and the
- *    unit is restarted into the pruned core.json,
- *  - when nothing is left to load, core.json is removed and the unit is
- *    stopped and disabled, so nothing can bring the deleted tunnel back.
- *
- * A server this tunnel never actually ran on is left untouched. Stopping or
- * restarting it would drop the connections of whatever it *is* serving — a
- * tunnel that names several exits only ever deployed to some of them.
- *
- * A server that cannot be reached is reported per server and the row is still
- * deleted: refusing to delete would strand a tunnel whose server is gone, and
- * the panel would keep listing something the operator already removed.
+ * The destructive details live in lib/cleanup.js: it resolves only the servers
+ * the tunnel actually names, removes configs from the current and older builds,
+ * prunes core.json, tears down the unit when nothing is left, and verifies the
+ * result on the box. Keeping it there makes the path testable without SSH.
  */
-async function removeTunnelFromServer(server, files) {
-  const base = server.waterwallPath || '/opt/waterwall';
-  const removed = await ssh.removeTunnelConfigs(server, base, files);
-  if (!removed.ok) return { ok: false, error: removed.error };
-
-  const corePath = path.posix.join(base, 'core.json');
-  const read = await ssh.readRemoteFile(server, corePath);
-  let core = null;
-  if (read.ok && read.content && read.content.trim()) {
-    try {
-      core = JSON.parse(read.content);
-    } catch {
-      core = null;
-    }
-  }
-
-  const result = { ok: true, deleted: removed.deleted };
-  const stopService = async () => {
-    const stop = await ssh.serviceAction(server, 'stop');
-    await ssh.sshExec(server, `systemctl disable ${ssh.shellQuote(server.serviceName || 'waterwall')} 2>&1`);
-    result.service = `stopped (${(stop.output || '').split(/\r?\n/)[0] || 'inactive'})`;
-  };
-
-  /**
-   * Tear the install down completely when this server has nothing left.
-   *
-   * A clone (a record with `clonedFrom`) exists only for the tunnel that
-   * asked for it, so its unit *and* its directory go away together. A base
-   * install may still be the binary of record for the box and is shared with
-   * the panel's other tunnels, so only its unit is removed; the directory
-   * stays so a later tunnel can reuse the binary without downloading it.
-   */
-  const removeInstall = async () => {
-    const isClone = Boolean(server.clonedFrom || server.clonedFor);
-    const removedInstall = await ssh.removeWaterwallInstall(server, {
-      waterwallPath: base,
-      serviceName: server.serviceName || 'waterwall',
-      removeDir: isClone ? 'yes' : 'no',
-    });
-    if (!removedInstall.ok) {
-      result.install = { ok: false, error: removedInstall.error };
-      return;
-    }
-    result.install = {
-      ok: true,
-      unitRemoved: removedInstall.unitRemoved,
-      dirRemoved: removedInstall.dirRemoved,
-      dirKept: !isClone && removedInstall.dirExists,
-    };
-  };
-
-  if (!core || !Array.isArray(core.configs)) {
-    // Nothing loads these files without a core.json. Only touch the unit when
-    // this server really held the tunnel.
-    if (removed.deleted.length) {
-      await stopService();
-      await removeInstall();
-    } else result.service = 'not deployed here';
-    return result;
-  }
-
-  // A config that is no longer on disk must not stay in the boot list. This
-  // also drops entries left by earlier deletions, which is the only place the
-  // panel ever notices them.
-  const kept = core.configs.filter((entry) => {
-    const rel = String(entry).replace(/^\.?\//, '');
-    return removed.after.includes(path.posix.basename(rel));
-  });
-
-  if (kept.length === core.configs.length) {
-    // core.json never named this tunnel, so the running service is fine: the
-    // files (if any) are gone and there is nothing left to reload.
-    result.core = 'unchanged';
-    if (!removed.deleted.length) result.service = 'not deployed here';
-    return result;
-  }
-  if (!kept.length) {
-    await ssh.sshExec(server, `rm -f ${ssh.shellQuote(corePath)} ${ssh.shellQuote(corePath)}.bak.*`);
-    await stopService();
-    // Nothing is left on this box for this tunnel: the unit file and, for a
-    // clone, the whole install directory go away too. Leaving them behind is
-    // what fills /opt with dead services after a few tunnels are created and
-    // deleted.
-    await removeInstall();
-    result.core = 'removed';
-    return result;
-  }
-  const written = await ssh.uploadFiles(
-    server,
-    { 'core.json': `${JSON.stringify({ ...core, configs: kept }, null, 2)}\n` },
-    base,
-  );
-  if (!written.ok) return { ok: false, error: written.error, deleted: result.deleted };
-  const restart = await ssh.serviceAction(server, 'restart');
-  result.core = 'pruned';
-  result.kept = kept;
-  result.service = restart.ok ? 'restarted' : restart.output;
-  return result;
-}
-
 async function removeTunnelFromServers(tunnel) {
-  const bundle = buildBundle(store, tunnel);
-  const targets = findTargets(tunnel);
-  const rows = [];
-  for (const side of Object.keys(bundle.bundles || {})) {
-    const files = Object.keys(bundle.bundles[side] || {});
-    if (!files.length) continue;
-    for (const server of targetsForSide(targets, side)) {
-      // Sequential on purpose: a deletion is a handful of servers and each
-      // one runs a few ssh commands; firing them in parallel buys nothing and
-      // makes a failure harder to attribute.
-      rows.push({
-        side,
-        server: server.name,
-        host: server.host,
-        ...(await removeTunnelFromServer(server, files)),
-      });
-    }
-  }
-  return rows;
+  return cleanup.removeTunnelFromServers(store, tunnel, ssh, buildBundle);
 }
 
 router.delete('/api/tunnels/:id', async (req, res, ctx) => {
   if (guard(req, res)) return;
   const tunnel = store.getTunnel(ctx.params.id);
   if (!tunnel) return sendError(res, 404, 'tunnel not found');
-  const cleanup = await removeTunnelFromServers(tunnel);
+  const cleanupRows = await removeTunnelFromServers(tunnel);
   const ok = store.deleteTunnel(ctx.params.id);
   if (!ok) return sendError(res, 404, 'tunnel not found');
   // Isolated service records exist only for this tunnel. Removing the tunnel's
@@ -1342,12 +1312,12 @@ router.delete('/api/tunnels/:id', async (req, res, ctx) => {
   for (const record of store.listServers()) {
     if (record.clonedFor === tunnel.id && !referenced.has(record.id)) store.deleteServer(record.id);
   }
-  const failed = cleanup.filter((row) => !row.ok);
+  const failed = cleanupRows.filter((row) => !row.ok);
   // A failed cleanup is the interesting case: it means a file and a service
   // are still on a box. Keep it in the audit log so it can be repeated by hand.
-  if (failed.length) store.log({ type: 'tunnel.cleanup.failed', tunnelId: tunnel.id, cleanup });
+  if (failed.length) store.log({ type: 'tunnel.cleanup.failed', tunnelId: tunnel.id, cleanup: cleanupRows });
   broadcast('tunnels', store.listTunnels());
-  sendJson(res, 200, { ok: true, cleanup, failed });
+  sendJson(res, 200, { ok: true, cleanup: cleanupRows, failed });
 });
 
 /** Generate + validate the WaterWall files without touching any server. */
@@ -1359,15 +1329,40 @@ router.post('/api/tunnels/:id/preview', async (req, res, ctx) => {
   sendJson(res, 200, { ok: true, ...result });
 });
 
+/**
+ * The latest progress of an apply, for a client that missed the SSE event or
+ * reconnected in the middle of a run.
+ */
+router.get('/api/apply-jobs/:jobId', (req, res, ctx) => {
+  if (guard(req, res)) return;
+  const job = applyJobFor(ctx.params.jobId);
+  if (!job) return sendError(res, 404, 'apply job not found (it may have expired)');
+  sendJson(res, 200, { ok: true, job });
+});
+
 /** Deploy the generated bundle over SSH to the selected servers. */
 router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   if (guard(req, res)) return;
   let tunnel = store.getTunnel(ctx.params.id);
   if (!tunnel) return sendError(res, 404, 'tunnel not found');
   const body = await parseJsonBody(req);
+  // The UI creates this id before the request so it can listen for progress on
+  // the event stream while the (slow) request is still open.
+  const jobId =
+    typeof body.jobId === 'string' && /^[A-Za-z0-9_.:-]{4,80}$/.test(body.jobId)
+      ? body.jobId
+      : `apply-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const progress = (patch) => applyJobUpdate(jobId, { tunnelId: tunnel.id, ...patch });
+  const fail = (message, percent = 100) =>
+    progress({ percent, done: true, ok: false, status: 'error', message });
+  progress({ percent: 1, phase: 'prepare', status: 'info', message: 'شروع اعتبارسنجی کانفیگ…' });
   let bundle = buildBundle(store, tunnel);
   if (bundle.problems.length) {
-    return sendError(res, 400, 'generated configuration is invalid', { problems: bundle.problems });
+    fail('کانفیگ ساخته‌شده معتبر نیست؛ چیزی روی سرورها نوشته نشد.');
+    return sendError(res, 400, 'generated configuration is invalid', {
+      problems: bundle.problems,
+      jobId,
+    });
   }
   // Only sides the template actually produced can be deployed. Defaulting to
   // the bundle keys (rather than a hard-coded pair) is what makes a two-sided
@@ -1375,12 +1370,14 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   // all work without a flag.
   const sides = Array.isArray(body.sides) && body.sides.length ? body.sides : Object.keys(bundle.bundles);
   const deploySides = sides.filter((side) => bundle.bundles[side]);
+  progress({ percent: 4, phase: 'prepare', status: 'ok', message: `کانفیگ معتبر است (${deploySides.length} سمت).` });
   /**
    * Another enabled tunnel already using one of these server records means the
    * two would share a unit and a core.json: whichever applies last wins, and
    * the other disappears on the next restart. Give this tunnel its own service
    * on the same host before writing anything.
    */
+  progress({ percent: 6, phase: 'isolation', status: 'info', message: 'بررسی سرویس‌های اشتراکی و ساخت سرویس جدا در صورت نیاز…' });
   const isolation = body.dryRun
     ? {
         ok: true,
@@ -1390,15 +1387,27 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
         changed: false,
       }
     : await isolate.isolateTargets(store, tunnel, deploySides, ssh);
+  progress({
+    percent: 10,
+    phase: 'isolation',
+    status: isolation.skipped?.length ? 'error' : 'ok',
+    message: isolation.clones?.length
+      ? `${isolation.clones.length} سرویس مستقل ساخته/بازاستفاده شد.`
+      : isolation.skipped?.length
+        ? `${isolation.skipped.length} سرور برای سرویس مستقل رد شد.`
+        : 'سرویس اشتراکی پیدا نشد.',
+  });
   if (!body.dryRun && isolation.changed) {
     tunnel = store.updateTunnel(tunnel.id, { targetServers: isolation.targets });
     broadcast('servers', store.listServers().map(redact));
     broadcast('tunnels', store.listTunnels());
     const rebuilt = buildBundle(store, tunnel);
     if (rebuilt.problems.length) {
+      fail('کانفیگ بعد از ساخت سرویس مستقل معتبر نیست؛ چیزی نوشته نشد.');
       return sendError(res, 400, 'generated configuration is invalid after service isolation', {
         problems: rebuilt.problems,
         isolation,
+        jobId,
       });
     }
     bundle = rebuilt;
@@ -1409,16 +1418,27 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
    * silently fails to come up. Move the newcomer to a free port before it is
    * written, so the tunnel works instead of replacing the first one.
    */
+  progress({ percent: 12, phase: 'ports', status: 'info', message: 'بررسی پورت‌های آزاد روی سرورها…' });
   const portFix = await resolvePorts(store, tunnel, deploySides, bundle, ssh);
+  progress({
+    percent: 16,
+    phase: 'ports',
+    status: portFix.problems?.length ? 'error' : 'ok',
+    message: portFix.moved?.length
+      ? `${portFix.moved.length} پورت برای جلوگیری از تداخل جابه‌جا شد.`
+      : 'پورت‌ها آزاد هستند.',
+  });
   if (portFix.changed && !body.dryRun) {
     tunnel = store.updateTunnel(tunnel.id, { options: { ...(tunnel.options || {}), ...portFix.options } });
     broadcast('tunnels', store.listTunnels());
     const rebuilt = buildBundle(store, tunnel);
     if (rebuilt.problems.length) {
+      fail('کانفیگ بعد از جابه‌جایی پورت معتبر نیست؛ چیزی نوشته نشد.');
       return sendError(res, 400, 'generated configuration is invalid after port allocation', {
         problems: rebuilt.problems,
         isolation,
         portFix,
+        jobId,
       });
     }
     bundle = rebuilt;
@@ -1434,6 +1454,7 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   // A tunnel with a domain gets its certificate handled before anything is
   // written, so the service never starts against a missing or expired file.
   let certificate = null;
+  progress({ percent: 18, phase: 'certificate', status: 'info', message: 'بررسی گواهی TLS…' });
   if (body.checkCertificates !== false) {
     // The certificate belongs on whichever side actually holds TlsServer. Most
     // templates put it on the exit box, but the reverse templates put it on the
@@ -1478,12 +1499,32 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
       }
     }
   }
+  progress({
+    percent: 22,
+    phase: 'certificate',
+    status: certificate?.error ? 'error' : 'ok',
+    message: certificate?.error
+      ? `گواهی صادر نشد (${certificate.error})؛ ادامه با گواهی موجود.`
+      : certificate
+        ? 'گواهی TLS آماده است.'
+        : 'گواهی TLS لازم نیست.',
+  });
 
+  const sideNames = { iran: 'ایران', relay: 'رله', foreign: 'خارج' };
+  const deployTotal = sides.reduce((sum, side) => sum + targetsForSide(targets, side).length, 0);
+  const deploySlot = deployTotal ? (88 - 22) / deployTotal : 0;
+  let deployIndex = 0;
   const results = {};
   for (const side of sides) {
     const files = bundle.bundles[side];
     if (!files) {
       results[side] = { ok: false, error: 'template does not produce a config for this side' };
+      progress({
+        percent: deployTotal ? 22 + deployIndex * deploySlot : 22,
+        status: 'error',
+        side,
+        message: `سمت ${sideNames[side] || side}: قالبی برای این سمت وجود ندارد.`,
+      });
       continue;
     }
     // A reverse tunnel can have a whole fleet of exits; every one of them gets
@@ -1492,6 +1533,12 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
     const fleet = targetsForSide(targets, side);
     if (!fleet.length) {
       results[side] = { ok: false, error: `no server registered for side "${side}"` };
+      progress({
+        percent: deployTotal ? 22 + deployIndex * deploySlot : 22,
+        status: 'error',
+        side,
+        message: `سمت ${sideNames[side] || side}: سروری انتخاب نشده است.`,
+      });
       continue;
     }
     if (body.dryRun) {
@@ -1501,15 +1548,46 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
         files: Object.keys(files),
         ...(fleet.length > 1 ? { servers: fleet.map((s) => ({ ok: true, server: s.name })) } : {}),
       };
+      for (const server of fleet) {
+        progress({
+          percent: 22 + deployIndex * deploySlot,
+          serverPercent: 100,
+          status: 'ok',
+          side,
+          server: server.name,
+          message: `اعمال آزمایشی روی «${server.name}»: ${Object.keys(files).length} فایل بررسی شد.`,
+        });
+        deployIndex += 1;
+      }
       continue;
     }
     const per = [];
     for (const server of fleet) {
+      const slotStart = 22 + deployIndex * deploySlot;
+      const slotEnd = slotStart + deploySlot;
+      const where = `${sideNames[side] || side} · ${server.name}`;
+      deployIndex += 1;
       const why = blocked.get(`${side}:${server.id}`);
       if (why) {
         per.push({ ok: false, server: server.name, error: why });
+        progress({
+          percent: slotEnd,
+          serverPercent: 100,
+          status: 'error',
+          side,
+          server: server.name,
+          message: `${where}: ${why}`,
+        });
         continue;
       }
+      progress({
+        percent: slotStart + deploySlot * 0.1,
+        serverPercent: 10,
+        status: 'running',
+        side,
+        server: server.name,
+        message: `${where}: در حال ارسال ${Object.keys(files).length} فایل…`,
+      });
       // A helper exit has no local service of its own: it bridges into the main
       // exit's service, so its bundle points at the main exit's address.
       const serverFiles =
@@ -1519,8 +1597,24 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
       const uploaded = await ssh.uploadFiles(server, serverFiles, server.waterwallPath);
       if (!uploaded.ok) {
         per.push({ ok: false, server: server.name, error: uploaded.error });
+        progress({
+          percent: slotEnd,
+          serverPercent: 100,
+          status: 'error',
+          side,
+          server: server.name,
+          message: `${where}: آپلود ناموفق — ${uploaded.error}`,
+        });
         continue;
       }
+      progress({
+        percent: slotStart + deploySlot * 0.6,
+        serverPercent: 60,
+        status: 'running',
+        side,
+        server: server.name,
+        message: `${where}: فایل‌ها نوشته شد؛ راه‌اندازی سرویس…`,
+      });
       let svc = { ok: true, output: 'restart skipped' };
       if (body.restart !== false) {
         // Cleanup disables a unit it empties, so make sure a redeploy turns it
@@ -1529,7 +1623,22 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
         await ssh.sshExec(server, `systemctl enable ${ssh.shellQuote(svcName)} 2>&1`);
         svc = await ssh.serviceAction(server, 'restart');
       }
-      per.push({ ok: true, server: server.name, uploaded: Object.keys(files), service: svc });
+      // `serviceAction` runs restart and is-active in one shell; its exit code
+      // is is-active's, so a unit that is still "activating" (or a stop that
+      // leaves it inactive) looks like a failed command. Only call it a failure
+      // when the command failed *and* the state is not a live one: an SSH drop
+      // is still a failure, a unit on its way up is not.
+      const svcState = String(svc.output || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
+      const svcOk = svc.ok !== false || /^(active|activating|reloading)$/i.test(svcState);
+      per.push({ ok: svcOk, server: server.name, uploaded: Object.keys(files), service: svc });
+      progress({
+        percent: slotEnd,
+        serverPercent: 100,
+        status: svcOk ? 'ok' : 'error',
+        side,
+        server: server.name,
+        message: `${where}: ${svcOk ? 'تمام شد' : 'سرویس بالا نیامد'}${svc.output ? ` — ${String(svc.output).split(/\r?\n/)[0]}` : ''}`,
+      });
     }
     results[side] =
       per.length === 1
@@ -1549,6 +1658,7 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
   // failure into an explicit, actionable message instead of a config hunt.
   let reachability = null;
   if (body.check !== false && bundle.bundles.foreign && !bundle.bundles.relay && servers.iran && servers.foreign) {
+    progress({ percent: 91, phase: 'reachability', status: 'info', message: 'تست دسترسی دو سرور به پورت‌های یکدیگر…' });
     try {
       reachability = await netcheck.checkTunnel((s, c, o) => ssh.sshExec(s, c, o), servers, {
         link: listenerPort(bundle, 'foreign'),
@@ -1557,10 +1667,30 @@ router.post('/api/tunnels/:id/apply', async (req, res, ctx) => {
     } catch (err) {
       reachability = { error: err.message, problems: [] };
     }
+    progress({
+      percent: 96,
+      phase: 'reachability',
+      status: reachability.ok ? 'ok' : 'error',
+      message: reachability.error
+        ? `تست دسترسی انجام نشد: ${reachability.error}`
+        : reachability.problems?.length
+          ? `${reachability.problems.length} مشکل دسترسی پیدا شد.`
+          : 'دسترسی دو سرور برقرار است.',
+    });
   }
 
+  const ok = Object.values(results).every((r) => r.ok);
+  progress({
+    percent: 100,
+    done: true,
+    ok,
+    phase: 'done',
+    status: ok ? 'ok' : 'error',
+    message: ok ? 'اعمال روی همهٔ سرورها تمام شد.' : 'اعمال تمام شد، ولی بعضی سرورها خطا دادند.',
+  });
   sendJson(res, 200, {
-    ok: Object.values(results).every((r) => r.ok),
+    ok,
+    jobId,
     results,
     reachability,
     certificate,

@@ -307,6 +307,321 @@ await checkAsync('a base install keeps its directory', async () => {
   assert.doesNotMatch(built.script, /rm -rf "\$BASE"/, 'the directory is kept');
 });
 
+await check('the host-key reset names the host and its non-default port', () => {
+  assert.strictEqual(ssh.knownHostTarget({ host: '203.0.113.9' }), '203.0.113.9');
+  assert.strictEqual(
+    ssh.knownHostTarget({ host: '203.0.113.9', sshPort: 2222 }),
+    '[203.0.113.9]:2222',
+    'a non-default port must use the [host]:port form ssh-keygen expects',
+  );
+});
+
+await check('only a changed host key triggers a known_hosts reset', () => {
+  assert.strictEqual(
+    ssh.hostKeyMismatch(
+      '@@@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@@@\nHost key verification failed.',
+    ),
+    true,
+  );
+  assert.strictEqual(ssh.hostKeyMismatch('Host key for 1.2.3.4 has changed'), true);
+  assert.strictEqual(ssh.hostKeyMismatch('Permission denied (publickey).'), false);
+  assert.strictEqual(ssh.hostKeyMismatch('Connection refused'), false);
+});
+
+await checkAsync('a stale host key is removed from known_hosts', async () => {
+  // A reinstall gives the box a new host key; ssh-keygen has to find the old
+  // line, including the hashed entries OpenSSH writes by default. The test uses
+  // a throwaway HOME so it never touches the operator's real known_hosts.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-known-hosts-'));
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  try {
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    fs.mkdirSync(path.join(home, '.ssh'), { recursive: true });
+    const known = path.join(home, '.ssh', 'known_hosts');
+    fs.writeFileSync(
+      known,
+      '203.0.113.9 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGm0examplekeyexamplekeyexamplekey\n199.51.100.7 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7\n',
+    );
+    const result = await ssh.forgetHostKey({ id: 's1', name: 'Reinstalled', host: '203.0.113.9' });
+    assert.strictEqual(result.ok, true, result.error);
+    assert.strictEqual(result.removed, true, 'ssh-keygen did not remove the entry');
+    const left = fs.readFileSync(known, 'utf8');
+    assert.doesNotMatch(left, /203\.0\.113\.9/, 'the old host key is still in known_hosts');
+    assert.match(left, /199\.51\.100\.7/, 'an unrelated host was removed too');
+  } finally {
+    if (saved.HOME === undefined) delete process.env.HOME;
+    else process.env.HOME = saved.HOME;
+    if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = saved.USERPROFILE;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+await check('the tunnel cleanup removes the current and an older build of the same tunnel', () => {
+  // A template change renames the config file. Both the current path and every
+  // file ending in the tunnel id suffix have to go, including backups; another
+  // tunnel on the same install must survive.
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-cleanup-configs-'));
+  try {
+    fs.mkdirSync(path.join(base, 'configs'), { recursive: true });
+    const files = {
+      'configs/reality-uk-abcd1234.json': 'current',
+      'configs/reality-uk-abcd1234.json.bak.1700000000': 'backup',
+      'configs/old-template_abcd1234.json': 'older build',
+      'configs/old-template_abcd1234.json.bak.1700000001': 'older backup',
+      'configs/another-tunnel-99999999.json': 'keep me',
+      'configs/another-tunnel-99999999.json.bak.1700000002': 'keep backup',
+    };
+    for (const [name, content] of Object.entries(files)) {
+      fs.writeFileSync(path.join(base, name), content);
+    }
+    const built = ssh.buildRemoveTunnelConfigsScript(
+      base,
+      ['configs/reality-uk-abcd1234.json', 'core.json'],
+      'abcd1234',
+    );
+    assert.strictEqual(built.ok, true, built.error);
+    const output = require('node:child_process').execFileSync('bash', ['-c', built.script], {
+      encoding: 'utf8',
+    });
+    assert.match(output, /had:configs\/reality-uk-abcd1234\.json/);
+    assert.match(output, /had:configs\/old-template_abcd1234\.json/);
+    for (const name of [
+      'reality-uk-abcd1234.json',
+      'reality-uk-abcd1234.json.bak.1700000000',
+      'old-template_abcd1234.json',
+      'old-template_abcd1234.json.bak.1700000001',
+    ]) {
+      assert.ok(!fs.existsSync(path.join(base, 'configs', name)), `${name} survived the cleanup`);
+    }
+    assert.ok(fs.existsSync(path.join(base, 'configs', 'another-tunnel-99999999.json')), 'another tunnel was deleted');
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+/** A stand-in for the remote calls cleanup.js makes. */
+function cleanupSsh({ deleted = [], after = [], core = null, verify, install } = {}) {
+  const calls = { remove: null, service: [], exec: [], uploads: [], install: null };
+  return {
+    calls,
+    shellQuote: (s) => `'${String(s).replace(/'/g, "'\\''")}'`,
+    async removeTunnelConfigs(server, base, files, opts) {
+      calls.remove = { server: server.id, base, files, suffix: opts?.suffix };
+      return { ok: true, deleted, after };
+    },
+    async readRemoteFile() {
+      return core === null ? { ok: false, error: 'missing' } : { ok: true, content: JSON.stringify(core) };
+    },
+    async serviceAction(server, action) {
+      calls.service.push(action);
+      return { ok: true, output: action === 'stop' ? 'inactive' : 'active' };
+    },
+    async sshExec(server, command) {
+      calls.exec.push(command);
+      if (command.includes('CONFIGS=')) {
+        return {
+          ok: true,
+          failed: false,
+          stdout: verify || 'CONFIGS=0\nUNIT_EXISTS=no\nSVC_ACTIVE=inactive\n',
+          stderr: '',
+        };
+      }
+      return { ok: true, failed: false, stdout: '', stderr: '' };
+    },
+    async uploadFiles(server, files, base) {
+      calls.uploads.push({ files, base });
+      return { ok: true };
+    },
+    async removeWaterwallInstall(server, opts) {
+      calls.install = opts;
+      return install || { ok: true, unitRemoved: true, dirRemoved: false, dirExists: false };
+    },
+  };
+}
+
+function cleanupStore() {
+  const { Store } = require('../lib/store');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-cleanup-'));
+  const store = new Store(dir);
+  store.addServer({
+    id: 'ex',
+    name: 'Exit',
+    role: 'foreign',
+    host: '203.0.113.20',
+    waterwallPath: '/opt/waterwall',
+    serviceName: 'waterwall',
+  });
+  store.addServer({ id: 'ir', name: 'Iran', role: 'iran', host: '203.0.113.10' });
+  return { store, dir };
+}
+
+await checkAsync('cleanup prunes a shared core.json instead of stopping the unit', async () => {
+  const cleanup = require('../lib/cleanup');
+  const { store, dir } = cleanupStore();
+  try {
+    const tunnel = store.addTunnel({
+      id: 'tun-abcd1234',
+      name: 'share',
+      template: 'reverse-reality',
+      targetServers: { foreign: ['ex'] },
+    });
+    const ssh = cleanupSsh({
+      deleted: ['configs/this-tunabcd1.json'],
+      after: ['other-tun99999999.json'],
+      core: { configs: ['configs/this-tunabcd1.json', 'configs/other-tun99999999.json'] },
+    });
+    const rows = await cleanup.removeTunnelFromServers(store, store.getTunnel(tunnel.id), ssh, () => ({
+      bundles: { foreign: { 'core.json': '{}', 'configs/this-tunabcd1.json': '{}' } },
+    }));
+    assert.strictEqual(rows.length, 1, 'only the foreign server was targeted');
+    assert.strictEqual(rows[0].ok, true, rows[0].error);
+    assert.strictEqual(rows[0].core, 'pruned');
+    assert.deepStrictEqual(JSON.parse(ssh.calls.uploads[0].files['core.json']).configs, [
+      'configs/other-tun99999999.json',
+    ]);
+    assert.ok(ssh.calls.service.includes('restart'), 'the other tunnel was restarted');
+    assert.ok(!ssh.calls.service.includes('stop'), 'a shared install must not be stopped');
+    assert.strictEqual(ssh.calls.install, null, 'the shared unit and binary stay');
+    assert.strictEqual(ssh.calls.remove.suffix, 'tunabcd1', 'the stable id suffix is used');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await checkAsync('cleanup of the last tunnel stops the unit and removes the core', async () => {
+  const cleanup = require('../lib/cleanup');
+  const { store, dir } = cleanupStore();
+  try {
+    const tunnel = store.addTunnel({
+      id: 'tun-abcd1234',
+      name: 'last',
+      template: 'reverse-reality',
+      targetServers: { foreign: ['ex'] },
+    });
+    const ssh = cleanupSsh({
+      deleted: ['configs/only-tunabcd1.json'],
+      after: [],
+      core: { configs: ['configs/only-tunabcd1.json'] },
+      install: { ok: true, unitRemoved: true, dirRemoved: false, dirExists: true },
+    });
+    const rows = await cleanup.removeTunnelFromServers(store, store.getTunnel(tunnel.id), ssh, () => ({
+      bundles: { foreign: { 'core.json': '{}', 'configs/only-tunabcd1.json': '{}' } },
+    }));
+    assert.strictEqual(rows[0].ok, true, rows[0].error);
+    assert.strictEqual(rows[0].core, 'removed');
+    assert.ok(ssh.calls.service.includes('stop'), 'the emptied unit is stopped');
+    assert.ok(ssh.calls.install, 'the unit is torn down');
+    assert.strictEqual(ssh.calls.install.sweepUnits, true, 'stray units on this install are swept');
+    assert.strictEqual(ssh.calls.install.removeDir, false, 'a base install keeps its directory');
+    assert.match(ssh.calls.exec.join('\n'), /rm -f '.*core\.json'/, 'core.json is removed');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await checkAsync('a failed core.json read does not stop a shared unit', async () => {
+  const cleanup = require('../lib/cleanup');
+  const { store, dir } = cleanupStore();
+  try {
+    const tunnel = store.addTunnel({
+      id: 'tun-abcd1234',
+      name: 'read-failure',
+      template: 'reverse-reality',
+      targetServers: { foreign: ['ex'] },
+    });
+    const ssh = cleanupSsh({
+      deleted: ['configs/only-tunabcd1.json'],
+      after: ['other.json'],
+    });
+    ssh.readRemoteFile = async () => ({ ok: false, error: 'Connection reset by peer' });
+    const rows = await cleanup.removeTunnelFromServers(store, store.getTunnel(tunnel.id), ssh, () => ({
+      bundles: { foreign: { 'core.json': '{}', 'configs/only-tunabcd1.json': '{}' } },
+    }));
+    assert.strictEqual(rows[0].ok, false, 'an unreadable core must abort the cleanup');
+    assert.match(rows[0].error, /could not read core\.json/);
+    assert.ok(!ssh.calls.service.includes('stop'), 'the shared unit was stopped on a failed read');
+    assert.strictEqual(ssh.calls.install, null, 'the shared install was torn down on a failed read');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await checkAsync('a cleanup that leaves a file behind is reported as failed', async () => {
+  const cleanup = require('../lib/cleanup');
+  const { store, dir } = cleanupStore();
+  try {
+    const tunnel = store.addTunnel({
+      id: 'tun-abcd1234',
+      name: 'leftover',
+      template: 'reverse-reality',
+      targetServers: { foreign: ['ex'] },
+    });
+    const ssh = cleanupSsh({
+      deleted: ['configs/only-tunabcd1.json'],
+      after: [],
+      core: { configs: ['configs/only-tunabcd1.json'] },
+      verify: 'CONFIGS=1\nUNIT_EXISTS=yes\nSVC_ACTIVE=active\n',
+    });
+    const rows = await cleanup.removeTunnelFromServers(store, store.getTunnel(tunnel.id), ssh, () => ({
+      bundles: { foreign: { 'core.json': '{}', 'configs/only-tunabcd1.json': '{}' } },
+    }));
+    assert.strictEqual(rows[0].ok, false, 'a leftover config must not be reported as success');
+    assert.strictEqual(rows[0].verification.configsLeft, 1);
+    assert.strictEqual(rows[0].verification.unitExists, true);
+    assert.match(rows[0].error, /پاک‌سازی ناقص/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await check('a cleanup plan never falls back to an unrelated server', () => {
+  const cleanup = require('../lib/cleanup');
+  const { store, dir } = cleanupStore();
+  try {
+    store.addServer({ id: 'ex2', name: 'Other exit', role: 'foreign', host: '203.0.113.30' });
+    const tunnel = store.addTunnel({
+      id: 'tun-abcd1234',
+      name: 'gone-exit',
+      template: 'reverse-reality',
+      targetServers: { iran: 'ir', foreign: ['missing-id'] },
+    });
+    const plan = cleanup.cleanupPlan(store, store.getTunnel(tunnel.id));
+    assert.deepStrictEqual(plan.map((row) => row.server.id), ['ir'], 'a missing target must not become the first foreign server');
+    assert.ok(!plan.some((row) => row.server.id === 'ex2'), 'an unrelated box is left alone');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await check('the cleanup sweep takes units that run from the same install', () => {
+  const built = ssh.buildRemoveInstallScript({
+    waterwallPath: '/opt/waterwall',
+    serviceName: 'waterwall',
+    removeDir: false,
+    sweepUnits: true,
+  });
+  assert.strictEqual(built.ok, true);
+  assert.ok(
+    built.script.includes(
+      '^(WorkingDirectory=/opt/waterwall|ExecStart=/opt/waterwall/(WaterWall|Waterwall)([[:space:]].*)?)$',
+    ),
+    'the sweep pattern must be anchored so /opt/waterwall does not match /opt/waterwall-2',
+  );
+  assert.match(built.script, /SWEPT_UNITS=\$SWEPT/);
+  assert.match(built.script, /for u in \/etc\/systemd\/system\/\*\.service/);
+  const without = ssh.buildRemoveInstallScript({
+    waterwallPath: '/opt/waterwall',
+    serviceName: 'waterwall',
+    removeDir: false,
+  });
+  assert.ok(
+    !without.script.includes('for u in /etc/systemd/system/*.service'),
+    'a shared install must not sweep units',
+  );
+});
+
 await checkAsync('an install path that is not a real path is refused', async () => {
   const built = require('../lib/ssh').buildRemoveInstallScript({
     waterwallPath: '/; rm -rf /',

@@ -450,6 +450,25 @@ hr.sep { border: 0; border-top: 1px solid var(--border); margin: 18px 0; }
   direction: ltr; text-align: left; max-height: 420px; overflow: auto; white-space: pre-wrap;
 }
 
+/* Per-server progress of an apply (see doApply in app.js). */
+.apply-progress {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 12px;
+  padding: 12px 14px; margin-bottom: 16px;
+}
+.apply-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.apply-head b { font-size: 12.5px; }
+.apply-head .mono { color: var(--accent); font-size: 13px; }
+.apply-bar { height: 8px; border-radius: 99px; background: var(--panel-2); overflow: hidden; border: 1px solid var(--border-soft); }
+.apply-bar span { display: block; height: 100%; width: 0; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .35s var(--ease); }
+.apply-log { margin-top: 10px; max-height: 260px; overflow: auto; display: grid; gap: 4px; }
+.apply-line { display: flex; align-items: baseline; gap: 8px; font-size: 11.5px; color: var(--muted); line-height: 1.8; }
+.apply-line .apply-ic { width: 14px; text-align: center; flex: none; }
+.apply-line .apply-msg { flex: 1; }
+.apply-line .apply-pct { flex: none; font-family: var(--mono); font-size: 10.5px; color: var(--accent); direction: ltr; }
+.apply-line.good { color: var(--ok); }
+.apply-line.bad { color: var(--err); }
+.apply-line.live { color: var(--text); }
+
 @media (max-width: 900px) {
   .layout { grid-template-columns: 1fr; }
   .sidebar { position: static; height: auto; border-left: 0; border-bottom: 1px solid var(--border); display: flex; gap: 6px; overflow-x: auto; }

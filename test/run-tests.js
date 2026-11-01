@@ -90,6 +90,77 @@ for (const tpl of templates.ALL) {
   }
 }
 
+// ---- core.json tuning ------------------------------------------------------
+// The form stores `_core.*` fields flat (that is their declared key), while the
+// API can also send a nested `_core` object. Both shapes have to reach
+// core.json; before this check the flat form silently produced the template
+// defaults no matter what the operator chose.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ww-core-opts-'));
+  const coreStore = new Store(dir);
+  coreStore.addServer({ id: 'ir', name: 'Iran', role: 'iran', host: '203.0.113.10' });
+  coreStore.addServer({ id: 'ex', name: 'Exit', role: 'foreign', host: '198.51.100.10' });
+  try {
+    for (const [label, options] of [
+      [
+        'flat',
+        {
+          '_core.workers': 17,
+          '_core.ramProfile': 'minimal',
+          '_core.splice': false,
+          '_core.bbr': false,
+          '_core.mtu': 1380,
+          '_core.logLevel': 'WARN',
+        },
+      ],
+      [
+        'nested',
+        {
+          _core: { workers: 9, ramProfile: 'ultralow', splice: false, bbr: false, mtu: 1360 },
+        },
+      ],
+    ]) {
+      const tunnel = coreStore.addTunnel({
+        name: `core-${label}`,
+        template: 'reverse-reality',
+        targetServers: { iran: 'ir', foreign: ['ex'] },
+        options,
+      });
+      const built = buildBundle(coreStore, coreStore.getTunnel(tunnel.id));
+      for (const side of ['iran', 'foreign']) {
+        const core = JSON.parse(built.bundles[side]['core.json']);
+        const expected = label === 'flat' ? { workers: 17, profile: 'minimal', mtu: 1380 } : { workers: 9, profile: 'ultralow', mtu: 1360 };
+        assert.strictEqual(core.misc.workers, expected.workers, `${label}/${side}: workers did not reach core.json`);
+        assert.strictEqual(core.misc['ram-profile'], expected.profile, `${label}/${side}: memory profile did not reach core.json`);
+        assert.strictEqual(core.misc.mtu, expected.mtu, `${label}/${side}: mtu did not reach core.json`);
+        assert.strictEqual(core.misc.splice, false, `${label}/${side}: splice stayed enabled`);
+        assert.strictEqual(core.misc['try-enabling-bbr'], false, `${label}/${side}: bbr stayed enabled`);
+        if (label === 'flat') assert.strictEqual(core.log.core.loglevel, 'WARN', 'the log level did not reach core.json');
+      }
+    }
+    pass += 1;
+    console.log('  ✓ core.json tuning arrives from both flat and nested options');
+
+    // 0 is a real WaterWall value (one worker per CPU core), not "use the default".
+    const zero = coreStore.addTunnel({
+      name: 'core-zero',
+      template: 'reverse-reality',
+      targetServers: { iran: 'ir', foreign: ['ex'] },
+      options: { '_core.workers': 0 },
+    });
+    const zeroBuilt = buildBundle(coreStore, coreStore.getTunnel(zero.id));
+    assert.strictEqual(JSON.parse(zeroBuilt.bundles.iran['core.json']).misc.workers, 0, 'workers=0 was replaced by the default');
+    pass += 1;
+    console.log('  ✓ workers=0 (auto: one per CPU) survives the build');
+  } catch (err) {
+    fail += 1;
+    failures.push(`core options: ${err.message}`);
+    console.log(`  ✗ core options: ${err.message}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ---- multi-exit reverse tunnels ------------------------------------------
 // A reverse entry can front any number of exit servers. Every exit runs the
 // same foreign config and joins the ReverseServer pool on the Iran side, so the
@@ -1019,12 +1090,13 @@ function netcheckTests() {
     const refused = await netcheck.tcpProbe(stub(1), srv, { host: peerHost, port: 443 });
     assert.strictEqual(refused.verdict, 'refused', 'an RST means nothing is listening');
 
-    // A probe that yields nothing usable falls through to the control test. If
-    // that also fails the box has no path at all, and blaming the far side's
-    // firewall would send the user in exactly the wrong direction.
-    const deadBox = async () => ({ stdout: '', stderr: '', failed: true, code: null });
+    // A probe that never ran (SSH failed) is not evidence about the far side's
+    // firewall. Calling it "no egress" made a broken login look like a network
+    // verdict, and the post-deploy report could even say everything was fine.
+    const deadBox = async () => ({ stdout: '', stderr: 'ssh: connect to host: Connection refused', failed: true, code: null });
     const noEgress = await netcheck.tcpProbe(deadBox, srv, { host: peerHost, port: 443 });
-    assert.strictEqual(noEgress.verdict, 'no-egress', 'a box with no path must not be reported as filtered');
+    assert.strictEqual(noEgress.verdict, 'unknown', 'a probe that could not run is unknown, not a firewall verdict');
+    assert.match(noEgress.detail, /could not run/, 'the report says the probe itself failed');
 
     const sides = { iran: { host: '85.198.55.61', role: 'iran' }, foreign: { host: peerHost, role: 'foreign' } };
 
