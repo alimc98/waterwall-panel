@@ -1012,17 +1012,38 @@ async function tests(ok, fail, failures) {
     assert.strictEqual(listenPorts({ 'configs/x.json': cfg }).ports.size, 0, 'no ports were found');
   });
 
-  // ---- the 1.5.2 release --------------------------------------------------
-  check('the panel targets the 1.5.2 release', () => {
-    assert.strictEqual(versions.CURRENT, '1.5.2', 'CURRENT is 1.5.2');
-    assert.ok(versions.RELEASE_NOTES['1.5.2'], 'the release notes are present');
+  // ---- the 1.6.0 release --------------------------------------------------
+  check('the panel targets the 1.6.0 release', () => {
+    assert.strictEqual(versions.CURRENT, '1.6.0', 'CURRENT is 1.6.0');
+    assert.ok(versions.RELEASE_NOTES['1.6.0'], 'the release notes are present');
+    assert.ok(versions.RELEASE_NOTES['1.5.42'], 'the 1.5.42 patch notes are present');
   });
 
-  check('1.5.2 ranks above the 1.46 series', () => {
-    assert.ok(versions.cmp('1.5.2', '1.46.96') > 0, '1.5.2 is newer than 1.46.96');
-    assert.ok(versions.cmp('1.46.96', '1.5.2') < 0, '1.46.96 is older than 1.5.2');
+  check('1.6.0 ranks above the whole 1.5 series', () => {
+    assert.ok(versions.cmp('1.6.0', '1.46.96') > 0, '1.6.0 is newer than 1.46.96');
+    assert.ok(versions.cmp('1.46.96', '1.6.0') < 0, '1.46.96 is older than 1.6.0');
+    assert.ok(versions.cmp('1.6.0', '1.5.42') > 0, '1.6.0 is newer than the 1.5.42 patch');
+    assert.ok(versions.cmp('1.5.42', '1.5.4') > 0, 'the 1.5.42 patch is newer than 1.5.4');
     assert.strictEqual(versions.cmp('1.50', '1.5.0'), 0, 'the 1.50 tag is the 1.5.0 binary');
     assert.ok(versions.cmp('1.46.8', '1.46.96') < 0, 'the patch level is compared within a minor');
+  });
+
+  check('feature detection knows the 1.5/1.6 node renames', () => {
+    assert.deepStrictEqual(
+      versions.featuresUsed({ nodes: [{ type: 'KcpClient', settings: {} }] }),
+      ['kcp'],
+      'KcpClient needs 1.5.4',
+    );
+    assert.deepStrictEqual(
+      versions.featuresUsed({ nodes: [{ type: 'WireGuardServer', settings: {} }] }),
+      ['wireguardV2'],
+      'WireGuardServer needs 1.6.0',
+    );
+    assert.deepStrictEqual(
+      versions.featuresUsed({ nodes: [{ type: 'TcpConnector', settings: { 'dns-behaviour': { resolve: false } } }] }),
+      ['dnsBehaviour'],
+      'dns-behaviour needs 1.5.4',
+    );
   });
 
   check('two ends on different releases are reported', () => {

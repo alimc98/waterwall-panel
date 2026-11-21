@@ -1037,7 +1037,7 @@ await checkAsync('a server delete leaves the other units alone when told to', as
 });
 
 check('the upgrade target is the release the panel knows about', () => {
-  assert.strictEqual(versions.CURRENT, '1.5.2');
+  assert.strictEqual(versions.CURRENT, '1.6.0');
 });
 
 await checkAsync('the running binary is replaced by a rename, not a write', async () => {

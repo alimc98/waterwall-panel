@@ -920,24 +920,41 @@ for (const tpl of templates.ALL) {
   };
   assert.strictEqual(v.lintConfig(encryptionOk).length, 0, 'EncryptionClient max-frame-size is still valid');
 
-  // Ping v2 is a closed set; each offending key is reported exactly once even
-  // though it is covered by two rules.
+  // Ping's settings are a closed set. Removed keys are reported once even
+  // though they are covered by both the removal rules and the allowlist.
   const pingV1 = {
     nodes: [{ name: 'p', type: 'PingServer', settings: { 'local-ipv4': '1.1.1.1', strategy: 'icmp', source: 'a' } }],
   };
   const pingHits = v.lintConfig(pingV1).map((h) => h.key);
-  assert.deepStrictEqual(pingHits, ['strategy', 'source'], `ping v1 keys reported wrongly: ${pingHits}`);
+  assert.deepStrictEqual(pingHits, ['strategy', 'source', 'local-ipv4'], `ping v1 keys reported wrongly: ${pingHits}`);
+
+  // 1.6.0 accepts only identifier / sequence-start / send-replies; every
+  // address and header-policy key is now a startup error.
+  const pingV1Settings = {
+    nodes: [
+      {
+        name: 'p',
+        type: 'PingServer',
+        settings: { 'local-ipv4': '1.1.1.1', 'peer-ipv4': '2.2.2.2', 'send-replies': true, ttl: 64, tos: 0 },
+      },
+    ],
+  };
+  assert.deepStrictEqual(
+    v.lintConfig(pingV1Settings).map((h) => h.key),
+    ['local-ipv4', 'peer-ipv4', 'ttl', 'tos'],
+    'every 1.6.0-removed Ping key must be flagged exactly once',
+  );
 
   const pingV2 = {
     nodes: [
       {
         name: 'p',
         type: 'PingServer',
-        settings: { 'local-ipv4': '1.1.1.1', 'peer-ipv4': '2.2.2.2', 'send-replies': true, ttl: 64 },
+        settings: { identifier: 'random', 'sequence-start': 1, 'send-replies': true },
       },
     ],
   };
-  assert.strictEqual(v.lintConfig(pingV2).length, 0, 'Ping v2 settings must be accepted');
+  assert.strictEqual(v.lintConfig(pingV2).length, 0, 'Ping 1.6.0 settings must be accepted');
 
   // Feature gating.
   const frag = { nodes: [{ name: 'f', type: 'StreamFragmenter', settings: { mode: 'counter', count: 1, cuts: [] } }] };
@@ -1048,9 +1065,14 @@ for (const tpl of templates.ALL) {
   for (const id of newTemplates) {
     assert.ok(templates.get(id), `template ${id} must exist`);
   }
-  for (const id of newTemplates.filter((x) => x !== 'disturber-lab')) {
+  // Two of these moved to newer cores in the 1.5/1.6 series: tcp-over-udp was
+  // renamed to Kcp nodes in 1.5.4, and ping-tunnel uses the 1.6.0 Ping format.
+  for (const id of newTemplates.filter((x) => x !== 'disturber-lab' && x !== 'tcp-over-udp' && x !== 'ping-tunnel')) {
     assert.strictEqual(templates.get(id).minVersion, '1.46.96', `${id} must declare minVersion 1.46.96`);
   }
+  assert.strictEqual(templates.get('tcp-over-udp').minVersion, '1.5.4', 'KcpClient needs 1.5.4');
+  assert.strictEqual(templates.get('ping-tunnel').minVersion, '1.6.0', 'the new Ping format needs 1.6.0');
+  assert.strictEqual(templates.get('tun-wireguard').minVersion, '1.6.0', 'WireGuardClient/Server need 1.6.0');
   assert.strictEqual(
     templates.get('disturber-lab').minVersion,
     undefined,
